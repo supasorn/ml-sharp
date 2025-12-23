@@ -129,6 +129,10 @@ def predict_cli(
     output_path.mkdir(exist_ok=True, parents=True)
 
     for image_path in image_paths:
+        output_ply_path = output_path / f"{image_path.stem}.ply"
+        if output_ply_path.exists():
+            LOGGER.info("Skipping %s (already processed)", image_path)
+            continue
         LOGGER.info("Processing %s", image_path)
         image, _, f_px = io.load_rgb(image_path)
         height, width = image.shape[:2]
@@ -145,7 +149,7 @@ def predict_cli(
         gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
 
         LOGGER.info("Saving 3DGS to %s", output_path)
-        save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
+        save_ply(gaussians, f_px, (height, width), output_ply_path)
 
         if with_rendering:
             output_video_path = (output_path / image_path.stem).with_suffix(".mp4")

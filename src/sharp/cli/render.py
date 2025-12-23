@@ -14,8 +14,10 @@ import torch
 import torch.utils.data
 
 from sharp.utils import camera, gsplat, io
+import numpy as np
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import Gaussians3D, SceneMetaData, load_ply
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -58,13 +60,14 @@ def render_cli(input_path: Path, output_path: Path, verbose: bool):
 
     for scene_path in scene_paths:
         LOGGER.info("Rendering %s", scene_path)
-        gaussians, metadata = load_ply(scene_path)
+        gaussians, metadata, _, _ = load_ply(scene_path)
         render_gaussians(
             gaussians=gaussians,
             metadata=metadata,
             params=params,
             output_path=(output_path / scene_path.stem).with_suffix(".mp4"),
         )
+
 
 
 def render_gaussians(
@@ -116,5 +119,29 @@ def render_gaussians(
         )
         color = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
         depth = rendering_output.depth[0]
+
+        # save depth as depth.png in grayscale
+        depth_np = depth.cpu().numpy()
+
+        depth_output_path = output_path.with_suffix(".debug.depth.npy")
+        np.save(depth_output_path, depth_np)
+
+        depth_min = np.nanmin(depth_np)
+        depth_max = np.nanmax(depth_np)
+        if depth_max > depth_min:
+            depth_norm = (depth_np - depth_min) / (depth_max - depth_min)
+        else:
+            depth_norm = np.zeros_like(depth_np)
+        depth_gray = (depth_norm * 255).astype(np.uint8)
+        if depth_gray.ndim == 3:
+            depth_gray = np.squeeze(depth_gray)
+
+        # Save as grayscale PNG
+        depth_output_path = output_path.with_suffix(".debug.depth.png")
+        io.save_image(depth_gray, depth_output_path)
+
+
+         
         video_writer.add_frame(color, depth)
     video_writer.close()
+    exit(0)

@@ -192,12 +192,12 @@ class VideoWriter(OutputWriter):
         if render_depth:
             self.depth_writer = iio.get_writer(output_path.with_suffix(".depth.mp4"), fps=fps)
 
-    def add_frame(self, image: torch.Tensor, depth: torch.Tensor) -> None:
-        """Add a single frame to output."""
+    def add_frame(self, image: torch.Tensor, depth: torch.Tensor = None) -> None:
+        """Add a single frame to output. Depth is optional if not rendering depth."""
         image_np = image.detach().cpu().numpy()
         self.image_writer.append_data(image_np)
 
-        if self.depth_writer is not None:
+        if hasattr(self, "depth_writer") and self.depth_writer is not None and depth is not None:
             if self.max_depth_estimate is None:
                 self.max_depth_estimate = depth.max().item()
 
@@ -207,6 +207,7 @@ class VideoWriter(OutputWriter):
             )
             colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
             self.depth_writer.append_data(colored_depth_np)
+
 
     def close(self):
         """Finish writing."""

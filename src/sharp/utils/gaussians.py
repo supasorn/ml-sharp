@@ -207,8 +207,8 @@ def convert_rgb_to_spherical_harmonics(rgb: torch.Tensor) -> torch.Tensor:
     return (rgb - 0.5) / coeff_degree0
 
 
-def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
-    """Loads a ply from a file."""
+def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData, torch.Tensor, torch.Tensor]:
+    """Loads a ply from a file and returns input camera intrinsics/extrinsics."""
     plydata = PlyData.read(path)
 
     vertices = next(filter(lambda x: x.name == "vertex", plydata.elements))
@@ -272,6 +272,7 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
                 supplement_data[key] = np.asarray(element[key])
 
     # Parse intrinsics and image_size.
+    input_intrinsics_matrix = np.eye(4, dtype=np.float32)
     if "intrinsic" in supplement_data:
         intrinsics_data = supplement_data["intrinsic"]
 
@@ -285,37 +286,44 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
             focal_length_px = (intrinsics_data[0], intrinsics_data[1])
             width = int(intrinsics_data[2])
             height = int(intrinsics_data[3])
-
+            input_intrinsics_matrix[0, 0] = focal_length_px[0]
+            input_intrinsics_matrix[1, 1] = focal_length_px[1]
+            input_intrinsics_matrix[0, 2] = (width - 1) / 2.0
+            input_intrinsics_matrix[1, 2] = (height - 1) / 2.0
         else:
             if len(intrinsics_data) != 9:
                 raise ValueError(
                     "Expect 9 elements in intrinsics, " f"but received {len(intrinsics_data)}."
                 )
-            intrinsics_matrix = intrinsics_data.reshape((3, 3))
-            focal_length_px = (intrinsics_matrix[0, 0], intrinsics_matrix[1, 1])
-
+            input_intrinsics_matrix[:3, :3] = intrinsics_data.reshape((3, 3))
+            focal_length_px = (input_intrinsics_matrix[0, 0], input_intrinsics_matrix[1, 1])
             image_size_data = supplement_data["image_size"]
             width = image_size_data[0]
             height = image_size_data[1]
-
     # Default to VGA resolution: focal length = 512, image size = (640, 480).
     else:
         focal_length_px = (512, 512)
         width = 640
         height = 480
+        input_intrinsics_matrix[0, 0] = focal_length_px[0]
+        input_intrinsics_matrix[1, 1] = focal_length_px[1]
+        input_intrinsics_matrix[0, 2] = (width - 1) / 2.0
+        input_intrinsics_matrix[1, 2] = (height - 1) / 2.0
+
 
     # Parse extrinsics.
+    input_extrinsics_matrix = np.eye(4, dtype=np.float32)
     extrinsics_data = supplement_data.get("extrinsic", np.eye(4).flatten())
-    extrinsics_matrix = np.eye(4)
 
     # Legacy: extrinsics store 12 elements.
     if len(extrinsics_data) == 12:
-        extrinsics_matrix[:3] = extrinsics_data.reshape((3, 4))
-        extrinsics_matrix[:3, :3] = extrinsics_matrix[:3, :3].copy().T
+        input_extrinsics_matrix[:3] = extrinsics_data.reshape((3, 4))
+        input_extrinsics_matrix[:3, :3] = input_extrinsics_matrix[:3, :3].copy().T
     elif len(extrinsics_data) == 16:
-        extrinsics_matrix[:] = extrinsics_data.reshape((4, 4))
+        input_extrinsics_matrix[:] = extrinsics_data.reshape((4, 4))
     else:
         raise ValueError(f"Unrecognized extrinsics matrix shape {len(extrinsics_data)}")
+
 
     # Parse color space.
     color_space_index = supplement_data.get("color_space", 1)
@@ -340,7 +348,10 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
         colors=colors,
     )
     metadata = SceneMetaData(focal_length_px[0], (width, height), color_space)
-    return gaussians, metadata
+    input_intrinsics_tensor = torch.from_numpy(input_intrinsics_matrix).float()
+    input_extrinsics_tensor = torch.from_numpy(input_extrinsics_matrix).float()
+    return gaussians, metadata, input_intrinsics_tensor, input_extrinsics_tensor
+
 
 
 @torch.no_grad()

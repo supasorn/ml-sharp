@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Three.js SplatMesh Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    html,
+    body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      width: 100vw;
+      min-height: 100vh;
+      min-width: 100vw;
+      background: #000;
+    }
+
+    #container {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      width: 100%;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js"
+    }
+  }
+</script>
+</head>
+
+<body>
+  <div id="container"></div>
+  <button id="save-sbs" style="position:fixed;top:20px;right:20px;z-index:10;">Save Side-by-Side Image</button>
+  <script type="module">
+    import * as THREE from "three";
+    import {SplatMesh} from "@sparkjsdev/spark";
+  
+    let file = "20251023_155037";
+    let plyURL = `../output2/${file}.ply`;
+    let jsonURL = `../output2/${file}.json`;
+
+    // let width = 4000;
+    // let height = 3000;
+    let width, height, ratio, vfov;
+
+    // Fetch width and height from JSON
+    await fetch(jsonURL)
+      .then(response => response.json())
+      .then(meta => {
+        width = meta.width;
+        height = meta.height;
+        ratio = width / height;
+        vfov = meta.vertical_fov_degrees;
+      });
+
+    if (innerWidth < width) {
+      width = innerWidth;
+      height = width / ratio;
+    }
+    if (innerHeight < height) {
+      height = innerHeight;
+      width = height * ratio;
+    }
+    // const width = window.innerWidth;
+    // const height = window.innerHeight;
+
+    const scene = new THREE.Scene();
+    // const camera = new THREE.PerspectiveCamera(54.88, ratio, 0.1, 1000);
+    const camera = new THREE.PerspectiveCamera(vfov, ratio, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer();
+    // renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setPixelRatio(2);
+    // alert( window.devicePixelRatio );
+    // renderer.setPixelRatio(2);
+    renderer.setSize(width, height);
+    document.getElementById('container').appendChild(renderer.domElement)
+
+    // --- Side-by-side save functionality ---
+    document.getElementById('save-sbs').onclick = async function () {
+      const sbsWidth = width * 2;
+      const sbsHeight = height;
+      const sbsCanvas = document.createElement('canvas');
+      sbsCanvas.width = sbsWidth;
+      sbsCanvas.height = sbsHeight;
+      const sbsCtx = sbsCanvas.getContext('2d');
+
+      // Save original camera position
+      const origPos = camera.position.clone();
+      const origQuat = camera.quaternion.clone();
+
+      // Stereo offset
+      const eyeSep = 0.03;
+
+      // LEFT EYE
+      camera.position.x = origPos.x - eyeSep;
+      camera.updateMatrixWorld();
+      camera.lookAt(0, 0, -5);
+      renderer.render(scene, camera);
+      sbsCtx.drawImage(renderer.domElement, 0, 0, width, height, 0, 0, width, height);
+
+      // RIGHT EYE
+      camera.position.x = origPos.x + eyeSep;
+      camera.updateMatrixWorld();
+      camera.lookAt(0, 0, -5);
+      renderer.render(scene, camera);
+      sbsCtx.drawImage(renderer.domElement, 0, 0, width, height, width, 0, width, height);
+
+      // Restore camera
+      camera.position.copy(origPos);
+      camera.quaternion.copy(origQuat);
+      camera.updateMatrixWorld();
+      renderer.render(scene, camera);
+
+      // Download
+      const link = document.createElement('a');
+      link.download = 'side_by_side.png';
+      link.href = sbsCanvas.toDataURL('image/png');
+      link.click();
+    }
+
+
+
+    const butterfly = new SplatMesh({url: plyURL});
+    butterfly.quaternion.set(1, 0, 0, 0);
+    butterfly.position.set(0, 0, 0);
+    scene.add(butterfly);
+
+    renderer.setAnimationLoop(function animate(time) {
+      // Animate camera x position in a sine wave
+      const amplitude = 0.06; // distance from center
+      const frequency = 0.001; // speed of oscillation
+      camera.position.x = amplitude * Math.sin(time * frequency);
+      camera.position.y = 0.5 * amplitude * Math.sin(2 * time * frequency);
+      camera.position.z = 4 * amplitude * Math.sin(0.5 * time * frequency);
+      // camera.lookAt(0, 0, -0.4);
+      // camera.lookAt(0, 0, -10);
+      camera.lookAt(0, 0, -5);
+      renderer.render(scene, camera);
+      // butterfly.rotation.y += 0.01;
+    });
+  </script>
+
+</body>
+
+</html>

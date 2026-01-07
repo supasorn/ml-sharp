@@ -27,6 +27,7 @@ from sharp.utils.gaussians import (
     Gaussians3D,
     SceneMetaData,
     save_ply,
+    load_ply,
     unproject_gaussians,
 )
 
@@ -129,32 +130,15 @@ def predict_cli(
         output_ply_path = output_path / f"{image_path.stem}.ply"
         output_json_path = output_path / f"{image_path.stem}.json"
 
-        if output_ply_path.exists() and output_json_path.exists():
-            LOGGER.info("Skipping %s (already processed)", image_path)
-            continue
+        # if output_ply_path.exists() and output_json_path.exists():
+            # LOGGER.info("Skipping %s (already processed)", image_path)
+            # continue
 
         LOGGER.info("Processing %s", image_path)
         image, _, f_px = io.load_rgb(image_path)
         height, width = image.shape[:2]
 
-        if not output_json_path.exists():
-            # Compute vertical FOV in degrees
-            vertical_fov_radians = 2 * np.arctan((height / 2) / f_px)
-            vertical_fov_degrees = np.degrees(vertical_fov_radians)
-
-            info = {
-                "image": str(image_path.name), 
-                "width": width,
-                "height": height,
-                "vertical_fov_degrees": float(vertical_fov_degrees),
-                "focal_length_px": float(f_px),
-            }
-            # Save info as JSON
-            with open(output_json_path, "w") as f:
-                json.dump(info, f, indent=2)
-        else:
-            LOGGER.info("Info file %s already exists, skipping.", output_json_path)
-
+        gaussians = None
         if not output_ply_path.exists():
             intrinsics = torch.tensor(
                 [
@@ -172,6 +156,45 @@ def predict_cli(
             save_ply(gaussians, f_px, (height, width), output_ply_path)
         else:
             LOGGER.info("PLY file %s already exists, skipping.", output_ply_path)
+
+        if not output_json_path.exists() or True:
+            # Compute vertical FOV in degrees
+            vertical_fov_radians = 2 * np.arctan((height / 2) / f_px)
+            vertical_fov_degrees = np.degrees(vertical_fov_radians)
+
+            # Load the saved ply and compute depth statistics
+            ply_path = output_ply_path
+            if ply_path.exists():
+                if gaussians is None:
+                  gaussians, metadata, _, _ = load_ply(ply_path)
+                depths = gaussians.mean_vectors[..., 2].cpu().numpy().flatten()
+                min_depth = float(np.min(depths))
+                max_depth = float(np.max(depths))
+                mean_depth = float(np.mean(depths))
+                median_depth = float(np.median(depths))
+                percentile_1_depth = float(np.percentile(depths, 1))
+                percentile_99_depth = float(np.percentile(depths, 99))
+            else:
+                min_depth = max_depth = mean_depth = median_depth = percentile_1_depth = percentile_99_depth = None
+
+            info = {
+                "image": str(image_path.name),
+                "width": width,
+                "height": height,
+                "vertical_fov_degrees": float(vertical_fov_degrees),
+                "focal_length_px": float(f_px),
+                "min_depth": min_depth,
+                "max_depth": max_depth,
+                "mean_depth": mean_depth,
+                "median_depth": median_depth,
+                "percentile_1_depth": percentile_1_depth,
+                "percentile_99_depth": percentile_99_depth,
+            }
+            # Save info as JSON
+            with open(output_json_path, "w") as f:
+                json.dump(info, f, indent=2)
+        else:
+            LOGGER.info("Info file %s already exists, skipping.", output_json_path)
 
 
 @torch.no_grad()

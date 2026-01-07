@@ -72,7 +72,8 @@
   {
     "imports": {
       "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
-      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js"
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js",
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js"
     }
   }
 </script>
@@ -89,6 +90,7 @@
   <button id="save-sbs" style="position:fixed;top:20px;right:20px;z-index:10;">Save Side-by-Side Image</button>
   <script type="module">
     import * as THREE from "three";
+    import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
     import {SplatMesh} from "@sparkjsdev/spark";
   
     // Get scene from URL (?scene=...) or use default
@@ -143,6 +145,14 @@
     // renderer.setPixelRatio(2);
     renderer.setSize(width, height);
     document.getElementById('container').appendChild(renderer.domElement)
+
+    // --- OrbitControls ---
+    let center = new THREE.Vector3(0, 0, -5);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.rotateSpeed = 0.1;
+    controls.target.copy(center);
+    controls.update();
+
 
     // --- Side-by-side save functionality ---
     document.getElementById('save-sbs').onclick = async function () {
@@ -210,14 +220,16 @@
       frequencyValue.textContent = frequency.toFixed(4);
     });
 
+
     renderer.setAnimationLoop(function animate(time) {
       // Animate camera x position in a sine wave
-      camera.position.x = amplitude * Math.sin(time * frequency);
-      camera.position.y = 0.5 * amplitude * Math.sin(2 * time * frequency);
+      // camera.position.x = amplitude * Math.sin(time * frequency);
+      // camera.position.y = 0.5 * amplitude * Math.sin(2 * time * frequency);
       // camera.position.z = 4 * amplitude * Math.sin(0.5 * time * frequency);
+
       // camera.lookAt(0, 0, -0.4);
       // camera.lookAt(0, 0, -10);
-      camera.lookAt(0, 0, -5);
+      camera.lookAt(center);
       renderer.render(scene, camera);
       // butterfly.rotation.y += 0.01;
     });

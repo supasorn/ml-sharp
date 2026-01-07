@@ -16,13 +16,48 @@
 
     body {
       display: flex;
+      flex-direction: column;
       align-items: center;
-      justify-content: center;
+      justify-content: flex-start;
       height: 100vh;
       width: 100vw;
       min-height: 100vh;
       min-width: 100vw;
       background: #000;
+    }
+
+    #controls {
+      margin-top: 12px;
+      margin-bottom: 12px;
+      background: rgba(30, 30, 30, 0.95);
+      border-radius: 12px;
+      padding: 18px 32px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+      display: flex;
+      flex-direction: row;
+      gap: 32px;
+      align-items: center;
+      color: #fff;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-size: 1.1em;
+    }
+    #controls label {
+      margin-right: 8px;
+      font-weight: 500;
+    }
+    #controls input[type="range"] {
+      width: 160px;
+      accent-color: #4f8cff;
+      margin: 0 12px 0 0;
+      vertical-align: middle;
+      background: transparent;
+    }
+    #controls span {
+      display: inline-block;
+      min-width: 3.5em;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: #b2d1ff;
     }
 
     #container {
@@ -44,13 +79,24 @@
 </head>
 
 <body>
+  <div id="controls">
+    <label for="amplitude-slider">Amplitude: <span id="amplitude-value">0.06</span></label>
+    <input type="range" id="amplitude-slider" min="0" max="0.2" step="0.001" value="0.06">
+    <label for="frequency-slider">Frequency: <span id="frequency-value">0.001</span></label>
+    <input type="range" id="frequency-slider" min="0.0001" max="0.01" step="0.0001" value="0.001">
+  </div>
   <div id="container"></div>
   <button id="save-sbs" style="position:fixed;top:20px;right:20px;z-index:10;">Save Side-by-Side Image</button>
   <script type="module">
     import * as THREE from "three";
     import {SplatMesh} from "@sparkjsdev/spark";
   
-    let file = "20251023_155037";
+    // Get scene from URL (?scene=...) or use default
+    function getQueryParam(name) {
+      const params = new URLSearchParams(window.location.search);
+      return params.get(name);
+    }
+    let file = getQueryParam('scene') || "20251023_155037";
     let plyURL = `../output2/${file}.ply`;
     let jsonURL = `../output2/${file}.json`;
 
@@ -68,14 +114,22 @@
         vfov = meta.vertical_fov_degrees;
       });
 
-    if (innerWidth < width) {
-      width = innerWidth;
+    let innerWidth = window.innerWidth;
+    let innerHeight = window.innerHeight;
+
+    const controlsHeight = document.getElementById('controls').getBoundingClientRect().height;
+    let usableWidth = innerWidth; 
+    let usableHeight = innerHeight - controlsHeight - 40; 
+
+    if (usableWidth < width) {
+      width = usableWidth;
       height = width / ratio;
     }
-    if (innerHeight < height) {
-      height = innerHeight;
+    if (usableHeight < height) {
+      height = usableHeight;
       width = height * ratio;
     }
+
     // const width = window.innerWidth;
     // const height = window.innerHeight;
 
@@ -140,13 +194,27 @@
     butterfly.position.set(0, 0, 0);
     scene.add(butterfly);
 
+    // --- Slider UI logic ---
+    let amplitude = 0.06;
+    let frequency = 0.001;
+    const amplitudeSlider = document.getElementById('amplitude-slider');
+    const frequencySlider = document.getElementById('frequency-slider');
+    const amplitudeValue = document.getElementById('amplitude-value');
+    const frequencyValue = document.getElementById('frequency-value');
+    amplitudeSlider.addEventListener('input', (e) => {
+      amplitude = parseFloat(e.target.value);
+      amplitudeValue.textContent = amplitude.toFixed(3);
+    });
+    frequencySlider.addEventListener('input', (e) => {
+      frequency = parseFloat(e.target.value);
+      frequencyValue.textContent = frequency.toFixed(4);
+    });
+
     renderer.setAnimationLoop(function animate(time) {
       // Animate camera x position in a sine wave
-      const amplitude = 0.06; // distance from center
-      const frequency = 0.001; // speed of oscillation
       camera.position.x = amplitude * Math.sin(time * frequency);
       camera.position.y = 0.5 * amplitude * Math.sin(2 * time * frequency);
-      camera.position.z = 4 * amplitude * Math.sin(0.5 * time * frequency);
+      // camera.position.z = 4 * amplitude * Math.sin(0.5 * time * frequency);
       // camera.lookAt(0, 0, -0.4);
       // camera.lookAt(0, 0, -10);
       camera.lookAt(0, 0, -5);

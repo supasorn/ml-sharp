@@ -143,10 +143,11 @@ def predict_cli(
             vertical_fov_degrees = np.degrees(vertical_fov_radians)
 
             info = {
-              "width": width,
-              "height": height,
-              "vertical_fov_degrees": float(vertical_fov_degrees),
-              "focal_length_px": float(f_px),
+                "image": str(image_path.name), 
+                "width": width,
+                "height": height,
+                "vertical_fov_degrees": float(vertical_fov_degrees),
+                "focal_length_px": float(f_px),
             }
             # Save info as JSON
             with open(output_json_path, "w") as f:

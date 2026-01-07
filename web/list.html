@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Scene List</title>
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #181c20; color: #eee; margin: 0; padding: 0; }
+    h1 { text-align: center; margin-top: 24px; }
+    .scene-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 32px;
+      justify-content: flex-start;
+      padding: 32px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .scene-item {
+      background: #23272e;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+      padding: 18px 18px 10px 18px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 180px;
+      min-width: 180px;
+      max-width: 180px;
+      transition: transform 0.15s;
+      box-sizing: border-box;
+    }
+    .scene-item:hover {
+      transform: translateY(-6px) scale(1.04);
+      box-shadow: 0 6px 24px rgba(0,0,0,0.28);
+    }
+    .scene-item img {
+      width: 100%;
+      max-width: 144px;
+      max-height: 144px;
+      border-radius: 8px;
+      margin-bottom: 10px;
+      background: #111;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.12);
+      display: block;
+      object-fit: contain;
+    }
+    .scene-filename {
+      margin-top: 4px;
+      font-size: 1em;
+      color: #b2d1ff;
+      text-align: center;
+      word-break: break-all;
+    }
+    a { text-decoration: none; color: inherit; }
+  </style>
+</head>
+<body>
+  <h1>Available Scenes</h1>
+  <div class="scene-grid">
+    <!-- SCENE_ITEMS_PLACEHOLDER -->
+  </div>
+</body>
+</html>

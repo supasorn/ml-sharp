@@ -13,6 +13,9 @@ app.get('/', (req, res) => {
 const fs = require('fs');
 app.get('/list', (req, res) => {
   const dir = path.join(__dirname, 'output2');
+  // get "ui" get parameter
+  const ui = req.query.ui || 'true';
+
   fs.readdir(dir, (err, files) => {
     if (err) {
       res.status(500).send('Cannot read directory');
@@ -40,7 +43,7 @@ app.get('/list', (req, res) => {
       const imgSrc = `/images/${encodeURIComponent(imageName)}`;
       return `
         <div class="scene-item">
-          <a href='/?scene=${encodeURIComponent(name)}'>
+          <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
             <img src='${imgSrc}' alt='${name}' />
             <div class="scene-filename">${f}</div>
           </a>

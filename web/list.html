@@ -8,25 +8,28 @@
     .scene-grid {
       display: flex;
       flex-wrap: wrap;
-      gap: 32px;
+      gap: 10px;
       justify-content: flex-start;
       padding: 32px;
-      max-width: 1200px;
+      /* max-width: 1200px; */
+      width: 100%;
       margin: 0 auto;
     }
     .scene-item {
+      width: 250px;
       background: #23272e;
       border-radius: 12px;
       box-shadow: 0 2px 12px rgba(0,0,0,0.18);
-      padding: 18px 18px 10px 18px;
+    }
+    .scene-item a {
+      padding: 5px;
       display: flex;
       flex-direction: column;
       align-items: center;
-      width: 180px;
-      min-width: 180px;
-      max-width: 180px;
       transition: transform 0.15s;
       box-sizing: border-box;
+      justify-content: space-between;
+      height: 100%;
     }
     .scene-item:hover {
       transform: translateY(-6px) scale(1.04);
@@ -34,8 +37,8 @@
     }
     .scene-item img {
       width: 100%;
-      max-width: 144px;
-      max-height: 144px;
+      /* max-width: 160px; */
+      /* max-height: 144px; */
       border-radius: 8px;
       margin-bottom: 10px;
       background: #111;
@@ -54,7 +57,6 @@
   </style>
 </head>
 <body>
-  <h1>Available Scenes</h1>
   <div class="scene-grid">
     <!-- SCENE_ITEMS_PLACEHOLDER -->
   </div>

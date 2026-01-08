@@ -15,13 +15,14 @@ import torch
 import torch.nn.functional as F
 import torch.utils.data
 import json
+from sharp.utils import vis
 
 from sharp.models import (
     PredictorParams,
     RGBGaussianPredictor,
     create_predictor,
 )
-from sharp.utils import io
+from sharp.utils import io, gsplat
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
     Gaussians3D,
@@ -127,10 +128,13 @@ def predict_cli(
     output_path.mkdir(exist_ok=True, parents=True)
 
     for image_path in image_paths:
+        if "441902" not in str(image_path):
+            continue
         output_ply_path = output_path / f"{image_path.stem}.ply"
         output_json_path = output_path / f"{image_path.stem}.json"
+        output_depth_path = output_path / f"{image_path.stem}.npy"
 
-        if output_ply_path.exists() and output_json_path.exists():
+        if output_ply_path.exists() and output_json_path.exists() and output_depth_path.exists():
             LOGGER.info("Skipping %s (already processed)", image_path)
             continue
 
@@ -139,17 +143,18 @@ def predict_cli(
         height, width = image.shape[:2]
 
         gaussians = None
+        intrinsics = torch.tensor(
+            [
+                [f_px, 0, (width - 1) / 2.0, 0],
+                [0, f_px, (height - 1) / 2.0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+
         if not output_ply_path.exists():
-            intrinsics = torch.tensor(
-                [
-                    [f_px, 0, (width - 1) / 2.0, 0],
-                    [0, f_px, (height - 1) / 2.0, 0],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1],
-                ],
-                device=device,
-                dtype=torch.float32,
-            )
             gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
 
             LOGGER.info("Saving 3DGS to %s", output_path)
@@ -195,6 +200,48 @@ def predict_cli(
                 json.dump(info, f, indent=2)
         else:
             LOGGER.info("Info file %s already exists, skipping.", output_json_path)
+
+        if not output_depth_path.exists():
+            if gaussians is None:
+                gaussians, metadata, _, _ = load_ply(output_ply_path)
+            else:
+                metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
+
+            renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
+            rendering_output = renderer(
+                gaussians.to(device),
+                extrinsics=torch.eye(4, device=device).unsqueeze(0),
+                intrinsics=intrinsics.unsqueeze(0),
+                image_width=width,
+                image_height=height,
+            )
+            depth = rendering_output.depth[0]
+            depth_np = depth.cpu().numpy()
+            np.save(output_depth_path, depth_np)
+
+            depth_min = np.nanmin(depth_np)
+            depth_max = np.nanmax(depth_np)
+            if depth_max > depth_min:
+                depth_norm = (depth_np - depth_min) / (depth_max - depth_min)
+            else:
+                depth_norm = np.zeros_like(depth_np)
+            depth_gray = (depth_norm * 255).astype(np.uint8)
+            if depth_gray.ndim == 3:
+                depth_gray = np.squeeze(depth_gray)
+
+            # Save as grayscale PNG
+            io.save_image(depth_gray, output_path / f"{image_path.stem}_gray.png")
+
+            colored_depth_pt = vis.colorize_depth(
+                depth,
+                min(depth_np.max(), vis.METRIC_DEPTH_MAX_CLAMP_METER),  # type: ignore[call-overload]
+            )
+            colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            io.save_image(colored_depth_np, output_path / f"{image_path.stem}_color.png")
+
+
+        else:
+            LOGGER.info("Depth file %s already exists, skipping.", output_depth_path)
 
 
 @torch.no_grad()

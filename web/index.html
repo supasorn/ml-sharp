@@ -63,7 +63,7 @@
     }
 
     #save-sbs {
-      display: none;
+      /* display: none; */
     }
   </style>
   <script type="importmap">
@@ -88,8 +88,12 @@
     import * as dat from "https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.module.js";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
     import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js';
-  
+  import { SparkRenderer } from "@sparkjsdev/spark";
+
     const stats = new Stats();
+    // const offset = [0, -2, -5];
+    const offset = [0, 0, 0];
+
     stats.showPanel(0); // 0: fps, 1: ms, 2: mb, 3+: custom
     document.body.appendChild(stats.dom);
 
@@ -102,17 +106,56 @@
     let plyURL = `../output2/${file}.ply`;
     let jsonURL = `../output2/${file}.json`;
 
+    // plyURL = 'http://localhost:8000/data/moth/moth.ply';
+
     let ui = getQueryParam('ui') || "true";
     let hybrid = getQueryParam('hybrid') || "false";
 
     // let width = 4000;
     // let height = 3000;
-    let meta;
+    let meta = {};
 
     await fetch(jsonURL)
-      .then(response => response.json())
+      .then(response => {
+        if (!response.ok) {
+          if (response.status === 404) {
+            throw new Error('File not found (404)');
+          } else {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+        }
+        return response.json();
+      })
       .then(meta_in => {
         meta = meta_in;
+      })
+      .catch(error => {
+        console.error('Fetch error:', error);
+        meta.width = 2000;
+        meta.height = 2000;
+        meta.vertical_fov_degrees = 30;
+        meta.focal_length_px = 3732;
+
+        meta.min_depth = -1.2954319715499878;
+        meta.max_depth = 1.1049436330795288;
+        meta.mean_depth = -0.48250031354417233;
+        meta.median_depth = -0.5307648663832427;
+        meta.percentile_1_depth = -1.222677595050114;
+        meta.percentile_99_depth = 0.734249217098667;
+
+        // These depth are positive values going away from the camera.
+        meta.min_depth = meta.min_depth - offset[2]
+        meta.max_depth = meta.max_depth - offset[2]
+        meta.mean_depth = meta.mean_depth - offset[2]
+        meta.median_depth = meta.median_depth - offset[2]
+        meta.percentile_1_depth = meta.percentile_1_depth - offset[2]
+        meta.percentile_99_depth = meta.percentile_99_depth - offset[2]
+
+        // meta.width = 2000;
+        // meta.height = 2000;
+        // meta.focal_length_px = 3322;
+        // meta.vertical_fov_degrees 
+
       });
 
     let width = meta.width, height = meta.height;
@@ -150,13 +193,32 @@
     const scene = new THREE.Scene();
     // const camera = new THREE.PerspectiveCamera(54.88, ratio, 0.1, 1000);
     const camera = new THREE.PerspectiveCamera(meta.vertical_fov_degrees, ratio, 0.1, 1000);
-    const renderer = new THREE.WebGLRenderer();
-    // renderer.setPixelRatio(window.devicePixelRatio);
+
+    // const renderer = new THREE.WebGLRenderer({ alpha: true });
+    const renderer = new THREE.WebGLRenderer({ alpha: false });
+    // renderer.setClearColor(0xFF0000, 1); // 0 alpha for full transparency
     renderer.setPixelRatio(2);
     // alert( window.devicePixelRatio );
     // renderer.setPixelRatio(2);
     renderer.setSize(width, height);
     document.getElementById('container').appendChild(renderer.domElement)
+
+
+
+
+    const spark = new SparkRenderer({ renderer });
+
+    // 2) Create a view with 32-bit sort
+    const viewpoint = spark.newViewpoint({
+      camera: camera,
+      sort32: true,       // ← enable float32 sorting
+      sortRadial: false,  // optional: sort by Z instead of radial
+      autoUpdate: true    // automatically sort each frame
+    });
+
+    // 3) Add SparkRenderer to the scene
+    scene.add(spark);
+
 
     // let median_depth = meta.median_depth;
     let median_depth = 1 / linspace[50];
@@ -165,6 +227,12 @@
     let center = new THREE.Vector3(0, 0, -center_depth);
     const controls = new OrbitControls(camera, renderer.domElement);
 
+    function resetView() {
+      camera.position.set(0, 0, 0);
+      center_depth = median_depth;
+      camera.lookAt(0, 0, -center_depth);
+    }
+    resetView();
 
     console.log("median depth:", median_depth);
     const angle = 20;
@@ -190,6 +258,7 @@
       const sbsCanvas = document.createElement('canvas');
       sbsCanvas.width = sbsWidth;
       sbsCanvas.height = sbsHeight;
+      console.log("A", width, height);
       const sbsCtx = sbsCanvas.getContext('2d');
 
       // Save original camera position
@@ -198,20 +267,22 @@
 
       // Stereo offset
       const eyeSep = 0.03;
+      const srcW = renderer.domElement.width;
+      const srcH = renderer.domElement.height;
 
       // LEFT EYE
-      camera.position.x = origPos.x - eyeSep;
-      camera.updateMatrixWorld();
-      camera.lookAt(0, 0, -5);
+      // camera.position.x = 10;
+      // camera.updateMatrixWorld();
+      // camera.lookAt(0, 0, -5);
       renderer.render(scene, camera);
-      sbsCtx.drawImage(renderer.domElement, 0, 0, width, height, 0, 0, width, height);
+      sbsCtx.drawImage(renderer.domElement, 0, 0, srcW, srcH, 0, 0, width, height);
 
       // RIGHT EYE
-      camera.position.x = origPos.x + eyeSep;
-      camera.updateMatrixWorld();
-      camera.lookAt(0, 0, -5);
-      renderer.render(scene, camera);
-      sbsCtx.drawImage(renderer.domElement, 0, 0, width, height, width, 0, width, height);
+      // camera.position.x = origPos.x + eyeSep;
+      // camera.updateMatrixWorld();
+      // camera.lookAt(0, 0, -5);
+      // renderer.render(scene, camera);
+      // sbsCtx.drawImage(renderer.domElement, 0, 0, width, height, width, 0, width, height);
 
       // Restore camera
       camera.position.copy(origPos);
@@ -226,6 +297,34 @@
       link.click();
     }
 
+    const target = controls.target;
+    const initialDistance = camera.position.distanceTo(target);
+    const initialFov = THREE.MathUtils.degToRad(camera.fov);
+    const dollyConstant = initialDistance * Math.tan(initialFov / 2);
+    const dolly_dir = new THREE.Vector3()
+      .subVectors(camera.position, target)
+      .normalize();
+    const oldPosition = camera.position.clone();
+
+    function dollyZoom(delta) {
+      // Move camera along view direction
+      camera.position.addScaledVector(dir, delta * 0.1);
+
+      // New distance
+      const newDistance = camera.position.distanceTo(target);
+
+      // Recompute FOV
+      const newFov = 2 * Math.atan(dollyConstant / newDistance);
+      camera.fov = THREE.MathUtils.radToDeg(newFov);
+      camera.updateProjectionMatrix();
+
+      controls.update();
+    }
+
+    window.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      dollyZoom(e.deltaY * 0.01);
+    }, { passive: false });
 
 
     let splatURL = plyURL, meshURL = plyURL;
@@ -239,7 +338,7 @@
     
     // const splat = new SplatMesh({url: plyURL});
     splat.quaternion.set(1, 0, 0, 0);
-    splat.position.set(0, 0, 0);
+    splat.position.set(offset[0], offset[1], offset[2]);
     scene.add(splat);
 
     let meshObj = null;
@@ -288,6 +387,7 @@
               child.material = new THREE.MeshBasicMaterial({
                   map: originalMaterial.map, // This is your UV texture
                   side: THREE.DoubleSide,    // Ensures both sides of faces are visible
+                  // transparent: true,
               });
 
               if (child.material.map) {
@@ -303,8 +403,8 @@
     }
 
     const gui = new dat.GUI();
-    gui.add(guiParams, 'cameraMotion', ["None", "SpiralXYZ", "SpiralXY"]);
-    gui.add(guiParams, 'amplitude', 0, 10, 0.1);
+    gui.add(guiParams, 'cameraMotion', ["None", "SpiralXYZ", "SpiralXY", "Dolly"]);
+    gui.add(guiParams, 'amplitude', 0, 20, 0.1);
     gui.add(guiParams, 'speed', 0.1, 5, 0.1);
     gui.add(guiParams, 'center', 0, 99, 1).onChange((value) => {
       center_depth = 1/linspace[Math.floor(value)];
@@ -328,25 +428,38 @@
           guiParams.cameraMotion = "None";
           gui.updateDisplay();
         } else {
-          camera.position.set(0, 0, 0);
-          center_depth = median_depth;
-          camera.lookAt(0, 0, -center_depth);
+          resetView();
         }
       }
     });
 
     renderer.setAnimationLoop(function animate(time) {
       stats.begin();
-      let amplitude = guiParams.amplitude * 0.005 * distance;
+      // let amplitude = guiParams.amplitude * 0.005 * distance;
+      let amplitude = guiParams.amplitude * 0.05;
       let speed = guiParams.speed * 0.001;
       let cameraMotion = guiParams.cameraMotion;
       if (cameraMotion === "SpiralXYZ") {
-        camera.position.x = amplitude * Math.sin(time * speed);
-        camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed);
+        camera.position.x = amplitude * Math.sin(time * speed) * 1.5;
+        camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed) * 1.5;
         camera.position.z = 2 * amplitude * (Math.sin(0.5 * time * speed) - 1);
       } else if (cameraMotion === "SpiralXY") {
         camera.position.x = amplitude * Math.sin(time * speed);
         camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed);
+      } else if (cameraMotion === "Dolly") {
+      // use oldPosition
+        // let delta = amplitude * Math.sin(time * speed);
+        let delta = 0.5 + 0.5 * Math.sin(time * speed);
+        delta = -delta * 1.5 + 1.5;
+
+        camera.position.copy(oldPosition).addScaledVector(dolly_dir, delta);
+
+        const newDistance = camera.position.distanceTo(target);
+        const newFov = 2 * Math.atan(dollyConstant / newDistance);
+        camera.fov = THREE.MathUtils.radToDeg(newFov);
+        camera.updateProjectionMatrix();
+
+        controls.update();
       }
       controls.update();
       renderer.render(scene, camera);

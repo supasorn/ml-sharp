@@ -134,6 +134,22 @@ def predict_cli(
 
         # depth = np.load(output_depth_path)
         depth = rendering_output.depth[0].cpu().numpy()
+        print("depth shape:", depth.shape)  # Debug: check shape
+        # compute normal map from depth using finite differences
+        nx = cv.Sobel(depth[0], cv.CV_64F, 1, 0, ksize=5)
+        ny = cv.Sobel(depth[0], cv.CV_64F, 0, 1, ksize=5)
+        # nx = depth[0][1:height-1, 2:] - depth[0][1:height-1, :-2]
+        # ny = depth[0][2:, 1:width-1] - depth[0][:-2, 1:width-1]
+        print(nx.shape, ny.shape)
+        nz = np.ones_like(nx)
+        normal_map = np.stack((nx, ny, nz * depth[0]), axis=-1)
+        norm = np.linalg.norm(normal_map, axis=-1, keepdims=True)
+        normal_map = normal_map / (norm + 1e-8)
+        # save normal map
+        normal_map_vis = ((normal_map + 1) / 2 * 255).astype(np.uint8)
+        io.save_image(normal_map_vis, output_path / f"{image_path.stem}_normal.png")
+        # exit()
+
         print(depth.shape, depth.dtype, depth.min(), depth.max())
 
         # find the seed from the nearest point

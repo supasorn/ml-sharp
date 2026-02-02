@@ -228,6 +228,7 @@
     <!-- SCENE_ITEMS_PLACEHOLDER -->
   </div>
   <script>
+    let dragTimeout;
     function uploadFiles(files) {
       let formData = new FormData();
       for (let i = 0; i < files.length; i++) {

@@ -329,9 +329,11 @@
 
     let splatURL = plyURL, meshURL = plyURL;
     if (hybrid === "true") {
-      splatURL = splatURL.replace(".ply", "_pruned.ply");
-      // meshURL = meshURL.replace(".ply", "_mesh.ply");
-      meshURL = meshURL.replace(".ply", "_mesh.glb");
+      // splatURL = splatURL.replace(".ply", "_pruned.ply");
+      // meshURL = meshURL.replace(".ply", "_mesh.glb");
+      // splatURL = "../output2/merged_output/mesh_output.ply"
+      splatURL = "../output2/20241215_194034.ply"
+      meshURL = "../output2/merged_output/mesh_output.glb"
     }
 
     const splat = new SplatMesh({url: splatURL});
@@ -383,9 +385,13 @@
           if (child.isMesh) {
               // Grab the original PBR material created by the loader
               const originalMaterial = child.material;
+              // const hasVertexColors = child.geometry.attributes.color !== undefined;
+              // const hasVertexColors = false;
 
               child.material = new THREE.MeshBasicMaterial({
                   map: originalMaterial.map, // This is your UV texture
+                  // color: originalMaterial.color,
+                  // vertexColors: hasVertexColors,
                   side: THREE.DoubleSide,    // Ensures both sides of faces are visible
                   // transparent: true,
               });

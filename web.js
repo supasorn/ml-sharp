@@ -9,6 +9,11 @@ const imgdir = 'images';
 
 // Serve index.html at root
 app.get('/', (req, res) => {
+  // redirect to /list if no scene parameter
+  if (!req.query.scene) {
+    res.redirect('/list');
+    return;
+  }
   res.sendFile(path.join(__dirname, 'web', 'index.html'));
 });
 
@@ -46,7 +51,7 @@ app.get('/list', (req, res) => {
       const imgSrc = `/images/${encodeURIComponent(imageName)}`;
       return `
         <div class="scene-item">
-          <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
+          <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}&hybrid=true'>
             <img src='${imgSrc}' alt='${name}' />
           </a>
         </div>

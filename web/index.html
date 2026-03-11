@@ -71,7 +71,9 @@
     "imports": {
       "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
       "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js",
-      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js"
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js",
+      "three/examples/jsm/webxr/VRButton.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/webxr/VRButton.js",
+      "three/examples/jsm/webxr/ARButton.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/webxr/ARButton.js"
     }
   }
 </script>
@@ -80,10 +82,13 @@
 
 <body>
   <div id="container"></div>
+  <div id="xr-buttons" style="position:fixed;bottom:20px;left:50%;transform:translateX(-50%);display:flex;gap:10px;z-index:100;"></div>
   <button id="save-sbs" style="position:fixed;top:20px;right:20px;z-index:10;">Save Side-by-Side Image</button>
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+    import { VRButton } from "three/examples/jsm/webxr/VRButton.js";
+    import { ARButton } from "three/examples/jsm/webxr/ARButton.js";
     import {SplatMesh} from "@sparkjsdev/spark";
     import * as dat from "https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.module.js";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
@@ -195,13 +200,31 @@
     const camera = new THREE.PerspectiveCamera(meta.vertical_fov_degrees, ratio, 0.1, 1000);
 
     // const renderer = new THREE.WebGLRenderer({ alpha: true });
-    const renderer = new THREE.WebGLRenderer({ alpha: false });
+    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
     // renderer.setClearColor(0xFF0000, 1); // 0 alpha for full transparency
-    renderer.setPixelRatio(2);
+    renderer.setPixelRatio(window.devicePixelRatio);
     // alert( window.devicePixelRatio );
     // renderer.setPixelRatio(2);
     renderer.setSize(width, height);
+    renderer.xr.enabled = true;
     document.getElementById('container').appendChild(renderer.domElement)
+
+    const xrButtons = document.getElementById('xr-buttons');
+    const vrButton = VRButton.createButton(renderer);
+    const arButton = ARButton.createButton(renderer);
+    
+    // Override default absolute positioning to fit in our container
+    [vrButton, arButton].forEach(btn => {
+      btn.style.position = 'static';
+      btn.style.bottom = 'auto';
+      btn.style.opacity = '0.8';
+      btn.style.transition = 'opacity 0.2s';
+      btn.onmouseenter = () => btn.style.opacity = '1';
+      btn.onmouseleave = () => btn.style.opacity = '0.8';
+    });
+    
+    xrButtons.appendChild(vrButton);
+    xrButtons.appendChild(arButton);
 
 
 
@@ -226,6 +249,19 @@
 
     let center = new THREE.Vector3(0, 0, -center_depth);
     const controls = new OrbitControls(camera, renderer.domElement);
+
+    renderer.xr.addEventListener('sessionstart', () => {
+      controls.enabled = false;
+      if (gui) gui.hide();
+      stats.dom.style.display = 'none';
+      document.getElementById('save-sbs').style.display = 'none';
+    });
+    renderer.xr.addEventListener('sessionend', () => {
+      controls.enabled = true;
+      if (gui && ui === "true") gui.show();
+      stats.dom.style.display = 'block';
+      document.getElementById('save-sbs').style.display = 'block';
+    });
 
     function resetView() {
       camera.position.set(0, 0, 0);

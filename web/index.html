@@ -389,7 +389,8 @@
       speed: 1,
       center: 50,
       showMesh: true,
-      showSplat: true
+      showSplat: true,
+      discardThreshold: 0.0
     };
     splat.visible = guiParams.showSplat;
 
@@ -421,18 +422,56 @@
 
         model.traverse((child) => {
           if (child.isMesh) {
-              // Grab the original PBR material created by the loader
-              const originalMaterial = child.material;
-              // const hasVertexColors = child.geometry.attributes.color !== undefined;
-              // const hasVertexColors = false;
+              // Ensure normals exist
+              if (!child.geometry.attributes.normal) {
+                  child.geometry.computeVertexNormals();
+              }
 
+              const originalMaterial = child.material;
               child.material = new THREE.MeshBasicMaterial({
-                  map: originalMaterial.map, // This is your UV texture
-                  // color: originalMaterial.color,
-                  // vertexColors: hasVertexColors,
-                  side: THREE.DoubleSide,    // Ensures both sides of faces are visible
-                  // transparent: true,
+                  map: originalMaterial.map,
+                  side: THREE.DoubleSide,
               });
+
+              /*
+              child.material.onBeforeCompile = (shader) => {
+                  shader.uniforms.discardThreshold = { value: guiParams.discardThreshold };
+                  
+                  shader.vertexShader = shader.vertexShader.replace(
+                      '#include <common>',
+                      `#include <common>
+                       varying vec3 vDiscardViewPos;
+                       varying vec3 vDiscardNormal;`
+                  );
+
+                  shader.vertexShader = shader.vertexShader.replace(
+                      '#include <begin_vertex>',
+                      `#include <begin_vertex>
+                       vDiscardViewPos = - ( modelViewMatrix * vec4( transformed, 1.0 ) ).xyz;
+                       vDiscardNormal = normalize( normalMatrix * normal );`
+                  );
+                  
+                  shader.fragmentShader = shader.fragmentShader.replace(
+                      '#include <common>',
+                      `#include <common>
+                       uniform float discardThreshold;
+                       varying vec3 vDiscardViewPos;
+                       varying vec3 vDiscardNormal;`
+                  );
+
+                  shader.fragmentShader = shader.fragmentShader.replace(
+                      'void main() {',
+                      `void main() {
+                       if (discardThreshold > 0.0) {
+                         vec3 n = normalize(vDiscardNormal);
+                         vec3 v = normalize(vDiscardViewPos);
+                         if (abs(dot(v, n)) < discardThreshold) {
+                           discard;
+                         }
+                       }`
+                  );
+                  child.material.userData.shader = shader;
+              };*/
 
               if (child.material.map) {
                   child.material.map.colorSpace = THREE.SRGBColorSpace;
@@ -462,6 +501,15 @@
     });
     gui.add(guiParams, 'showSplat').onChange((value) => {
       if (splat) splat.visible = value;
+    });
+    gui.add(guiParams, 'discardThreshold', 0, 1, 0.01).onChange((value) => {
+      if (meshObj) {
+        meshObj.traverse((child) => {
+          if (child.isMesh && child.material.userData && child.material.userData.shader) {
+            child.material.userData.shader.uniforms.discardThreshold.value = value;
+          }
+        });
+      }
     });
     if (ui === "false") {
       gui.hide();

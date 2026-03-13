@@ -1,4 +1,5 @@
 const express = require('express');
+var https = require('https');
 const multer = require('multer');
 const path = require('path');
 
@@ -154,6 +155,11 @@ app.use((req, res) => {
 });
 
 
-app.listen(PORT, () => {
-  console.log(`Express server running at http://localhost:${PORT}/`);
+const options = {
+  key: fs.readFileSync('server.key'),
+  cert: fs.readFileSync('server.cert')
+};
+
+https.createServer(options, app).listen(PORT, () => {
+  console.log(`Express server running at https://localhost:${PORT}/`);
 });

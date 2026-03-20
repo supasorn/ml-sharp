@@ -68,7 +68,10 @@ app.get('/list', (req, res) => {
 });
 
 
-// Optionally serve static files from 'web' directory
+// Serve static files from 'web' directory
+app.use(express.static(path.join(__dirname, 'web')));
+
+// Optionally serve static files from 'output2' directory
 app.use('/output2', express.static(path.join(__dirname, 'output2')));
 
 // Optionally serve static files from 'web' directory

@@ -94,8 +94,12 @@
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
     import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js';
   import { SparkRenderer } from "@sparkjsdev/spark";
+  import { XRMeshController } from "./XRMeshController.js";
+  import { TextGeometry } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/geometries/TextGeometry.min.js";
+  import { FontLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/FontLoader.min.js";
 
-    const stats = new Stats();
+  const stats = new Stats();
+
     // const offset = [0, -2, -5];
     const offset = [0, 0, 0];
 
@@ -196,15 +200,10 @@
     // const height = window.innerHeight;
 
     const scene = new THREE.Scene();
-    // const camera = new THREE.PerspectiveCamera(54.88, ratio, 0.1, 1000);
     const camera = new THREE.PerspectiveCamera(meta.vertical_fov_degrees, ratio, 0.1, 1000);
 
-    // const renderer = new THREE.WebGLRenderer({ alpha: true });
     const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
-    // renderer.setClearColor(0xFF0000, 1); // 0 alpha for full transparency
     renderer.setPixelRatio(window.devicePixelRatio);
-    // alert( window.devicePixelRatio );
-    // renderer.setPixelRatio(2);
     renderer.setSize(width, height);
     renderer.xr.enabled = true;
     document.getElementById('container').appendChild(renderer.domElement)
@@ -213,7 +212,6 @@
     const vrButton = VRButton.createButton(renderer);
     const arButton = ARButton.createButton(renderer);
     
-    // Override default absolute positioning to fit in our container
     [vrButton, arButton].forEach(btn => {
       btn.style.position = 'static';
       btn.style.bottom = 'auto';
@@ -225,6 +223,19 @@
     
     xrButtons.appendChild(vrButton);
     xrButtons.appendChild(arButton);
+
+    const hybridGroup = new THREE.Group();
+    scene.add(hybridGroup);
+
+    const xrController = new XRMeshController(renderer, camera, scene, {
+      zoffset: 0,
+      zscale: 1,
+      scale: 1,
+      basename: file,
+      TextGeometry: TextGeometry,
+      FontLoader: FontLoader,
+      group: hybridGroup
+    });
 
 
 
@@ -255,6 +266,10 @@
       if (gui) gui.hide();
       stats.dom.style.display = 'none';
       document.getElementById('save-sbs').style.display = 'none';
+
+      setTimeout(() => {
+        xrController.setInitHeight = true;
+      }, 500);
     });
     renderer.xr.addEventListener('sessionend', () => {
       controls.enabled = true;
@@ -378,8 +393,14 @@
     
     // const splat = new SplatMesh({url: plyURL});
     splat.quaternion.set(1, 0, 0, 0);
-    splat.position.set(offset[0], offset[1], offset[2]);
-    scene.add(splat);
+    // Position at origin relative to hybridGroup
+    splat.position.set(0, 0, 0);
+    hybridGroup.add(splat);
+    
+    // Fake shader for XRMeshController compatibility
+    if (splat.material) {
+      splat.material.userData.shader = { uniforms: { zscale: {value: 1}, zoffset: {value: 0}, ox: {value: 0}, oy: {value: 0}, depthThreshold: {value: 0} } };
+    }
 
     let meshObj = null;
 
@@ -416,12 +437,12 @@
         model.quaternion.set(1, 0, 0, 0);
         model.position.set(0, 0, 0);
         model.visible = guiParams.showMesh;
-        scene.add(model);
+        hybridGroup.add(model);
         meshObj = model;
 
 
         model.traverse((child) => {
-          if (child.isMesh) {
+          if (child.isMesh && child.material) {
               // Ensure normals exist
               if (!child.geometry.attributes.normal) {
                   child.geometry.computeVertexNormals();
@@ -433,45 +454,20 @@
                   side: THREE.DoubleSide,
               });
 
-              /*
-              child.material.onBeforeCompile = (shader) => {
-                  shader.uniforms.discardThreshold = { value: guiParams.discardThreshold };
-                  
-                  shader.vertexShader = shader.vertexShader.replace(
-                      '#include <common>',
-                      `#include <common>
-                       varying vec3 vDiscardViewPos;
-                       varying vec3 vDiscardNormal;`
-                  );
-
-                  shader.vertexShader = shader.vertexShader.replace(
-                      '#include <begin_vertex>',
-                      `#include <begin_vertex>
-                       vDiscardViewPos = - ( modelViewMatrix * vec4( transformed, 1.0 ) ).xyz;
-                       vDiscardNormal = normalize( normalMatrix * normal );`
-                  );
-                  
-                  shader.fragmentShader = shader.fragmentShader.replace(
-                      '#include <common>',
-                      `#include <common>
-                       uniform float discardThreshold;
-                       varying vec3 vDiscardViewPos;
-                       varying vec3 vDiscardNormal;`
-                  );
-
-                  shader.fragmentShader = shader.fragmentShader.replace(
-                      'void main() {',
-                      `void main() {
-                       if (discardThreshold > 0.0) {
-                         vec3 n = normalize(vDiscardNormal);
-                         vec3 v = normalize(vDiscardViewPos);
-                         if (abs(dot(v, n)) < discardThreshold) {
-                           discard;
-                         }
-                       }`
-                  );
-                  child.material.userData.shader = shader;
-              };*/
+              // Set the controller to target the first mesh found in the hybrid model
+              if (!xrController.mesh) {
+                // Add fake shader uniforms to the GLB material for controller compatibility
+                child.material.userData.shader = { 
+                  uniforms: { 
+                    zscale: {value: 1}, 
+                    zoffset: {value: 0}, 
+                    ox: {value: 0}, 
+                    oy: {value: 0}, 
+                    depthThreshold: {value: 0} 
+                  } 
+                };
+                xrController.setTarget(hybridGroup, child, splat, child.material);
+              }
 
               if (child.material.map) {
                   child.material.map.colorSpace = THREE.SRGBColorSpace;
@@ -528,6 +524,11 @@
 
     renderer.setAnimationLoop(function animate(time) {
       stats.begin();
+
+      if (renderer.xr.isPresenting) {
+        xrController.update();
+      }
+      
       // let amplitude = guiParams.amplitude * 0.005 * distance;
       let amplitude = guiParams.amplitude * 0.05;
       let speed = guiParams.speed * 0.001;

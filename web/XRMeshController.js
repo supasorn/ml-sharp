@@ -39,13 +39,13 @@ export class XRMeshController {
 
     // Parameters
     this.config = {
-      zoffset: options.zoffset || -2.4,
-      ox: options.ox || 0,
-      oy: options.oy || 0,
-      zscale: options.zscale || 1.4,
-      scale: options.scale || 0.45,
-      depthThreshold: options.depthThreshold || -0.01,
-      basename: options.basename || ""
+      zoffset: options.zoffset ?? -2.4,
+      ox: options.ox ?? 0,
+      oy: options.oy ?? 0,
+      zscale: options.zscale ?? 1.4,
+      scale: options.scale ?? 0.45,
+      depthThreshold: options.depthThreshold ?? -0.01,
+      basename: options.basename ?? ""
     };
 
     // Callbacks
@@ -169,6 +169,12 @@ export class XRMeshController {
   }
 
   updateShaderUniforms() {
+    if (this.group) {
+      // For real 3D objects, apply zscale to the Z axis stretch
+      this.group.scale.z = this.config.scale * this.config.zscale;
+      this.group.updateMatrixWorld(true);
+    }
+
     if (!this.material || !this.material.userData.shader) return;
     const shader = this.material.userData.shader;
     shader.uniforms.zscale.value = this.config.zscale;
@@ -224,14 +230,10 @@ export class XRMeshController {
       source.gamepad.buttons.forEach((button, i) => {
         const bci = this.butts[cont][i];
         if (!bci) return;
-        if (button.pressed) {
-          bci.clicked = !bci.pressed;
-          bci.unclicked = false;
-        } else {
-          bci.clicked = false;
-          bci.unclicked = bci.pressed;
-        }
-        bci.pressed = button.pressed;
+        const pressed = !!button.pressed;
+        bci.clicked = pressed && !bci.pressed;
+        bci.unclicked = !pressed && bci.pressed;
+        bci.pressed = pressed;
       });
     }
 
@@ -360,13 +362,13 @@ export class XRMeshController {
         if (mButt[1].pressed) {
           if (this.lastContPos === null) {
             this.lastContPos = new THREE.Vector3().copy(mCont.position);
-            this.lastMeshPos = new THREE.Vector3().copy(this.group.position);
+          } else {
+            let diff = new THREE.Vector3().subVectors(mCont.position, this.lastContPos);
+            this.group.position.add(diff);
+            this.lastContPos.copy(mCont.position);
           }
-          let diff = new THREE.Vector3().subVectors(mCont.position, this.lastContPos);
-          this.group.position.addVectors(this.lastMeshPos, diff);
         } else {
           this.lastContPos = null;
-          this.lastMeshPos = null;
         }
 
         if (mButt[3].clicked && this.mesh) {

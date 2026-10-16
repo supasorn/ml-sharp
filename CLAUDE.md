@@ -22,4 +22,4 @@ Quick facts:
   server's `logs/xr_perf.jsonl` before building optimizations.
 - Keep AR on three's stock `ARButton` (dom-overlay) or the Quest switches to
   roomscale.
-- Work on the `quest-xr-hybrid` branch; commit/push when asked.
+- Work on `main` (the `quest-xr-hybrid` work was merged into it); commit/push when asked.

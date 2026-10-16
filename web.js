@@ -14,6 +14,31 @@ app.get('/', (req, res) => {
 
 // List all .json files in output2 as links
 const fs = require('fs');
+
+// Scene names (json basenames in output2), most recently modified first.
+function sortedSceneNames(dir) {
+  return fs.readdirSync(dir)
+    .filter(f => f.endsWith('.json'))
+    .map(f => ({ name: f.replace(/\.json$/, ''), mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)
+    .map(s => s.name)
+    .filter(name => name != "rgb" && name != "rgb2");
+}
+
+// FPS reports from the viewer while in XR.
+app.post('/fps', express.json(), (req, res) => {
+  console.log('[xr fps]', JSON.stringify(req.body));
+  res.sendStatus(204);
+});
+
+// Same order as /list, as JSON (used by the viewer to step through scenes).
+app.get('/scenes', (req, res) => {
+  try {
+    res.json(sortedSceneNames(path.join(__dirname, 'output2')));
+  } catch (e) {
+    res.status(500).send('Cannot read directory');
+  }
+});
 app.get('/list', (req, res) => {
   const dir = path.join(__dirname, 'output2');
   // get "ui" get parameter
@@ -152,3 +177,16 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`Express server running at http://localhost:${PORT}/`);
 });
+
+// HTTPS is required for WebXR (AR on Meta Quest) when not on localhost.
+// Enabled when certs/key.pem and certs/cert.pem exist.
+const HTTPS_PORT = 3443;
+const keyPath = path.join(__dirname, 'certs', 'key.pem');
+const certPath = path.join(__dirname, 'certs', 'cert.pem');
+if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+  require('https')
+    .createServer({ key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) }, app)
+    .listen(HTTPS_PORT, () => {
+      console.log(`HTTPS server running at https://localhost:${HTTPS_PORT}/`);
+    });
+}

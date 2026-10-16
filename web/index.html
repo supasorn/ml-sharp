@@ -102,7 +102,9 @@
       const params = new URLSearchParams(window.location.search);
       return params.get(name);
     }
-    let file = getQueryParam('scene') || "20251023_155037";
+    // Default scene when ?scene= is missing; hybrid mode needs one with _pruned.ply + _mesh.glb.
+    let file = getQueryParam('scene') ||
+      (getQueryParam('hybrid') === "true" ? "20241215_194034" : "20251023_155037");
     let plyURL = `../output2/${file}.ply`;
     let jsonURL = `../output2/${file}.json`;
 
@@ -195,7 +197,10 @@
     const camera = new THREE.PerspectiveCamera(meta.vertical_fov_degrees, ratio, 0.1, 1000);
 
     // const renderer = new THREE.WebGLRenderer({ alpha: true });
-    const renderer = new THREE.WebGLRenderer({ alpha: false });
+    // alpha is needed so the Quest passthrough shows behind the splats in AR;
+    // the page background is black, so desktop looks unchanged.
+    const renderer = new THREE.WebGLRenderer({ alpha: true });
+    renderer.setClearColor(0x000000, 0);
     // renderer.setClearColor(0xFF0000, 1); // 0 alpha for full transparency
     renderer.setPixelRatio(2);
     // alert( window.devicePixelRatio );
@@ -203,21 +208,146 @@
     renderer.setSize(width, height);
     document.getElementById('container').appendChild(renderer.domElement)
 
+    // --- WebXR AR (e.g. Meta Quest 3 passthrough) ---
+    // 'local' reference space puts the origin at the head pose when the session
+    // starts, so the scene appears in front of you exactly as the source camera saw it.
+    renderer.xr.enabled = true;
+    renderer.xr.setReferenceSpaceType('local');
+
+    // XR performance knobs (URL-overridable). Splat rendering on Quest is mostly
+    // fill-rate bound, so cut pixels: lower eye-buffer resolution, fixed foveated
+    // rendering, and a tighter Gaussian cutoff (sqrt(8) -> sqrt(5) shrinks each
+    // splat quad's area by ~37% while dropping only its faintest tail).
+    const xrScale = parseFloat(getQueryParam('xrscale') || '0.8');
+    const xrFoveation = parseFloat(getQueryParam('foveation') || '1');
+    const xrStdDev = parseFloat(getQueryParam('xrstddev') || String(Math.sqrt(5)));
+    renderer.xr.setFramebufferScaleFactor(xrScale);
+    renderer.xr.setFoveation(xrFoveation);
+    document.body.appendChild(createXRButton(renderer));
+
+    // Tries passthrough AR first and falls back to VR if AR isn't offered or the
+    // request is refused (e.g. some Quest boundary modes). Only 'local' space is
+    // used, which works in both roomscale and stationary boundary modes.
+    function createXRButton(renderer) {
+      const button = document.createElement('button');
+      Object.assign(button.style, {
+        position: 'fixed', bottom: '20px', left: 'calc(50% - 75px)', width: '150px',
+        padding: '12px 6px', border: '1px solid #fff', borderRadius: '4px',
+        background: 'rgba(0,0,0,0.4)', color: '#fff', font: '13px sans-serif',
+        zIndex: 999, cursor: 'pointer',
+      });
+      if (!navigator.xr) {
+        button.textContent = 'WEBXR NEEDS HTTPS';
+        button.disabled = true;
+        return button;
+      }
+      let session = null;
+      const modes = [];
+      button.textContent = 'CHECKING XR...';
+      Promise.all(['immersive-ar', 'immersive-vr'].map(m =>
+        navigator.xr.isSessionSupported(m).catch(() => false)
+      )).then(([ar, vr]) => {
+        if (ar) modes.push('immersive-ar');
+        if (vr) modes.push('immersive-vr');
+        button.textContent = ar ? 'START AR' : vr ? 'ENTER VR' : 'XR NOT SUPPORTED';
+        button.disabled = modes.length === 0;
+      });
+      button.onclick = async () => {
+        if (session) { session.end(); return; }
+        for (const mode of modes) {
+          try {
+            session = await navigator.xr.requestSession(mode, { optionalFeatures: ['local'] });
+            await renderer.xr.setSession(session);
+            button.textContent = 'EXIT XR';
+            session.addEventListener('end', () => {
+              session = null;
+              button.textContent = modes[0] === 'immersive-ar' ? 'START AR' : 'ENTER VR';
+            });
+            return;
+          } catch (e) {
+            console.warn(`Failed to start ${mode}:`, e);
+            session = null;
+          }
+        }
+        button.textContent = 'XR FAILED (see console)';
+      };
+      return button;
+    }
+
+    // All scene content goes under xrRoot so it can be re-placed in AR.
+    const xrRoot = new THREE.Group();
 
 
 
-    const spark = new SparkRenderer({ renderer });
 
-    // 2) Create a view with 32-bit sort
-    const viewpoint = spark.newViewpoint({
-      camera: camera,
-      sort32: true,       // ← enable float32 sorting
-      sortRadial: false,  // optional: sort by Z instead of radial
-      autoUpdate: true    // automatically sort each frame
+    const spark = new SparkRenderer({
+      renderer,
+      view: {
+        sort32: true,       // float32 sorting
+        sortRadial: false,  // sort by Z instead of radial
+      },
     });
+
+    // Sort once: the default view normally re-sorts whenever the camera moves
+    // (constantly, with head tracking). Pinning its sort pose to a fixed object at
+    // the original capture camera means it sorts only when the splats change
+    // (load / re-place), not per frame. Toggle "sortOnce" in the GUI to compare.
+    const sortCamera = new THREE.Object3D();  // origin, looking down -z
+    function setSortOnce(on) {
+      spark.defaultView.camera = on ? sortCamera : undefined;
+    }
 
     // 3) Add SparkRenderer to the scene
     scene.add(spark);
+    scene.add(xrRoot);
+    xrRoot.add(sortCamera);
+    setSortOnce(true);
+
+    // In AR, pull a controller trigger (or pinch) to re-place the scene in front
+    // of your current head position, facing the direction you are looking.
+    function recenterXR() {
+      const xrCam = renderer.xr.getCamera();
+      const pos = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      xrCam.getWorldPosition(pos);
+      xrCam.getWorldQuaternion(quat);
+      const yaw = new THREE.Euler().setFromQuaternion(quat, 'YXZ').y;
+      xrRoot.position.copy(pos);
+      xrRoot.rotation.set(0, yaw, 0);
+    }
+    for (let i = 0; i < 2; i++) {
+      const controller = renderer.xr.getController(i);
+      controller.addEventListener('select', recenterXR);
+      scene.add(controller);
+    }
+    let desktopStdDev = spark.maxStdDev;
+    renderer.xr.addEventListener('sessionstart', () => {
+      desktopStdDev = spark.maxStdDev;
+      spark.maxStdDev = xrStdDev;
+      renderer.xr.setFoveation(xrFoveation);
+    });
+    renderer.xr.addEventListener('sessionend', () => {
+      xrRoot.position.set(0, 0, 0);
+      xrRoot.rotation.set(0, 0, 0);
+      spark.maxStdDev = desktopStdDev;
+    });
+
+    // Headset FPS can't be seen in the page during XR, so report it to the
+    // server console (node web.js) every 2 s.
+    let fpsFrames = 0, fpsStart = performance.now();
+    function reportXRFps() {
+      if (!renderer.xr.isPresenting) { fpsFrames = 0; fpsStart = performance.now(); return; }
+      fpsFrames++;
+      const elapsed = performance.now() - fpsStart;
+      if (elapsed < 2000) return;
+      const fps = fpsFrames * 1000 / elapsed;
+      fpsFrames = 0; fpsStart = performance.now();
+      fetch('/fps', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ fps: +fps.toFixed(1), scene: file, lod: lodMode,
+                               splats: countSplats(splat), xrScale, xrStdDev: +xrStdDev.toFixed(2) }),
+      }).catch(() => {});
+    }
 
 
     // let median_depth = meta.median_depth;
@@ -327,23 +457,204 @@
     }, { passive: false });
 
 
-    let splatURL = plyURL, meshURL = plyURL;
-    if (hybrid === "true") {
-      // splatURL = splatURL.replace(".ply", "_pruned.ply");
-      // meshURL = meshURL.replace(".ply", "_mesh.glb");
-      // splatURL = "../output2/merged_output/mesh_output.ply"
-      // splatURL = "../output2/20241215_194034.ply"
-      // splatURL = "../output2/merged_output/visible_splats2.ply"
-      splatURL = "../output2/merged_output/20241215_194034.ply"
-      meshURL = "../output2/merged_output/mesh_output2.glb"
+    // ?lod=quest loads the lighter <scene>_quest.ply from `sharp quest-lod`;
+    // ?lod=layers loads the opaque depth meshes <scene>_layers.glb from
+    // `sharp bake-layers`; ?lod=hybrid loads <scene>_hybrid.glb + .ply from
+    // `sharp bake-hybrid`. All fall back to the full splats when missing.
+    const lodMode = getQueryParam('lod') || 'full';
+    async function splatUrlFor(scene) {
+      const full = `../output2/${scene}.ply`;
+      if (lodMode !== 'quest') return full;
+      const lite = `../output2/${scene}_quest.ply`;
+      try {
+        if ((await fetch(lite, { method: 'HEAD' })).ok) return lite;
+      } catch (e) {}
+      console.warn(`No ${lite}; using full splats.`);
+      return full;
     }
 
-    const splat = new SplatMesh({url: splatURL});
-    
-    // const splat = new SplatMesh({url: plyURL});
-    splat.quaternion.set(1, 0, 0, 0);
-    splat.position.set(offset[0], offset[1], offset[2]);
-    scene.add(splat);
+    let splatURL = hybrid === "true" ? plyURL : await splatUrlFor(file), meshURL = plyURL;
+    if (hybrid === "true") {
+      // Outputs of create_mesh.py: splats with the meshed region removed + textured mesh.
+      splatURL = plyURL.replace(".ply", "_pruned.ply");
+      meshURL = plyURL.replace(".ply", "_mesh.glb");
+    }
+
+    function createSplat(url) {
+      const s = new SplatMesh({url});
+      s.quaternion.set(1, 0, 0, 0);
+      s.position.set(offset[0], offset[1], offset[2]);
+      return s;
+    }
+
+    // Baked layers: opaque textured meshes ("front", "back") drawn unlit with
+    // depth testing, plus "front_edges": the foreground cells at depth
+    // discontinuities, whose vertex alpha fades them out over the back layer.
+    // Only that thin mesh is blended, after the opaque ones.
+    async function loadLayers(url) {
+      const gltf = await new GLTFLoader().loadAsync(url);
+      const model = gltf.scene;
+      model.quaternion.set(1, 0, 0, 0);
+      model.position.set(offset[0], offset[1], offset[2]);
+      model.traverse((child) => {
+        if (!child.isMesh) return;
+        const map = child.material.map;
+        if (map) map.colorSpace = THREE.SRGBColorSpace;
+        child.material.dispose();
+        const soft = child.name === 'front_edges' && !!child.geometry.attributes.color;
+        child.material = new THREE.MeshBasicMaterial({
+          map,
+          side: THREE.DoubleSide,
+          vertexColors: soft,      // RGBA COLOR_0: white with per-vertex alpha
+          transparent: soft,
+          depthWrite: !soft,
+        });
+        if (soft) child.renderOrder = 1;
+      });
+      return model;
+    }
+
+    // Scene content: a SplatMesh, or the baked-layers model for ?lod=layers.
+    // Resolves once it's ready to show.
+    // Hybrid (`sharp bake-hybrid`): an opaque textured mesh for large surfaces
+    // plus the Gaussians it doesn't replace. The mesh is opaque, so three.js
+    // draws it before the (transparent) splats, which are depth-tested against
+    // it: splat fragments behind the mesh are rejected before shading. The
+    // mesh sits slightly in front of its surface, so splats on it are hidden
+    // (the texture already contains them) while border splats still draw
+    // where they extend past it.
+    async function loadHybrid(scene) {
+      const gltf = await new GLTFLoader().loadAsync(`../output2/${scene}_hybrid.glb`);
+      const mesh = gltf.scene;
+      mesh.quaternion.set(1, 0, 0, 0);
+      mesh.position.set(offset[0], offset[1], offset[2]);
+      mesh.traverse((child) => {
+        if (!child.isMesh) return;
+        const map = child.material.map;
+        if (map) map.colorSpace = THREE.SRGBColorSpace;
+        child.material.dispose();
+        child.material = new THREE.MeshBasicMaterial({ map, side: THREE.DoubleSide });
+      });
+      const s = createSplat(`../output2/${scene}_hybrid.ply`);
+      await s.initialized;
+      const group = new THREE.Group();
+      group.add(mesh, s);
+      return group;
+    }
+
+    // Splat count of whatever content is loaded (for FPS reports).
+    function countSplats(obj) {
+      let n = 0;
+      obj.traverse((child) => { if (child instanceof SplatMesh) n += child.numSplats ?? 0; });
+      return n;
+    }
+
+    async function loadContent(scene) {
+      if (lodMode === 'hybrid') {
+        const url = `../output2/${scene}_hybrid.glb`;
+        try {
+          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadHybrid(scene);
+        } catch (e) {
+          console.error(`Failed to load ${url}:`, e);
+        }
+        console.warn(`No ${url}; using full splats.`);
+      }
+      if (lodMode === 'layers') {
+        const url = `../output2/${scene}_layers.glb`;
+        try {
+          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadLayers(url);
+        } catch (e) {
+          console.error(`Failed to load ${url}:`, e);
+        }
+        console.warn(`No ${url}; using full splats.`);
+      }
+      const s = createSplat(await splatUrlFor(scene));
+      await s.initialized;
+      return s;
+    }
+
+    // Apply the GUI's showSplat / showMesh checkboxes to loaded content:
+    // SplatMeshes follow showSplat, every other mesh (hybrid mesh, baked
+    // layers) follows showMesh. Set per object, not on the parent group, so
+    // hiding one part of a hybrid scene leaves the other visible.
+    function applyVisibility(obj) {
+      if (!obj) return;
+      obj.traverse((child) => {
+        if (child instanceof SplatMesh) child.visible = guiParams.showSplat;
+        else if (child.isMesh) child.visible = guiParams.showMesh;
+      });
+    }
+
+    function disposeContent(obj) {
+      obj.traverse((child) => {
+        if (child instanceof SplatMesh) { child.dispose(); return; }
+        if (!child.isMesh) return;
+        child.geometry.dispose();
+        child.material.map?.dispose();
+        child.material.dispose();
+      });
+    }
+
+    let splat;
+    if (hybrid === "true") {
+      splat = createSplat(splatURL);
+    } else if (lodMode === 'layers' || lodMode === 'hybrid') {
+      splat = await loadContent(file);
+    } else {
+      splat = createSplat(splatURL);  // shows progressively while loading
+    }
+    xrRoot.add(splat);
+
+    // --- Scene stepping in XR: right controller A = next, B = previous ---
+    // The page can't reload without ending the XR session, so swap the splat in
+    // place; when the session ends on a different scene, reload into it so the
+    // desktop camera/meta match.
+    const initialScene = file;
+    let sceneList = null;
+    let switching = false;
+    async function stepScene(delta) {
+      if (switching) return;
+      switching = true;
+      try {
+        if (!sceneList) sceneList = await (await fetch('/scenes')).json();
+        if (sceneList.length === 0) return;
+        const idx = sceneList.indexOf(file);
+        file = sceneList[(idx + delta + sceneList.length) % sceneList.length];
+        // Keep the old scene visible until the next one is loaded.
+        const next = await loadContent(file);
+        applyVisibility(next);
+        xrRoot.add(next);
+        xrRoot.remove(splat);
+        disposeContent(splat);
+        splat = next;
+        const url = new URL(window.location);
+        url.searchParams.set('scene', file);
+        history.replaceState(null, '', url);
+      } catch (e) {
+        console.error('Scene switch failed:', e);
+      } finally {
+        switching = false;
+      }
+    }
+    renderer.xr.addEventListener('sessionend', () => {
+      if (file !== initialScene) window.location.reload();
+    });
+
+    // xr-standard gamepad mapping on Quest: buttons[4] = A, buttons[5] = B (right hand).
+    const prevPressed = [false, false];
+    function pollSceneButtons() {
+      const session = renderer.xr.getSession();
+      if (!session) return;
+      for (const source of session.inputSources) {
+        if (source.handedness !== 'right' || !source.gamepad) continue;
+        const buttons = source.gamepad.buttons;
+        [4, 5].forEach((b, i) => {
+          const pressed = !!(buttons[b] && buttons[b].pressed);
+          if (pressed && !prevPressed[i]) stepScene(i === 0 ? 1 : -1);
+          prevPressed[i] = pressed;
+        });
+      }
+    }
 
     let meshObj = null;
 
@@ -353,9 +664,10 @@
       speed: 1,
       center: 50,
       showMesh: true,
-      showSplat: true
+      showSplat: true,
+      sortOnce: true
     };
-    splat.visible = guiParams.showSplat;
+    applyVisibility(splat);
 
     if (hybrid == "true") {
       /*
@@ -379,7 +691,7 @@
         model.quaternion.set(1, 0, 0, 0);
         model.position.set(0, 0, 0);
         model.visible = guiParams.showMesh;
-        scene.add(model);
+        xrRoot.add(model);
         meshObj = model;
 
 
@@ -422,10 +734,10 @@
     });
     gui.add(guiParams, 'showMesh').onChange((value) => {
       if (meshObj) meshObj.visible = value;
+      applyVisibility(splat);
     });
-    gui.add(guiParams, 'showSplat').onChange((value) => {
-      if (splat) splat.visible = value;
-    });
+    gui.add(guiParams, 'showSplat').onChange(() => applyVisibility(splat));
+    gui.add(guiParams, 'sortOnce').onChange(setSortOnce);
     if (ui === "false") {
       gui.hide();
     }
@@ -443,6 +755,8 @@
 
     renderer.setAnimationLoop(function animate(time) {
       stats.begin();
+      pollSceneButtons();
+      reportXRFps();
       // let amplitude = guiParams.amplitude * 0.005 * distance;
       let amplitude = guiParams.amplitude * 0.05;
       let speed = guiParams.speed * 0.001;

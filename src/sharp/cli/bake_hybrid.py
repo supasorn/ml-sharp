@@ -147,13 +147,14 @@ def plane_fit_error(disp: np.ndarray, weight: np.ndarray, x0, y0, s):
     return np.sqrt(np.maximum(sse, 0) / np.maximum(sums["1"], 1))
 
 
-def quadtree_blocks(hard_bad, soft_bad, disp, max_err, max_soft, max_block, min_block):
+def quadtree_blocks(hard_bad, soft_bad, disp, max_err, max_soft, max_block, min_block, max_depth_ratio=0.0):
     """Accepted leaf blocks (x, y, size) of an adaptive quadtree over the grid points.
 
     A block is accepted when it has no `hard_bad` pixels (depth edges,
     uncovered), at most `max_soft` fraction of `soft_bad` pixels (their
-    Gaussians are kept and drawn over the mesh), and a plane fits the
-    disparity of its remaining pixels within `max_err`.
+    Gaussians are kept and drawn over the mesh), a plane fits the
+    disparity of its remaining pixels within `max_err`, and (if
+    `max_depth_ratio` > 0) its depth varies by at most that fraction.
     """
     H, W = hard_bad.shape
     sat = lambda m: np.pad(m.astype(np.int64).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
@@ -176,6 +177,13 @@ def quadtree_blocks(hard_bad, soft_bad, disp, max_err, max_soft, max_block, min_
         ok = fits & (n_hard == 0) & (n_soft <= max_soft * area)
         if ok.any():
             ok[ok] = plane_fit_error(disp, good, x0[ok], y0[ok], s) <= max_err
+        if max_depth_ratio > 0 and ok.any():
+            # Steep blocks are mostly depth edges the slope-aware edge test took for slopes (smooth
+            # predicted depth across foliage edges); from the side they become slivers.
+            idx = np.nonzero(ok)[0]
+            ratio = np.array([disp[y0[i]:y1[i], x0[i]:x1[i]].max() / max(disp[y0[i]:y1[i], x0[i]:x1[i]].min(), 1e-9)
+                              for i in idx])
+            ok[idx[ratio > 1 + max_depth_ratio]] = False
         accepted += [(x, y, s) for x, y in zip(x0[ok], y0[ok])]
         # Split the rest, unless they're entirely unusable.
         split = ~ok & (n_hard + n_soft < area)
@@ -352,7 +360,8 @@ def bake(path: Path, args) -> None:
     # 2. Quadtree of large planar blocks; tolerance = parallax error in pixels
     # at the full head move.
     max_err = args.parallax_px / (f * args.move)
-    blocks = quadtree_blocks(hard_bad, soft_bad, disp, max_err, args.max_soft, args.max_block, args.min_block)
+    blocks = quadtree_blocks(hard_bad, soft_bad, disp, max_err, args.max_soft, args.max_block, args.min_block,
+                             args.max_depth_ratio)
     rc, faces = triangulate(blocks, H, W)
     verts = rays[rc[:, 0], rc[:, 1]] * depth[rc[:, 0], rc[:, 1], None] * (1 + args.mesh_offset)
     uv = (rc[:, ::-1] + 0.5) / [W, H]
@@ -444,6 +453,9 @@ def bake(path: Path, args) -> None:
               help="Max on-screen error (pixels at grid resolution) from approximating depth with a flat triangle.")
 @click.option("--max-block", default=64, show_default=True, help="Largest quadtree block (grid pixels).")
 @click.option("--min-block", default=2, show_default=True, help="Smallest quadtree block (grid pixels). 1 removes more Gaussians for more triangles.")
+@click.option("--max-depth-ratio", default=0.0, show_default=True,
+              help="If > 0, reject mesh blocks whose depth varies by more than this fraction (e.g. 0.05): they are "
+                   "mostly depth edges taken for steep slopes, which show as slivers from the side.")
 @click.option("--name-suffix", default="_hybrid", show_default=True, help="Output name suffix (e.g. _hybrid_s2 for a variant).")
 @click.option("--keep-move", default=1.0, show_default=True, type=float,
               help="Head movement (m) within which hidden splats that could become visible are kept. Larger than "

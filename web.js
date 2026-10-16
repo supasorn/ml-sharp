@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
+const { execFile } = require('child_process');
 
 const app = express();
 const PORT = 3000;
@@ -38,6 +39,45 @@ app.post('/fps', express.json(), (req, res) => {
     });
   });
   res.sendStatus(204);
+});
+
+// Small JPEG thumbnail of a scene's photo (for the in-XR gallery), made once with
+// the sharp conda env's Pillow (EXIF orientation applied) and cached.
+const THUMB_DIR = path.join(__dirname, 'renderings', 'thumbs');
+app.get('/thumb/:scene', (req, res) => {
+  const scene = req.params.scene;
+  const jsonPath = path.join(__dirname, 'output2', scene + '.json');
+  if (scene.includes('/') || scene.includes('..') || !fs.existsSync(jsonPath)) return res.sendStatus(404);
+  const out = path.join(THUMB_DIR, scene + '.jpg');
+  if (fs.existsSync(out)) return res.sendFile(out);
+  let image;
+  try { image = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).image; } catch (e) { return res.sendStatus(404); }
+  const src = path.join(__dirname, 'images', image || '');
+  if (!image || !fs.existsSync(src)) return res.sendStatus(404);
+  fs.mkdirSync(THUMB_DIR, { recursive: true });
+  const py = 'import sys\nfrom PIL import Image, ImageOps\nim = ImageOps.exif_transpose(Image.open(sys.argv[1])).convert("RGB")\n' +
+             'im.thumbnail((384, 384))\nim.save(sys.argv[2], quality=85)';
+  execFile('/conda_envs/sharp/bin/python', ['-c', py, src, out], (err) => {
+    if (err) { console.error('thumbnail failed:', scene, err.message); return res.sendStatus(500); }
+    res.sendFile(out);
+  });
+});
+
+// View modes a scene can be shown in (gallery page and in-XR gallery grey out the rest).
+function sceneModes(dir, name) {
+  const has = (suffix) => fs.existsSync(path.join(dir, name + suffix));
+  const modes = ['full'];
+  if (has('_hybrid.glb') && has('_hybrid.ply')) modes.push('hybrid');
+  if (has('_mpi.glb')) modes.push('mpi');
+  return modes;
+}
+app.get('/scene-modes', (req, res) => {
+  const dir = path.join(__dirname, 'output2');
+  try {
+    res.json(Object.fromEntries(sortedSceneNames(dir).map((n) => [n, sceneModes(dir, n)])));
+  } catch (e) {
+    res.status(500).send('Cannot read directory');
+  }
 });
 
 // Same order as /list, as JSON (used by the viewer to step through scenes).
@@ -79,7 +119,7 @@ app.get('/list', (req, res) => {
       }
       const imgSrc = `/images/${encodeURIComponent(imageName)}`;
       return `
-        <div class="scene-item">
+        <div class="scene-item" data-modes="${sceneModes(dir, name).join(' ')}">
           <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
             <img src='${imgSrc}' alt='${name}' />
           </a>
@@ -172,7 +212,7 @@ app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
   // Delete all files in output2/ with the same base name, plus files derived
   // from it (bake-hybrid / bake-layers / quest-lod outputs and previews).
   // Exact suffixes, so deleting "foo" never touches "foo_2".
-  const derived = ['_hybrid.glb', '_hybrid.ply', '_layers.glb', '_quest.ply',
+  const derived = ['_hybrid.glb', '_hybrid.ply', '_surfaces.glb', '_patches.glb', '_mpi.glb', '_surfaces_mesh.glb', '_patches_mesh.glb', '_mpi_mesh.glb', '_layers.glb', '_quest.ply',
                    '_hybrid_vs_splats.jpg', '_hybrid_coverage.jpg', '_layers_vs_splats.jpg']
     .map(suffix => scene + suffix);
   const files = fs.readdirSync(outputDir);

@@ -16,6 +16,10 @@ Quick facts:
   the hybrid-bake watcher (`sharp bake-hybrid -i output2 --watch`).
 - Bake hybrids: `sharp bake-hybrid -i output2` (outputs next to each scene);
   how-to with options and troubleshooting: `docs/hybrid-baking.md`.
+- Hybrid-MPI (`?lod=mpi`, gallery "Hybrid-MPI"): hybrid mesh + the remaining
+  splats as a sparse multi-plane image; bake all scenes with
+  `python scripts/bake_mpi.py` (not automatic for new scenes). Design, numbers
+  and pitfalls (premultiplied textures must not be sRGB): findings doc §4b, §7.
 - Quest 3 splat rendering is GPU-bound by per-splat vertex work; the viewer
   draws splats non-instanced as triangles (`web/js/splatFlat.js`). Measure
   speed with a self-running headset benchmark (`web/js/xrBench.js`) and the

@@ -15,7 +15,12 @@
  *
  * SECONDARY CONTROLLER:
  * - Thumbstick Up/Down: Scale the scene.
+ * - Button A/X (4): Open/close the scene gallery (if `gallery` is given).
  * - Button B/Y (5): Open/close the settings menu.
+ *
+ * SCENE GALLERY (web/js/XRGallery.js): point with either controller, trigger
+ * picks a scene or view mode; thumbstick left/right pages. Other controls are
+ * paused while it's open (holding the main A/X still exits).
  *
  * SETTINGS MENU (thumbstick to navigate, trigger to select):
  * - Swap main/secondary hand, main on/off, secondary on/off,
@@ -35,6 +40,7 @@ export class XRSceneController {
    *   onStepScene(delta), onReloadScene(), onDeleteScene(): scene callbacks.
    *   onExit(): leave the XR session.
    *   homePush: metres the scene starts (and resets) in front of its default spot.
+   *   gallery: optional XRGallery, toggled with the secondary A/X.
    */
   constructor(renderer, camera, scene, options = {}) {
     this.renderer = renderer;
@@ -50,6 +56,7 @@ export class XRSceneController {
     this.onExit = options.onExit || (() => {});
     this.onDeleteScene = options.onDeleteScene || (() => {});
     this.homePush = options.homePush || 0;
+    this.gallery = options.gallery || null;
 
     this.minScale = 0.05;
     this.maxScale = 20;
@@ -211,6 +218,7 @@ export class XRSceneController {
     this.content.position.set(0, 0, 0);
     this.content.quaternion.identity();
     this.menuGroup.visible = false;
+    this.gallery?.close();
     this.baseSpace = null;
     this.placePos.set(0, 0, 0);
     this.placeQuat.identity();
@@ -223,13 +231,14 @@ export class XRSceneController {
     const session = this.renderer.xr.getSession();
     if (!session) return;
 
-    const motionUD = [0, 0];
+    const motionUD = [0, 0], motionLR = [0, 0];
     for (const source of session.inputSources) {
       const hand = source.handedness === "left" ? 0 : source.handedness === "right" ? 1 : -1;
       if (hand < 0 || !source.gamepad || !source.gamepad.buttons) continue;
       // Dead zone: a slightly off-centre stick must not keep nudging the scene.
       const ud = source.gamepad.axes[3] || 0;
       if (Math.abs(ud) > 0.15) motionUD[hand] = ud;
+      motionLR[hand] = source.gamepad.axes[2] || 0;
       source.gamepad.buttons.forEach((button, i) => {
         const b = this.butts[hand][i];
         if (!b) return;
@@ -251,6 +260,18 @@ export class XRSceneController {
     const mCont = this.conts[mInd];
     const mUD = motionUD[mInd], sUD = motionUD[sInd];
     const mButt = this.butts[mInd], sButt = this.butts[sInd];
+
+    // Scene gallery (secondary A/X): takes all other input while open.
+    if (this.gallery) {
+      if (sButt[4].clicked) {
+        if (this.menuGroup.visible) this.toggleMenu();
+        this.gallery.toggle();
+      }
+      if (this.gallery.visible) {
+        this.gallery.update(this.conts, [this.butts[0][0].clicked, this.butts[1][0].clicked], motionLR);
+        return;
+      }
+    }
 
     // Settings menu (secondary B/Y).
     if (sButt[5].clicked) this.toggleMenu();

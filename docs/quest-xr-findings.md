@@ -18,11 +18,12 @@ original: 1.18M). Quality test scene: `20251023_155037` (palm trees, people).
 | Other bakes | `sharp bake-layers`, `sharp quest-lod` | Older approaches (see §5); `bake_layers.py` also hosts shared helpers (gsplat loading, splat rendering, edge detection). |
 | Whole stack | `scripts/start_server.sh` | Web server + prediction watcher (GPU 0) + `bake-hybrid --watch` (GPU 1); photos dropped on the gallery become hybrids automatically. Logs in `logs/`. |
 | Server | `node web.js` | HTTP 3000, HTTPS 3443 (WebXR needs HTTPS; cert/key in `certs/`, git-ignored). `/` → gallery `/list`; `/scenes` JSON; `/fps` logs XR reports to `logs/xr_perf.jsonl` (git-ignored); `/delete` removes a scene and its derived files. |
-| Viewer | `web/index.html` | Spark 0.1.10 + three.js r178. `?lod=full|hybrid|layers|quest`. |
-| XR controls | `web/js/XRSceneController.js` | Ported from `/projects/img3dviewer`'s `XRMeshController`. |
+| Hybrid-MPI bake | `python scripts/bake_mpi.py` (all scenes, one per GPU; `--reexport`, `--overwrite`) | Per scene: `bake-hybrid --keep-move 0.3 --max-depth-ratio 0.05` into `renderings/mpi_work/`, then the remaining splats as a sparse MPI (`scripts/eval_alpha_patches.py` MPI mode). Writes `<scene>_mpi_mesh.glb` + `<scene>_mpi.glb` to `output2/`. ~50 s/scene/GPU. See §4b. Not run automatically for new scenes. |
+| Viewer | `web/index.html` | Spark 0.1.10 + three.js r178. `?lod=full|hybrid|mpi|layers|quest` (`patches`, `surfaces`: experimental). |
+| XR controls | `web/js/XRSceneController.js` | Ported from `/projects/img3dviewer`'s `XRMeshController`. Secondary X opens the in-XR gallery (`web/js/XRGallery.js`: thumbnails from `/thumb/<scene>`, view-mode buttons, scenes without the mode greyed out via `/scene-modes`). |
 | Splat drawing | `web/js/splatFlat.js` | Non-instanced, one triangle per splat (default). See §3. |
 | Benchmarks | `web/js/xrBench.js` | Self-running in-headset benchmarks (`?bench=<name>`). |
-| Gallery | `web/list.html` | Original/Hybrid switch, XR options, presets, Performance tests panel (hidden when no test is pending). |
+| Gallery | `web/list.html` | Original / Hybrid / Hybrid-MPI switch (scenes without the mode greyed out), XR options, presets, Performance tests panel (hidden when no test is pending). |
 
 **GPU environment quirk:** the cached gsplat CUDA extension was built with the
 system CUDA 13 toolkit while PyTorch is cu128. `load_gsplat()` in
@@ -171,6 +172,42 @@ left uncovered): with `--keep-move` 0.4 → 0.01% @0.45 m, 1.4% @0.6 m, 2.2%
 
 ---
 
+## 4b. Hybrid-MPI: the remaining splats as a sparse multi-plane image
+
+Idea: keep the hybrid mesh and pre-render *all* remaining splats into
+semi-transparent textured quads, so the Quest draws ~100k triangles instead of
+~500k splats. What made it work (each step fixed a failure, offline numbers on
+`20260104_122019_7039`, dB vs the original splats at 10 / 30 cm head moves;
+hybrid 32.5 / 26.4):
+
+1. **No splats may be left** between layers: layers mixed with leftover
+   splats can't be drawn in a correct order (best ~1 dB loss + grainy edges).
+2. **Overlapping spans, not cut surfaces**: heightfield meshes split at depth
+   jumps fall apart into floating squares (−3.6 dB even with 6.8M triangles).
+   Patches that cover their splats' full footprints and fade out like them
+   (per-tile flat depth slices) were within ~0.3 dB.
+3. **Flat patches only**: RANSAC tilted planes mixed foreground and
+   background splats in one patch (input view 23 dB).
+4. **Sparse MPI** (128 global bins uniform in disparity; each bin's splats
+   rendered together and cut into 16-px cells, empty cells dropped): cells of
+   a bin abut on one plane (no margins), bins are disjoint in depth, so mesh →
+   bins back to front is the right order and overdraw halves (26× vs 53×) for
+   32.0 / 25.9 dB. 64 bins: 30.7 / 24.5 at 16×; 256 bins: 32.3 / 26.2 at 43×.
+5. **`--max-depth-ratio 0.05`** in the hybrid bake: blocks whose depth varies
+   >5% are mostly foliage edges taken for steep slopes and show as slivers
+   pointing away once the splats that hid them are gone.
+6. **Export**: cells keep a 2-texel border of *real* neighbour texels and the
+   viewer disables mipmaps (else seams show as short lines); per-cell adaptive
+   texture resolution (half resolution unless the cell loses > 0.003 of
+   detail, ≤ 4 pages of 4096²) keeps foliage sharp.
+7. **Viewer must not treat the premultiplied textures as sRGB** (see §7).
+
+Headset (`20200927_161631`, xrscale 1, foveation 0): hybrid 33 fps; per-tile
+patches 46–54 fps (varies with view direction → fill-bound, 71× overdraw); the
+MPI (24× overdraw) has not been benchmarked yet.
+
+---
+
 ## 5. Approaches that did not work (and why)
 
 | Approach | Outcome | Why |
@@ -184,6 +221,7 @@ left uncovered): with `--keep-move` 0.4 → 0.01% @0.45 m, 1.4% @0.6 m, 2.2%
 | Multiview (both eyes in one pass) | Not attempted | three r178's WebGLRenderer has no multiview (only its WebGPU renderer); Spark needs WebGLRenderer |
 | Lowering resolution / foveation for speed | Little gain | Not fill-bound |
 | Semi-transparent textured layers for the remaining hybrid splats (`scripts/eval_alpha_layers.py`, offline only) | Not built | Geometrically promising: per 16-px tile, ≤4 tilted planes within 0.5 px parallax at 1 m take a median 37% of the remaining splats (26–67% over 8 scenes; 3–8× extra blended overdraw). But ~60% of the remaining splats lie *between* layers in depth (mostly hidden splats kept for reveals), and no viewer draw order fixes that: best (mesh → sorted layers writing depth where α > 0.5 → splats) costs ~1 dB at 0.15 m and grainy edges at the input view (36 vs 52 dB). Layers only behind every remaining splat of their tile keep 0.2%. The highest-payoff scene ghosts even with exact per-pixel order (−4 dB, smeared people) |
+| Mesh + *all* remaining splats as K non-flat alpha surfaces (`scripts/eval_alpha_surfaces.py`, `eval_alpha_surfaces2.py`, offline, 0.3 m range) | Not built | Depth peeling into K heightfield meshes (depth + RGBA from a render of each surface's splats). Test scene vs hybrid at 0.1 / 0.3 m: −3.6 / −3.0 dB even at 2-px vertex spacing (6.8M tris); K = 8: −2.7 / −2.3 dB (14M tris). Splitting cells at depth jumps, depth smoothing and multi-view texture optimisation (24 views) didn't help (≤ +0.6 dB at 0.3 m, worse at small moves). Diagnostic: draw order costs < 1 dB; flattening the edge/volumetric splats onto one depth per pixel costs the rest. Superseded by overlapping patches → sparse MPI (§4b) |
 
 ---
 
@@ -216,6 +254,15 @@ The harness renders splats with gsplat and meshes with pyvista/VTK:
   spill around the mesh border with the nearest mesh colour, not black.
 - PSNR vs the photo is ~18–22 dB even when perfect (splat renders are softer);
   compare against splat renders instead.
+- **Premultiplied RGBA textures must not be sRGB textures**: the GPU decodes
+  colour to linear before filtering, so filtered texels at soft edges get more
+  colour than their alpha (bright contours along every MPI bin boundary). The
+  viewer samples them raw (`NoColorSpace`) in a minimal ShaderMaterial with no
+  output conversion. An offline emulator of the viewer has to model this (and
+  the draw order), or it misses such artifacts.
+- Vertices exactly on pixel centres plus an inclusive inside test count each
+  pixel ~3× in a software rasteriser (too opaque); use half-open tests and
+  nudge vertices. Sort keys packing pixel·1e7 + order must keep |order| < 1e7.
 - `scripts/eval_alpha_layers.py` is a gsplat-only alternative: the mesh (and
   any planar layers) are ray-cast per eye pixel and composited as tiny
   per-pixel Gaussians (`eps2d` ≈ 0 so they don't leak), giving exact

@@ -31,6 +31,11 @@
       margin: 0 auto;
     }
 
+    .scene-item.unavailable {
+      opacity: 0.3;
+      filter: grayscale(1);
+      pointer-events: none;
+    }
     .scene-item {
       width: 250px;
       background: #23272e;
@@ -325,6 +330,7 @@
       <div class="seg" id="lodSeg">
         <button type="button" data-lod="full">Original splats</button>
         <button type="button" data-lod="hybrid">Hybrid</button>
+        <button type="button" data-lod="mpi" title="Hybrid mesh + the remaining splats as a sparse multi-plane image (scripts/bake_mpi.py); falls back to the original splats when not baked">Hybrid-MPI</button>
       </div>
     </div>
     <div class="opt-group" title="Eye-buffer resolution in AR/VR (1 = full)">
@@ -463,6 +469,11 @@
         url.searchParams.set('xrpush', opts.xrpush);
         url.searchParams.set('adaptive', opts.adaptive ? '1' : '0');
         $(this).attr('href', url.pathname + url.search);
+      });
+      // Grey out scenes that don't have the selected view mode (not baked yet).
+      $('.scene-item').each(function () {
+        const modes = ($(this).data('modes') || 'full').split(' ');
+        $(this).toggleClass('unavailable', !modes.includes(opts.lod));
       });
     }
 

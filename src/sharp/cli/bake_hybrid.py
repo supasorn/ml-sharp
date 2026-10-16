@@ -336,7 +336,7 @@ def bake(path: Path, args) -> None:
 @click.option("--parallax-px", default=0.5, show_default=True,
               help="Max on-screen error (pixels at grid resolution) from approximating depth with a flat triangle.")
 @click.option("--max-block", default=64, show_default=True, help="Largest quadtree block (grid pixels).")
-@click.option("--min-block", default=4, show_default=True, help="Smallest quadtree block (grid pixels).")
+@click.option("--min-block", default=2, show_default=True, help="Smallest quadtree block (grid pixels). 1 removes more Gaussians for more triangles.")
 @click.option("--footprint-sigma", default=2.0, show_default=True,
               help="Gaussian footprint radius (in sigmas) that must lie inside the mesh for it to be removed.")
 @click.option("--border-px", default=1.0, show_default=True, help="Extra margin (pixels) keeping Gaussians near the mesh border.")

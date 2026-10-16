@@ -152,6 +152,67 @@
       border-radius: 4px;
       font-size: 18px;
     }
+    /* View options bar */
+    #options {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px 24px;
+      margin: 8px;
+      padding: 12px 16px;
+      background: #23272e;
+      border-radius: 12px;
+    }
+    .opt-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .opt-label {
+      color: #8a94a3;
+      font-size: 14px;
+    }
+    .seg {
+      display: inline-flex;
+      background: #181c20;
+      border-radius: 8px;
+      padding: 3px;
+    }
+    .seg button {
+      background: transparent;
+      color: #cfd6df;
+      border: none;
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    .seg button.active {
+      background: #0066cc;
+      color: #fff;
+    }
+    .opt-group input[type=range] {
+      width: 110px;
+      accent-color: #4f8cff;
+    }
+    .opt-value {
+      min-width: 2.8em;
+      color: #b2d1ff;
+      font-variant-numeric: tabular-nums;
+      font-size: 14px;
+    }
+    .preset {
+      background: #3a414b;
+      color: #fff;
+      border: none;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .preset:hover {
+      background: #4a525e;
+    }
     /* Toggle Switch Styles */
     .toggle-switch {
       position: relative;
@@ -220,6 +281,35 @@
     <span class="slider"></span>
   </label>
   <span class="toggle-label" id="toggleDeleteLabel">Delete: Off</span>
+  <div id="options">
+    <div class="opt-group">
+      <span class="opt-label">View</span>
+      <div class="seg" id="lodSeg">
+        <button type="button" data-lod="full">Original splats</button>
+        <button type="button" data-lod="hybrid">Hybrid</button>
+      </div>
+    </div>
+    <div class="opt-group" title="Eye-buffer resolution in AR/VR (1 = full)">
+      <span class="opt-label">xrscale</span>
+      <input type="range" id="optXrscale" min="0.5" max="1" step="0.05">
+      <span class="opt-value" id="valXrscale"></span>
+    </div>
+    <div class="opt-group" title="Quest fixed foveated rendering (0 = off, 1 = max; blurs the view's edges)">
+      <span class="opt-label">foveation</span>
+      <input type="range" id="optFoveation" min="0" max="1" step="0.1">
+      <span class="opt-value" id="valFoveation"></span>
+    </div>
+    <div class="opt-group" title="Splat extent in sigmas in AR/VR (2.24 = faster, 2.83 = Spark default, smoother)">
+      <span class="opt-label">xrstddev</span>
+      <input type="range" id="optXrstddev" min="1.8" max="3" step="0.01">
+      <span class="opt-value" id="valXrstddev"></span>
+    </div>
+    <div class="opt-group">
+      <button type="button" class="preset" id="presetDefault">Defaults</button>
+      <button type="button" class="preset" id="presetFull">Full quality</button>
+    </div>
+  </div>
+
   <div id="progressContainer" style="display:none;">
     <div id="progressBar">0%</div>
   </div>
@@ -271,7 +361,54 @@
       });
     }
 
+    // --- View options: applied to every scene link ---
+    // Viewer defaults (web/index.html): lod=full, xrscale=0.8, foveation=1, xrstddev=sqrt(5).
+    const DEFAULT_OPTS = { lod: 'full', xrscale: 0.8, foveation: 1, xrstddev: 2.24 };
+    const FULL_QUALITY = { xrscale: 1, foveation: 0, xrstddev: 2.83 };
+    let opts = { ...DEFAULT_OPTS };
+    try {
+      opts = { ...opts, ...JSON.parse(localStorage.getItem('sceneViewOpts') || '{}') };
+    } catch (e) {}
+
+    function saveOpts() {
+      try { localStorage.setItem('sceneViewOpts', JSON.stringify(opts)); } catch (e) {}
+    }
+
+    function applyOpts() {
+      $('#lodSeg button').each(function () {
+        $(this).toggleClass('active', $(this).data('lod') === opts.lod);
+      });
+      $('#optXrscale').val(opts.xrscale); $('#valXrscale').text(Number(opts.xrscale).toFixed(2));
+      $('#optFoveation').val(opts.foveation); $('#valFoveation').text(Number(opts.foveation).toFixed(1));
+      $('#optXrstddev').val(opts.xrstddev); $('#valXrstddev').text(Number(opts.xrstddev).toFixed(2));
+      // Rewrite each scene link, keeping scene (first) and ui as they are.
+      $('.scene-item a').each(function () {
+        const url = new URL($(this).attr('href'), window.location.href);
+        url.searchParams.set('lod', opts.lod);
+        url.searchParams.set('xrscale', opts.xrscale);
+        url.searchParams.set('foveation', opts.foveation);
+        url.searchParams.set('xrstddev', opts.xrstddev);
+        $(this).attr('href', url.pathname + url.search);
+      });
+    }
+
+    function setOpts(changes) {
+      opts = { ...opts, ...changes };
+      saveOpts();
+      applyOpts();
+    }
+
     $(document).ready(function () {
+      applyOpts();
+      $('#lodSeg').on('click', 'button', function () { setOpts({ lod: $(this).data('lod') }); });
+      $('#optXrscale').on('input', function () { setOpts({ xrscale: parseFloat(this.value) }); });
+      $('#optFoveation').on('input', function () { setOpts({ foveation: parseFloat(this.value) }); });
+      $('#optXrstddev').on('input', function () { setOpts({ xrstddev: parseFloat(this.value) }); });
+      $('#presetDefault').on('click', function () {
+        setOpts({ xrscale: DEFAULT_OPTS.xrscale, foveation: DEFAULT_OPTS.foveation, xrstddev: DEFAULT_OPTS.xrstddev });
+      });
+      $('#presetFull').on('click', function () { setOpts(FULL_QUALITY); });
+
       // Toggle delete switch
       $('#toggleDelete').on('change', function() {
         if ($(this).is(':checked')) {

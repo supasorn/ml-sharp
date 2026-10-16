@@ -89,6 +89,10 @@
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
     import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js';
   import { SparkRenderer } from "@sparkjsdev/spark";
+    import { XRSceneController } from "/js/XRSceneController.js";
+    import { ARButton } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/webxr/ARButton.js";
+    import { FontLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/FontLoader.js";
+    import { TextGeometry } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/geometries/TextGeometry.js";
 
     const stats = new Stats();
     // const offset = [0, -2, -5];
@@ -223,59 +227,61 @@
     const xrStdDev = parseFloat(getQueryParam('xrstddev') || String(Math.sqrt(5)));
     renderer.xr.setFramebufferScaleFactor(xrScale);
     renderer.xr.setFoveation(xrFoveation);
-    document.body.appendChild(createXRButton(renderer));
+    // AR: three.js's stock ARButton, exactly as img3dviewer starts AR
+    // (immersive-ar + dom-overlay, 'local' reference space). Our earlier custom
+    // AR request (only 'local', no dom-overlay) made the Quest 3 switch to its
+    // roomscale boundary; with this request, stationary mode sticks (tested on
+    // the headset).
+    // VR: our own button, requesting only 'local' (three's VRButton would also
+    // ask for bounded-floor, which may pull the Quest towards roomscale).
+    document.body.appendChild(ARButton.createButton(renderer));
+    document.body.appendChild(createVRButton(renderer));
 
-    // Tries passthrough AR first and falls back to VR if AR isn't offered or the
-    // request is refused (e.g. some Quest boundary modes). Only 'local' space is
-    // used, which works in both roomscale and stationary boundary modes.
-    function createXRButton(renderer) {
+    function createVRButton(renderer) {
       const button = document.createElement('button');
       Object.assign(button.style, {
-        position: 'fixed', bottom: '20px', left: 'calc(50% - 75px)', width: '150px',
+        position: 'absolute', bottom: '20px', left: 'calc(50% - 237px)', width: '150px',
         padding: '12px 6px', border: '1px solid #fff', borderRadius: '4px',
-        background: 'rgba(0,0,0,0.4)', color: '#fff', font: '13px sans-serif',
-        zIndex: 999, cursor: 'pointer',
+        background: 'rgba(0,0,0,0.1)', color: '#fff', font: 'normal 13px sans-serif',
+        textAlign: 'center', opacity: '0.5', outline: 'none', zIndex: 999, cursor: 'pointer',
       });
+      button.textContent = 'ENTER VR';
       if (!navigator.xr) {
-        button.textContent = 'WEBXR NEEDS HTTPS';
+        button.textContent = 'VR NEEDS HTTPS';
         button.disabled = true;
         return button;
       }
-      let session = null;
-      const modes = [];
-      button.textContent = 'CHECKING XR...';
-      Promise.all(['immersive-ar', 'immersive-vr'].map(m =>
-        navigator.xr.isSessionSupported(m).catch(() => false)
-      )).then(([ar, vr]) => {
-        if (ar) modes.push('immersive-ar');
-        if (vr) modes.push('immersive-vr');
-        button.textContent = ar ? 'START AR' : vr ? 'ENTER VR' : 'XR NOT SUPPORTED';
-        button.disabled = modes.length === 0;
+      button.disabled = true;
+      navigator.xr.isSessionSupported('immersive-vr').catch(() => false).then((ok) => {
+        button.disabled = !ok;
+        if (!ok) button.textContent = 'VR NOT SUPPORTED';
       });
+      button.onmouseenter = () => { button.style.opacity = '1.0'; };
+      button.onmouseleave = () => { button.style.opacity = '0.5'; };
+      let session = null;
       button.onclick = async () => {
         if (session) { session.end(); return; }
-        for (const mode of modes) {
-          try {
-            session = await navigator.xr.requestSession(mode, { optionalFeatures: ['local'] });
-            await renderer.xr.setSession(session);
-            button.textContent = 'EXIT XR';
-            session.addEventListener('end', () => {
-              session = null;
-              button.textContent = modes[0] === 'immersive-ar' ? 'START AR' : 'ENTER VR';
-            });
-            return;
-          } catch (e) {
-            console.warn(`Failed to start ${mode}:`, e);
-            session = null;
-          }
+        if (renderer.xr.isPresenting) return;  // an AR session is running
+        try {
+          session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local'] });
+          renderer.xr.setReferenceSpaceType('local');
+          await renderer.xr.setSession(session);
+          button.textContent = 'EXIT VR';
+          session.addEventListener('end', () => { session = null; button.textContent = 'ENTER VR'; });
+        } catch (e) {
+          console.warn('Failed to start immersive-vr:', e);
+          session = null;
+          button.textContent = 'VR FAILED (see console)';
         }
-        button.textContent = 'XR FAILED (see console)';
       };
       return button;
     }
 
-    // All scene content goes under xrRoot so it can be re-placed in AR.
+    // All scene content goes under xrRoot (placed/moved/scaled in AR) and its
+    // child xrContent (rotated by hand with the XR controller).
     const xrRoot = new THREE.Group();
+    const xrContent = new THREE.Group();
+    xrRoot.add(xrContent);
 
 
 
@@ -300,26 +306,9 @@
     // 3) Add SparkRenderer to the scene
     scene.add(spark);
     scene.add(xrRoot);
-    xrRoot.add(sortCamera);
+    xrContent.add(sortCamera);
     setSortOnce(true);
 
-    // In AR, pull a controller trigger (or pinch) to re-place the scene in front
-    // of your current head position, facing the direction you are looking.
-    function recenterXR() {
-      const xrCam = renderer.xr.getCamera();
-      const pos = new THREE.Vector3();
-      const quat = new THREE.Quaternion();
-      xrCam.getWorldPosition(pos);
-      xrCam.getWorldQuaternion(quat);
-      const yaw = new THREE.Euler().setFromQuaternion(quat, 'YXZ').y;
-      xrRoot.position.copy(pos);
-      xrRoot.rotation.set(0, yaw, 0);
-    }
-    for (let i = 0; i < 2; i++) {
-      const controller = renderer.xr.getController(i);
-      controller.addEventListener('select', recenterXR);
-      scene.add(controller);
-    }
     let desktopStdDev = spark.maxStdDev;
     renderer.xr.addEventListener('sessionstart', () => {
       desktopStdDev = spark.maxStdDev;
@@ -327,8 +316,6 @@
       renderer.xr.setFoveation(xrFoveation);
     });
     renderer.xr.addEventListener('sessionend', () => {
-      xrRoot.position.set(0, 0, 0);
-      xrRoot.rotation.set(0, 0, 0);
       spark.maxStdDev = desktopStdDev;
     });
 
@@ -428,9 +415,9 @@
     }
 
     const target = controls.target;
-    const initialDistance = camera.position.distanceTo(target);
+    let initialDistance = camera.position.distanceTo(target);
     const initialFov = THREE.MathUtils.degToRad(camera.fov);
-    const dollyConstant = initialDistance * Math.tan(initialFov / 2);
+    let dollyConstant = initialDistance * Math.tan(initialFov / 2);
     const dolly_dir = new THREE.Vector3()
       .subVectors(camera.position, target)
       .normalize();
@@ -603,9 +590,9 @@
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading
     }
-    xrRoot.add(splat);
+    xrContent.add(splat);
 
-    // --- Scene stepping in XR: right controller A = next, B = previous ---
+    // --- Scene stepping in XR (A = next, B = previous; see XRSceneController) ---
     // The page can't reload without ending the XR session, so swap the splat in
     // place; when the session ends on a different scene, reload into it so the
     // desktop camera/meta match.
@@ -618,13 +605,15 @@
       try {
         if (!sceneList) sceneList = await (await fetch('/scenes')).json();
         if (sceneList.length === 0) return;
-        const idx = sceneList.indexOf(file);
-        file = sceneList[(idx + delta + sceneList.length) % sceneList.length];
+        if (delta !== 0) {  // 0 reloads the current scene
+          const idx = sceneList.indexOf(file);
+          file = sceneList[(idx + delta + sceneList.length) % sceneList.length];
+        }
         // Keep the old scene visible until the next one is loaded.
         const next = await loadContent(file);
         applyVisibility(next);
-        xrRoot.add(next);
-        xrRoot.remove(splat);
+        xrContent.add(next);
+        xrContent.remove(splat);
         disposeContent(splat);
         splat = next;
         const url = new URL(window.location);
@@ -640,21 +629,38 @@
       if (file !== initialScene) window.location.reload();
     });
 
-    // xr-standard gamepad mapping on Quest: buttons[4] = A, buttons[5] = B (right hand).
-    const prevPressed = [false, false];
-    function pollSceneButtons() {
-      const session = renderer.xr.getSession();
-      if (!session) return;
-      for (const source of session.inputSources) {
-        if (source.handedness !== 'right' || !source.gamepad) continue;
-        const buttons = source.gamepad.buttons;
-        [4, 5].forEach((b, i) => {
-          const pressed = !!(buttons[b] && buttons[b].pressed);
-          if (pressed && !prevPressed[i]) stepScene(i === 0 ? 1 : -1);
-          prevPressed[i] = pressed;
+    // Delete the current scene from the XR menu: switch to the next scene
+    // first, then delete the old one's files on the server.
+    async function deleteCurrentScene() {
+      const victim = file;
+      if (!sceneList) sceneList = await (await fetch('/scenes')).json();
+      if (sceneList.length <= 1) return;
+      await stepScene(1);
+      if (file === victim) return;  // switch didn't happen
+      try {
+        await fetch('/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ scene: victim }),
         });
+        sceneList = sceneList.filter((name) => name !== victim);
+      } catch (e) {
+        console.error('Delete failed:', e);
       }
     }
+
+    // XR controls (ported from img3dviewer's XRMeshController); button map in
+    // web/js/XRSceneController.js.
+    const xrController = new XRSceneController(renderer, camera, scene, {
+      group: xrRoot,
+      content: xrContent,
+      FontLoader,
+      TextGeometry,
+      onStepScene: (delta) => stepScene(delta),
+      onReloadScene: () => stepScene(0),
+      onDeleteScene: () => deleteCurrentScene(),
+    });
+    renderer.xr.addEventListener('sessionend', () => xrController.resetAll());
 
     let meshObj = null;
 
@@ -691,7 +697,7 @@
         model.quaternion.set(1, 0, 0, 0);
         model.position.set(0, 0, 0);
         model.visible = guiParams.showMesh;
-        xrRoot.add(model);
+        xrContent.add(model);
         meshObj = model;
 
 
@@ -753,9 +759,92 @@
       }
     });
 
+    // --- Automatic orbit centre, computed at run time from the loaded scene ---
+    // The meta-based centre (disparity midpoint of min/max depth) is thrown
+    // off by stray near/far splats. Instead: project splat centres
+    // (subsampled) and mesh vertices into a coarse screen grid from the input
+    // camera, keep the nearest depth per cell (~ the visible surface), and
+    // orbit around a low percentile of those depths over the middle of the
+    // view -- the foreground subject rather than the sky behind it.
+    // ?autoorbit=false keeps the meta-based centre.
+    function setOrbitDepth(d) {
+      median_depth = d;  // resetView() (Space) returns here
+      center_depth = d;
+      controls.target.set(0, 0, -d);
+      initialDistance = d;  // dolly zoom is relative to the input camera at the origin
+      dollyConstant = initialDistance * Math.tan(initialFov / 2);
+      // Keep the GUI 'center' slider on the nearest of its preset depths.
+      let best = 0;
+      for (let i = 1; i < linspace.length; i++) {
+        if (Math.abs(1 / linspace[i] - d) < Math.abs(1 / linspace[best] - d)) best = i;
+      }
+      guiParams.center = best;
+      gui.updateDisplay();
+      controls.update();
+    }
+
+    async function autoOrbitCenter() {
+      const t0 = performance.now();
+      const GX = 40, GY = 30;
+      const nearest = new Float32Array(GX * GY).fill(Infinity);
+      const tanY = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+      const tanX = tanY * camera.aspect;
+      const p = new THREE.Vector3();
+      // World-space point; the input camera is at the origin looking down -z.
+      const addPoint = (v) => {
+        const z = -v.z;
+        if (z <= 0.05) return;
+        const gx = Math.floor((v.x / z / tanX * 0.5 + 0.5) * GX);
+        const gy = Math.floor((-v.y / z / tanY * 0.5 + 0.5) * GY);
+        if (gx < 0 || gx >= GX || gy < 0 || gy >= GY) return;
+        const k = gy * GX + gx;
+        if (z < nearest[k]) nearest[k] = z;
+      };
+      const splatObjs = [], meshObjs = [];
+      splat.traverse((c) => {
+        if (c instanceof SplatMesh) splatObjs.push(c);
+        else if (c.isMesh) meshObjs.push(c);
+      });
+      for (const sm of splatObjs) {
+        await sm.initialized;
+        sm.updateMatrixWorld(true);
+        const stride = Math.max(1, Math.ceil((sm.numSplats || 0) / 200000));
+        sm.forEachSplat((i, center, scales, quaternion, opacity) => {
+          if (i % stride || opacity < 0.5) return;
+          addPoint(p.copy(center).applyMatrix4(sm.matrixWorld));
+        });
+      }
+      for (const m of meshObjs) {
+        m.updateMatrixWorld(true);
+        const pos = m.geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) addPoint(p.fromBufferAttribute(pos, i).applyMatrix4(m.matrixWorld));
+      }
+      // Central 60% of the view.
+      const depths = [];
+      for (let gy = Math.floor(GY * 0.2); gy < Math.ceil(GY * 0.8); gy++) {
+        for (let gx = Math.floor(GX * 0.2); gx < Math.ceil(GX * 0.8); gx++) {
+          const d = nearest[gy * GX + gx];
+          if (Number.isFinite(d)) depths.push(d);
+        }
+      }
+      if (depths.length < 10) {
+        console.warn('Auto orbit centre: not enough samples; keeping', median_depth);
+        return;
+      }
+      depths.sort((a, b) => a - b);
+      const d = depths[Math.floor(0.4 * (depths.length - 1))];
+      console.log(`Auto orbit centre: ${d.toFixed(2)} m (meta-based ${median_depth.toFixed(2)} m), ` +
+                  `${depths.length} cells, ${(performance.now() - t0).toFixed(0)} ms`);
+      setOrbitDepth(d);
+    }
+
+    if (getQueryParam('autoorbit') !== 'false') {
+      autoOrbitCenter().catch((e) => console.warn('Auto orbit centre failed:', e));
+    }
+
     renderer.setAnimationLoop(function animate(time) {
       stats.begin();
-      pollSceneButtons();
+      xrController.update();
       reportXRFps();
       // let amplitude = guiParams.amplitude * 0.005 * distance;
       let amplitude = guiParams.amplitude * 0.05;

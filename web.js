@@ -7,8 +7,9 @@ const PORT = 3000;
 const imgdir = 'images';
 
 
-// Serve index.html at root
+// Bare root goes to the gallery; with query params (?scene=..., etc.) it's the viewer.
 app.get('/', (req, res) => {
+  if (Object.keys(req.query).length === 0) return res.redirect('/list');
   res.sendFile(path.join(__dirname, 'web', 'index.html'));
 });
 
@@ -93,6 +94,9 @@ app.use('/output2', express.static(path.join(__dirname, 'output2')));
 // Optionally serve static files from 'web' directory
 app.use('/images', express.static(path.join(__dirname, 'images')));
 
+// Viewer modules (e.g. web/js/XRSceneController.js)
+app.use('/js', express.static(path.join(__dirname, 'web', 'js')));
+
 const storage = multer.diskStorage({
   destination: function(req, file, cb) {
     cb(null, path.join(__dirname, imgdir));
@@ -157,10 +161,15 @@ app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
     }
   } catch (e) {}
 
-  // Delete all files in output2/ with the same base name
+  // Delete all files in output2/ with the same base name, plus files derived
+  // from it (bake-hybrid / bake-layers / quest-lod outputs and previews).
+  // Exact suffixes, so deleting "foo" never touches "foo_2".
+  const derived = ['_hybrid.glb', '_hybrid.ply', '_layers.glb', '_quest.ply',
+                   '_hybrid_vs_splats.jpg', '_hybrid_coverage.jpg', '_layers_vs_splats.jpg']
+    .map(suffix => scene + suffix);
   const files = fs.readdirSync(outputDir);
   files.forEach(f => {
-    if (f.startsWith(scene + '.')) {
+    if (f.startsWith(scene + '.') || derived.includes(f)) {
       fs.unlinkSync(path.join(outputDir, f));
     }
   });

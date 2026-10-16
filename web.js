@@ -26,9 +26,17 @@ function sortedSceneNames(dir) {
     .filter(name => name != "rgb" && name != "rgb2");
 }
 
-// FPS reports from the viewer while in XR.
+// FPS reports from the viewer while in XR: printed, and appended to
+// logs/xr_perf.jsonl (one JSON object per line) for later analysis.
+const PERF_LOG = path.join(__dirname, 'logs', 'xr_perf.jsonl');
 app.post('/fps', express.json(), (req, res) => {
   console.log('[xr fps]', JSON.stringify(req.body));
+  const entry = { time: new Date().toISOString(), ...req.body };
+  fs.mkdir(path.dirname(PERF_LOG), { recursive: true }, () => {
+    fs.appendFile(PERF_LOG, JSON.stringify(entry) + '\n', (err) => {
+      if (err) console.error('Could not write', PERF_LOG, err.message);
+    });
+  });
   res.sendStatus(204);
 });
 

@@ -10,8 +10,8 @@
  * - Index Trigger (0): Reset the scene in front of you, facing you.
  * - Grip (1): Hold to drag the scene in 3D.
  * - Thumbstick Click (3): Hold to attach the scene to the controller and rotate it.
- * - Button A/X (4): [Short press] Next scene; [Hold 1 s] Reload current scene.
- * - Button B/Y (5): Previous scene.
+ * - Button A/X (4): [Short press] Next scene; [Hold 1 s] Exit AR/VR (works anytime).
+ * - Button B/Y (5): [Short press] Previous scene; [Hold 1 s] Reload current scene.
  *
  * SECONDARY CONTROLLER:
  * - Thumbstick Up/Down: Scale the scene.
@@ -33,6 +33,8 @@ export class XRSceneController {
    *   content: child of `group` holding the scene; attached to the controller to rotate it.
    *   FontLoader, TextGeometry: three.js addons, for the settings menu text.
    *   onStepScene(delta), onReloadScene(), onDeleteScene(): scene callbacks.
+   *   onExit(): leave the XR session.
+   *   homePush: metres the scene starts (and resets) in front of its default spot.
    */
   constructor(renderer, camera, scene, options = {}) {
     this.renderer = renderer;
@@ -45,7 +47,9 @@ export class XRSceneController {
 
     this.onStepScene = options.onStepScene || (() => {});
     this.onReloadScene = options.onReloadScene || (() => {});
+    this.onExit = options.onExit || (() => {});
     this.onDeleteScene = options.onDeleteScene || (() => {});
+    this.homePush = options.homePush || 0;
 
     this.minScale = 0.05;
     this.maxScale = 20;
@@ -142,7 +146,16 @@ export class XRSceneController {
 
   // --- Scene placement ------------------------------------------------------
 
-  /** Place the scene at your head, facing your gaze (yaw only), and undo any hand rotation. */
+  /** Session start: scene at the reference-space origin (your head), pushed by homePush. */
+  applyHome() {
+    if (!this.group) return;
+    this.group.position.set(0, 0, -this.homePush);
+    this.group.quaternion.identity();
+    this.group.scale.setScalar(1);
+  }
+
+  /** Place the scene at your head, facing your gaze (yaw only), pushed forward by
+   *  homePush, and undo any hand rotation. */
   resetPlacement() {
     if (!this.group) return;
     const cam = this.renderer.xr.getCamera();
@@ -150,8 +163,8 @@ export class XRSceneController {
     cam.getWorldPosition(pos);
     cam.getWorldQuaternion(quat);
     const euler = new THREE.Euler(0, 0, 0, "YXZ").setFromQuaternion(quat);
-    this.group.position.copy(pos);
     this.group.quaternion.setFromEuler(new THREE.Euler(0, euler.y, 0, "YXZ"));
+    this.group.position.copy(pos).add(new THREE.Vector3(0, 0, -this.homePush).applyQuaternion(this.group.quaternion));
     if (this.content && this.content.parent === this.group) {
       this.content.position.set(0, 0, 0);
       this.content.quaternion.identity();
@@ -190,6 +203,14 @@ export class XRSceneController {
     }
 
     const mInd = this.motionInd, sInd = 1 - mInd;
+    // Main A/X and B/Y: tap vs 1 s hold. Holding A/X exits in any state
+    // (menu open, main hand disabled), so there's always a way out.
+    const aKind = this._pressKind(this.butts[mInd][4]);
+    const bKind = this._pressKind(this.butts[mInd][5]);
+    if (aKind === "hold") {
+      this.onExit();
+      return;
+    }
     const mCont = this.conts[mInd];
     const mUD = motionUD[mInd], sUD = motionUD[sInd];
     const mButt = this.butts[mInd], sButt = this.butts[sInd];
@@ -259,20 +280,27 @@ export class XRSceneController {
       }
     }
 
-    // A/X: short press = next scene, hold 1 s = reload. B/Y: previous scene.
-    const a = mButt[4];
-    if (a.pressed && !a.processed) {
-      a.pressedTime ??= Date.now();
-      if (Date.now() - a.pressedTime > 1000) {
-        a.processed = true;
-        this.onReloadScene();
+    // A/X tap = next scene; B/Y tap = previous, hold 1 s = reload. (A/X hold exits; see above.)
+    if (aKind === "tap") this.onStepScene(1);
+    if (bKind === "tap") this.onStepScene(-1);
+    else if (bKind === "hold") this.onReloadScene();
+  }
+
+  /** "tap" on release of a press shorter than 1 s, "hold" once when held for 1 s, else null. */
+  _pressKind(b) {
+    let kind = null;
+    if (b.pressed && !b.processed) {
+      b.pressedTime ??= Date.now();
+      if (Date.now() - b.pressedTime > 1000) {
+        b.processed = true;
+        kind = "hold";
       }
     }
-    if (a.unclicked) {
-      if (!a.processed) this.onStepScene(1);
-      a.pressedTime = undefined;
-      a.processed = false;
+    if (b.unclicked) {
+      if (!b.processed) kind = "tap";
+      b.pressedTime = undefined;
+      b.processed = false;
     }
-    if (mButt[5].unclicked) this.onStepScene(-1);
+    return kind;
   }
 }

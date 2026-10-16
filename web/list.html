@@ -213,6 +213,44 @@
     .preset:hover {
       background: #4a525e;
     }
+    /* Performance tests */
+    #perfTests {
+      margin: 8px;
+      padding: 12px 16px;
+      background: #23272e;
+      border-radius: 12px;
+    }
+    #perfScene {
+      width: 260px;
+      max-width: 100%;
+      padding: 6px 10px;
+      margin: 0;
+      font-size: 14px;
+      border-radius: 6px;
+      border: 1px solid #3a414b;
+      background: #181c20;
+      color: #eee;
+    }
+    .perf-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 10px 0 6px;
+    }
+    .perf-links a {
+      background: #3a414b;
+      color: #fff;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    .perf-links a:hover {
+      background: #4a525e;
+    }
+    .perf-hint {
+      color: #8a94a3;
+      font-size: 13px;
+    }
     /* Toggle Switch Styles */
     .toggle-switch {
       position: relative;
@@ -304,10 +342,35 @@
       <input type="range" id="optXrstddev" min="1.8" max="3" step="0.01">
       <span class="opt-value" id="valXrstddev"></span>
     </div>
+    <div class="opt-group" title="Max splat radius on screen in AR/VR, in pixels (512 = Spark default). Lower stops close-up splats ballooning when you lean in.">
+      <span class="opt-label">xrmaxpx</span>
+      <input type="range" id="optXrmaxpx" min="16" max="512" step="8">
+      <span class="opt-value" id="valXrmaxpx"></span>
+    </div>
+    <div class="opt-group" title="Start the scene this many metres further away, so it covers less of the view (trigger-reset keeps it)">
+      <span class="opt-label">xrpush</span>
+      <input type="range" id="optXrpush" min="0" max="2" step="0.1">
+      <span class="opt-value" id="valXrpush"></span>
+    </div>
+    <div class="opt-group" title="Adaptive quality: when frames drop, lower splat extent, size cap and foveation; restore them when there's headroom">
+      <label class="opt-label" for="optAdaptive">adaptive</label>
+      <input type="checkbox" id="optAdaptive">
+    </div>
     <div class="opt-group">
       <button type="button" class="preset" id="presetDefault">Defaults</button>
       <button type="button" class="preset" id="presetFull">Full quality</button>
+      <button type="button" class="preset" id="presetSmooth" title="Steady frame rate in close-up scenes">Smooth</button>
     </div>
+  </div>
+
+  <div id="perfTests">
+    <div class="opt-group">
+      <span class="opt-label">Performance tests</span>
+      <input type="text" id="perfScene" value="20260104_122019_7039" spellcheck="false">
+    </div>
+    <div class="perf-links" id="perfLinks"></div>
+    <div class="perf-hint">Open it, tap START AR, and look at the scene from one spot until it exits by itself.
+      Results are logged on the server (logs/xr_perf.jsonl).</div>
   </div>
 
   <div id="progressContainer" style="display:none;">
@@ -362,12 +425,17 @@
     }
 
     // --- View options: applied to every scene link ---
-    // Viewer defaults (web/index.html): lod=full, xrscale=0.8, foveation=1, xrstddev=sqrt(5).
-    const DEFAULT_OPTS = { lod: 'full', xrscale: 0.8, foveation: 1, xrstddev: 2.24 };
-    const FULL_QUALITY = { xrscale: 1, foveation: 0, xrstddev: 2.83 };
+    // Viewer defaults (web/index.html). Presets set every XR option (not the view).
+    const XR_DEFAULTS = { xrscale: 0.8, foveation: 1, xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: false };
+    const DEFAULT_OPTS = { lod: 'full', ...XR_DEFAULTS };
+    const FULL_QUALITY = { ...XR_DEFAULTS, xrscale: 1, foveation: 0, xrstddev: 2.83 };
+    const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96, adaptive: true };
     let opts = { ...DEFAULT_OPTS };
     try {
       opts = { ...opts, ...JSON.parse(localStorage.getItem('sceneViewOpts') || '{}') };
+      delete opts.nearclip;
+      delete opts.xrsize;
+      delete opts.prepass;
     } catch (e) {}
 
     function saveOpts() {
@@ -381,6 +449,9 @@
       $('#optXrscale').val(opts.xrscale); $('#valXrscale').text(Number(opts.xrscale).toFixed(2));
       $('#optFoveation').val(opts.foveation); $('#valFoveation').text(Number(opts.foveation).toFixed(1));
       $('#optXrstddev').val(opts.xrstddev); $('#valXrstddev').text(Number(opts.xrstddev).toFixed(2));
+      $('#optXrmaxpx').val(opts.xrmaxpx); $('#valXrmaxpx').text(Math.round(opts.xrmaxpx));
+      $('#optXrpush').val(opts.xrpush); $('#valXrpush').text(Number(opts.xrpush).toFixed(1) + ' m');
+      $('#optAdaptive').prop('checked', !!opts.adaptive);
       // Rewrite each scene link, keeping scene (first) and ui as they are.
       $('.scene-item a').each(function () {
         const url = new URL($(this).attr('href'), window.location.href);
@@ -388,6 +459,9 @@
         url.searchParams.set('xrscale', opts.xrscale);
         url.searchParams.set('foveation', opts.foveation);
         url.searchParams.set('xrstddev', opts.xrstddev);
+        url.searchParams.set('xrmaxpx', opts.xrmaxpx);
+        url.searchParams.set('xrpush', opts.xrpush);
+        url.searchParams.set('adaptive', opts.adaptive ? '1' : '0');
         $(this).attr('href', url.pathname + url.search);
       });
     }
@@ -398,16 +472,40 @@
       applyOpts();
     }
 
+    // Fixed-settings performance tests (foveation and adaptive off, so only
+    // the tested variable changes). `test` labels the run in the server log.
+    // Splat count is what limits the Quest (resolution barely matters), so
+    // these compare hybrid variants at full resolution.
+    // Tests currently needed (the panel hides when there are none). A benchmark
+    // link runs all its variants in one XR session and exits by itself.
+    const PERF_TESTS = [];
+    function renderPerfLinks() {
+      $('#perfTests').toggle(PERF_TESTS.length > 0);
+      const scene = $('#perfScene').val().trim();
+      const $links = $('#perfLinks').empty();
+      for (const t of PERF_TESTS) {
+        const params = new URLSearchParams({ scene, ui: 'true', lod: t.lod, xrscale: t.xrscale, foveation: 0,
+                                             xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: 0, test: t.test });
+        if (t.variant) params.set('variant', t.variant);
+        if (t.bench) params.set('bench', t.bench);
+        $('<a>').attr('href', '/?' + params.toString()).text(t.label).appendTo($links);
+      }
+    }
+
     $(document).ready(function () {
       applyOpts();
+      renderPerfLinks();
+      $('#perfScene').on('input', renderPerfLinks);
       $('#lodSeg').on('click', 'button', function () { setOpts({ lod: $(this).data('lod') }); });
       $('#optXrscale').on('input', function () { setOpts({ xrscale: parseFloat(this.value) }); });
       $('#optFoveation').on('input', function () { setOpts({ foveation: parseFloat(this.value) }); });
       $('#optXrstddev').on('input', function () { setOpts({ xrstddev: parseFloat(this.value) }); });
-      $('#presetDefault').on('click', function () {
-        setOpts({ xrscale: DEFAULT_OPTS.xrscale, foveation: DEFAULT_OPTS.foveation, xrstddev: DEFAULT_OPTS.xrstddev });
-      });
+      $('#optXrmaxpx').on('input', function () { setOpts({ xrmaxpx: parseFloat(this.value) }); });
+      $('#optXrpush').on('input', function () { setOpts({ xrpush: parseFloat(this.value) }); });
+      $('#optAdaptive').on('change', function () { setOpts({ adaptive: this.checked }); });
+      $('#presetDefault').on('click', function () { setOpts(XR_DEFAULTS); });
       $('#presetFull').on('click', function () { setOpts(FULL_QUALITY); });
+      $('#presetSmooth').on('click', function () { setOpts(SMOOTH); });
 
       // Toggle delete switch
       $('#toggleDelete').on('change', function() {

@@ -222,11 +222,106 @@ def triangulate(blocks, H, W):
     return np.concatenate(verts), np.array(faces, dtype=np.int64)
 
 
+def mesh_depth(blocks, occ, H, W):
+    """Per-pixel depth of the meshed occluder (inf outside it).
+
+    Within each quadtree block, disparity is interpolated bilinearly from the
+    block's corner depths -- what its triangles render, up to the split.
+    """
+    out = np.full((H, W), np.inf)
+    disp = 1 / np.maximum(occ, 1e-6)
+    by_size = {}
+    for x, y, s in blocks:
+        by_size.setdefault(s, []).append((x, y))
+    for s, xy in by_size.items():
+        xy = np.array(xy)
+        x, y = xy[:, 0], xy[:, 1]
+        t = np.arange(s + 1) / s
+        d00, d01 = disp[y, x], disp[y, x + s]
+        d10, d11 = disp[y + s, x], disp[y + s, x + s]
+        top = d00[:, None] + (d01 - d00)[:, None] * t        # (n, s+1) along x
+        bot = d10[:, None] + (d11 - d10)[:, None] * t
+        grid = top[:, None, :] + (bot - top)[:, None, :] * t[None, :, None]  # (n, s+1 rows, s+1 cols)
+        rows = (y[:, None] + np.arange(s + 1))[:, :, None]
+        cols = (x[:, None] + np.arange(s + 1))[:, None, :]
+        out[rows, cols] = 1 / np.maximum(grid, 1e-9)
+    return out
+
+
+def hidden_behind_mesh(mdepth, means, sigma, eyes, W, H, f, std, max_radius=64):
+    """Per splat: is it completely hidden behind the mesh from every eye?
+
+    Matches the GPU: Spark draws each splat as a flat quad at its centre depth
+    and every fragment is depth-tested, so a splat is hidden in a view when the
+    mesh is in front of its centre depth across its whole quad (radius
+    `std` sigmas). Conservative: the mesh is shrunk by 1 px at its border and
+    projected into each view without filling gaps, the quad is bounded by a
+    square window, and splats with a quad over `max_radius` px or a centre
+    off-screen (but quad partly on-screen) are kept.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    dev = "cuda"
+    md = torch.tensor(np.where(np.isfinite(mdepth), mdepth, np.inf), device=dev, dtype=torch.float32)
+    present = torch.isfinite(md)
+    interior = -F.max_pool2d(-present.float()[None, None], 3, 1, 1)[0, 0] > 0.5
+    md = torch.where(interior, md, torch.full_like(md, float("inf")))
+    ys, xs = torch.nonzero(torch.isfinite(md), as_tuple=True)
+    d = md[ys, xs]
+    src = []
+    for dy in (-1 / 3, 0.0, 1 / 3):
+        for dx in (-1 / 3, 0.0, 1 / 3):
+            u = xs.float() + 0.5 + dx
+            v = ys.float() + 0.5 + dy
+            src.append(torch.stack([(u - W / 2) / f * d, (v - H / 2) / f * d, d], -1))
+    src = torch.cat(src)
+
+    M = torch.tensor(means, device=dev, dtype=torch.float32)
+    sig = torch.tensor(sigma, device=dev, dtype=torch.float32)
+    levels = [1, 2, 4, 8, 16, 32, max_radius]
+    hidden = torch.ones(len(M), device=dev, dtype=torch.bool)
+    for eye in eyes:
+        e = torch.tensor(eye, device=dev, dtype=torch.float32)
+        # Mesh depth in this view (nearest surface).
+        Q = src - e
+        qz = Q[:, 2]
+        ok = qz > 1e-3
+        qc = torch.floor(f * Q[:, 0] / qz.clamp(min=1e-3) + W / 2).long()
+        qr = torch.floor(f * Q[:, 1] / qz.clamp(min=1e-3) + H / 2).long()
+        ok &= (qc >= 0) & (qc < W) & (qr >= 0) & (qr < H)
+        D = torch.full((H * W,), float("inf"), device=dev).scatter_reduce(
+            0, (qr * W + qc)[ok], qz[ok], "amin").view(H, W)
+        # Max mesh depth over square windows (off-screen padding counts as hidden).
+        maxd = [F.max_pool2d(D[None, None], 2 * k + 1, 1, k)[0, 0] for k in levels]
+        # Splats in this view.
+        S = M - e
+        z = S[:, 2]
+        front = z > 0.05
+        zc = z.clamp(min=1e-3)
+        cu = f * S[:, 0] / zc + W / 2
+        cv = f * S[:, 1] / zc + H / 2
+        rad = std * sig * f / zc
+        offscreen = (cu + rad < 0) | (cu - rad > W) | (cv + rad < 0) | (cv - rad > H)
+        ci, ri = torch.floor(cu).long(), torch.floor(cv).long()
+        center_on = (ci >= 0) & (ci < W) & (ri >= 0) & (ri < H)
+        h = torch.zeros_like(hidden)
+        lvl_lo = torch.zeros_like(rad)
+        cic, ric = ci.clamp(0, W - 1), ri.clamp(0, H - 1)
+        for k, mx in zip(levels, maxd):
+            fits = (rad <= k) & (rad > lvl_lo)
+            h |= fits & front & center_on & (mx[ric, cic] < z)
+            lvl_lo = torch.maximum(lvl_lo, torch.where(fits, torch.full_like(rad, float(k)), lvl_lo))
+        h |= ~front | (front & offscreen)  # behind the camera / entirely off-screen: not visible
+        hidden &= h
+    return hidden.cpu().numpy()
+
+
 def bake(path: Path, args) -> None:
     import torch
 
-    mesh_path = path.with_name(f"{path.stem}_hybrid.glb")
-    splat_path = path.with_name(f"{path.stem}_hybrid.ply")
+    mesh_path = path.with_name(f"{path.stem}{args.name_suffix}.glb")
+    splat_path = path.with_name(f"{path.stem}{args.name_suffix}.ply")
     if mesh_path.exists() and splat_path.exists() and not args.overwrite:
         LOGGER.info("%s exists, skipping.", mesh_path)
         return
@@ -288,12 +383,24 @@ def bake(path: Path, args) -> None:
     radius = args.footprint_sigma * np.exp(np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], -1).max(-1)) * f / np.maximum(z, 1e-6)
     on_surface = np.abs(z - z_mesh) < args.depth_tol * z_mesh
     behind = z >= z_mesh * (1 + args.depth_tol)
-    parallax = f * args.move * np.maximum(1 / z_mesh - 1 / np.maximum(z, 1e-6), 0)
+    keep_move = args.keep_move or args.move
+    parallax = f * keep_move * np.maximum(1 / z_mesh - 1 / np.maximum(z, 1e-6), 0)
     margin = radius + args.border_px
     remove = inside & covered[ri, ci] & (
         (on_surface & (dist > margin)) | (behind & (dist > margin + parallax)))
 
     keep = ~remove
+    # Of the rest, also drop splats the mesh hides from every nearby viewpoint.
+    n_hidden = 0
+    if args.visibility:
+        sc = np.sort(np.exp(np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], -1).astype(np.float64)), -1)
+        sigma = np.sqrt(sc[:, 2] * sc[:, 1])
+        mdepth = mesh_depth(blocks, depth * (1 + args.mesh_offset), H, W)
+        eyes = [(0.0, 0.0, 0.0)] + teacher_eyes(keep_move)
+        idx = np.nonzero(keep)[0]
+        hid = hidden_behind_mesh(mdepth, means[idx], sigma[idx], eyes, W, H, f, args.vis_std)
+        keep[idx[hid]] = False
+        n_hidden = int(hid.sum())
     out = np.empty(int(keep.sum()), dtype=[(k, "f4") for k in PROPS])
     for k in PROPS:
         out[k] = v[k][keep]
@@ -314,10 +421,10 @@ def bake(path: Path, args) -> None:
 
     sizes = np.bincount([s for _, _, s in blocks]) if blocks else np.zeros(1)
     LOGGER.info("%s: meshable %.0f%% of pixels, %d blocks (%s), %d tris covering %.0f%%; "
-                "Gaussians %d -> %d (%.0f%% removed) -> %s, %s",
+                "Gaussians %d -> %d (%.0f%% removed; %d hidden behind the mesh from every viewpoint) -> %s, %s",
                 path.name, 100 * meshable.mean(), len(blocks),
                 ", ".join(f"{s}px:{n}" for s, n in enumerate(sizes) if n),
-                len(faces), 100 * covered.mean(), len(v), int(keep.sum()), 100 * remove.mean(),
+                len(faces), 100 * covered.mean(), len(v), int(keep.sum()), 100 * (1 - keep.mean()), n_hidden,
                 mesh_path.name, splat_path.name)
 
 
@@ -337,6 +444,15 @@ def bake(path: Path, args) -> None:
               help="Max on-screen error (pixels at grid resolution) from approximating depth with a flat triangle.")
 @click.option("--max-block", default=64, show_default=True, help="Largest quadtree block (grid pixels).")
 @click.option("--min-block", default=2, show_default=True, help="Smallest quadtree block (grid pixels). 1 removes more Gaussians for more triangles.")
+@click.option("--name-suffix", default="_hybrid", show_default=True, help="Output name suffix (e.g. _hybrid_s2 for a variant).")
+@click.option("--keep-move", default=1.0, show_default=True, type=float,
+              help="Head movement (m) within which hidden splats that could become visible are kept. Larger than "
+                   "--move so moving further than the meshing range doesn't open holes at mesh edges "
+                   "(1.0 vs 0.4: +1.4% splats, far-move holes 2% -> 0.1%).")
+@click.option("--visibility/--no-visibility", default=True, show_default=True,
+              help="Also remove Gaussians hidden behind the mesh from every viewpoint within --move.")
+@click.option("--vis-std", default=float(np.sqrt(8)), show_default=True,
+              help="Splat quad radius (sigmas) assumed by the visibility test (sqrt(8) = largest the viewer draws).")
 @click.option("--footprint-sigma", default=2.0, show_default=True,
               help="Gaussian footprint radius (in sigmas) that must lie inside the mesh for it to be removed.")
 @click.option("--border-px", default=1.0, show_default=True, help="Extra margin (pixels) keeping Gaussians near the mesh border.")

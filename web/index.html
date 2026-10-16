@@ -225,6 +225,17 @@
     const xrScale = parseFloat(getQueryParam('xrscale') || '0.8');
     const xrFoveation = parseFloat(getQueryParam('foveation') || '1');
     const xrStdDev = parseFloat(getQueryParam('xrstddev') || String(Math.sqrt(5)));
+    // Close-up scenes cost more: their photos are wider-angle (the scene fills
+    // more of the headset's view) with more large splats, and leaning in grows
+    // splats further. These cap or avoid that:
+    // - xrmaxpx: max splat radius on screen (Spark's maxPixelRadius; 512 default).
+    // - xrpush: start the scene this many metres further away (covers less of the view).
+    // - adaptive=1: lower splat extent, size cap and foveation when frames
+    //   drop, restore them when there's headroom (eye-buffer resolution can't
+    //   change during a WebXR session).
+    const xrMaxPx = parseFloat(getQueryParam('xrmaxpx') || '512');
+    const xrPush = parseFloat(getQueryParam('xrpush') || '0');
+    const xrAdaptive = getQueryParam('adaptive') === '1';
     renderer.xr.setFramebufferScaleFactor(xrScale);
     renderer.xr.setFoveation(xrFoveation);
     // AR: three.js's stock ARButton, exactly as img3dviewer starts AR
@@ -309,15 +320,64 @@
     xrContent.add(sortCamera);
     setSortOnce(true);
 
-    let desktopStdDev = spark.maxStdDev;
+    const desktop = { stdDev: spark.maxStdDev, maxPx: spark.maxPixelRadius };
     renderer.xr.addEventListener('sessionstart', () => {
-      desktopStdDev = spark.maxStdDev;
-      spark.maxStdDev = xrStdDev;
-      renderer.xr.setFoveation(xrFoveation);
+      Object.assign(desktop, { stdDev: spark.maxStdDev, maxPx: spark.maxPixelRadius });
+      adapt.q = 1;
+      applyQuality(1);
     });
     renderer.xr.addEventListener('sessionend', () => {
-      spark.maxStdDev = desktopStdDev;
+      spark.maxStdDev = desktop.stdDev;
+      spark.maxPixelRadius = desktop.maxPx;
     });
+
+    // Quality level q in [0, 1]: 1 = the settings above; lower trades splat
+    // softness, size cap and periphery sharpness for speed.
+    const adapt = { q: 1, lastT: 0, dts: [], lastStep: 0 };
+    function applyQuality(q) {
+      spark.maxStdDev = Math.min(xrStdDev, 1.8) + (xrStdDev - Math.min(xrStdDev, 1.8)) * q;
+      spark.maxPixelRadius = Math.min(xrMaxPx, 32) + (xrMaxPx - Math.min(xrMaxPx, 32)) * q;
+      renderer.xr.setFoveation(1 - (1 - xrFoveation) * q);
+    }
+    // Every ~30 frames, compare the median frame time with the headset's
+    // frame rate: step down fast when too slow, step back up slowly.
+    function adaptQuality(now) {
+      if (!xrAdaptive || !renderer.xr.isPresenting) { adapt.lastT = 0; adapt.dts.length = 0; return; }
+      if (adapt.lastT) adapt.dts.push(now - adapt.lastT);
+      adapt.lastT = now;
+      if (adapt.dts.length < 30) return;
+      const dt = adapt.dts.sort((a, b) => a - b)[adapt.dts.length >> 1];
+      adapt.dts.length = 0;
+      const target = 1000 / (renderer.xr.getSession()?.frameRate || 72);
+      if (dt > target * 1.15 && adapt.q > 0) {
+        adapt.q = Math.max(0, adapt.q - 0.15);
+      } else if (dt < target * 1.05 && adapt.q < 1 && now - adapt.lastStep > 2000) {
+        adapt.q = Math.min(1, adapt.q + 0.05);
+      } else {
+        return;
+      }
+      adapt.lastStep = now;
+      applyQuality(adapt.q);
+    }
+
+    // Diagnostics for the FPS reports: how often Spark rebuilds its splat data
+    // (needs a new accumulator) and re-sorts (GPU readback + sort). Both are
+    // expensive; with sortOnce they should be rare, not per frame.
+    const sparkStats = { rebuilds: 0, sorts: 0, cpuMs: [], sparkMs: 0, frames: 0 };
+    {
+      // CPU time Spark spends preparing draws (called once per eye per frame).
+      const sparkBeforeRender = spark.onBeforeRender.bind(spark);
+      spark.onBeforeRender = (...a) => {
+        const t = performance.now();
+        sparkBeforeRender(...a);
+        sparkStats.sparkMs += performance.now() - t;
+      };
+      const allocAccumulator = spark.maybeAllocAccumulator.bind(spark);
+      spark.maybeAllocAccumulator = (...a) => { sparkStats.rebuilds++; return allocAccumulator(...a); };
+      const view = spark.defaultView;
+      const sortUpdate = view.sortUpdate.bind(view);
+      view.sortUpdate = (...a) => { sparkStats.sorts++; return sortUpdate(...a); };
+    }
 
     // Headset FPS can't be seen in the page during XR, so report it to the
     // server console (node web.js) every 2 s.
@@ -331,9 +391,21 @@
       fpsFrames = 0; fpsStart = performance.now();
       fetch('/fps', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ fps: +fps.toFixed(1), scene: file, lod: lodMode,
-                               splats: countSplats(splat), xrScale, xrStdDev: +xrStdDev.toFixed(2) }),
+        body: JSON.stringify({ test: getQueryParam('test') || null, fps: +fps.toFixed(1), scene: file, lod: lodMode,
+                               variant: lodMode === 'hybrid' ? hybridName : null,
+                               splats: countSplats(splat), xrScale, xrStdDev: +xrStdDev.toFixed(2),
+                               xrMaxPx, quality: xrAdaptive ? +adapt.q.toFixed(2) : null,
+                               rebuilds: sparkStats.rebuilds, sorts: sparkStats.sorts,
+                               // CPU per frame: median of our frame callback (incl. draw submission),
+                               // and Spark's per-eye preparation averaged per frame.
+                               cpuMs: sparkStats.cpuMs.length ? +sparkStats.cpuMs.sort((x, y) => x - y)[sparkStats.cpuMs.length >> 1].toFixed(2) : null,
+                               sparkMs: sparkStats.frames ? +(sparkStats.sparkMs / sparkStats.frames).toFixed(2) : null }),
       }).catch(() => {});
+      sparkStats.rebuilds = 0;
+      sparkStats.sorts = 0;
+      sparkStats.cpuMs.length = 0;
+      sparkStats.sparkMs = 0;
+      sparkStats.frames = 0;
     }
 
 
@@ -448,6 +520,8 @@
     // ?lod=layers loads the opaque depth meshes <scene>_layers.glb from
     // `sharp bake-layers`; ?lod=hybrid loads <scene>_hybrid.glb + .ply from
     // `sharp bake-hybrid`. All fall back to the full splats when missing.
+    // ?variant=_hybrid_s2 (etc.) loads a hybrid baked with another --name-suffix.
+    const hybridName = /^_[A-Za-z0-9_]+$/.test(getQueryParam('variant') || '') ? getQueryParam('variant') : '_hybrid';
     const lodMode = getQueryParam('lod') || 'full';
     async function splatUrlFor(scene) {
       const full = `../output2/${scene}.ply`;
@@ -511,7 +585,7 @@
     // (the texture already contains them) while border splats still draw
     // where they extend past it.
     async function loadHybrid(scene) {
-      const gltf = await new GLTFLoader().loadAsync(`../output2/${scene}_hybrid.glb`);
+      const gltf = await new GLTFLoader().loadAsync(`../output2/${scene}${hybridName}.glb`);
       const mesh = gltf.scene;
       mesh.quaternion.set(1, 0, 0, 0);
       mesh.position.set(offset[0], offset[1], offset[2]);
@@ -522,7 +596,7 @@
         child.material.dispose();
         child.material = new THREE.MeshBasicMaterial({ map, side: THREE.DoubleSide });
       });
-      const s = createSplat(`../output2/${scene}_hybrid.ply`);
+      const s = createSplat(`../output2/${scene}${hybridName}.ply`);
       await s.initialized;
       const group = new THREE.Group();
       group.add(mesh, s);
@@ -538,7 +612,7 @@
 
     async function loadContent(scene) {
       if (lodMode === 'hybrid') {
-        const url = `../output2/${scene}_hybrid.glb`;
+        const url = `../output2/${scene}${hybridName}.glb`;
         try {
           if ((await fetch(url, { method: 'HEAD' })).ok) return await loadHybrid(scene);
         } catch (e) {
@@ -658,7 +732,18 @@
       TextGeometry,
       onStepScene: (delta) => stepScene(delta),
       onReloadScene: () => stepScene(0),
+      onExit: () => renderer.xr.getSession()?.end(),
       onDeleteScene: () => deleteCurrentScene(),
+      homePush: xrPush,
+    });
+    // Centre the scene on the headset shortly after entering XR (like pressing
+    // the trigger): the 'local' origin isn't reliably where your head is, and
+    // tracking needs a moment to settle.
+    renderer.xr.addEventListener('sessionstart', () => {
+      xrController.applyHome();
+      setTimeout(() => {
+        if (renderer.xr.isPresenting) xrController.resetPlacement();
+      }, 500);
     });
     renderer.xr.addEventListener('sessionend', () => xrController.resetAll());
 
@@ -843,9 +928,11 @@
     }
 
     renderer.setAnimationLoop(function animate(time) {
+      const frameStart = performance.now();
       stats.begin();
       xrController.update();
       reportXRFps();
+      adaptQuality(performance.now());
       // let amplitude = guiParams.amplitude * 0.005 * distance;
       let amplitude = guiParams.amplitude * 0.05;
       let speed = guiParams.speed * 0.001;
@@ -876,6 +963,10 @@
       renderer.render(scene, camera);
       // splat.rotation.y += 0.01;
       stats.end();
+      if (renderer.xr.isPresenting) {
+        sparkStats.cpuMs.push(performance.now() - frameStart);
+        sparkStats.frames++;
+      }
     });
   </script>
 

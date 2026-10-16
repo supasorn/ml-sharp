@@ -164,3 +164,8 @@ cython_debug/
 .DS_STORE
 *.pt
 .aider*
+
+# Viewer server: HTTPS key/cert, XR performance logs, local scratch
+certs/
+logs/
+.hybtest/

@@ -11,6 +11,64 @@ Tian Fang, Yanghai Tsin, Stephan Richter and Vladlen Koltun_.
 
 We present SHARP, an approach to photorealistic view synthesis from a single image. Given a single photograph, SHARP regresses the parameters of a 3D Gaussian representation of the depicted scene. This is done in less than a second on a standard GPU via a single feedforward pass through a neural network. The 3D Gaussian representation produced by SHARP can then be rendered in real time, yielding high-resolution photorealistic images for nearby views. The representation is metric, with absolute scale, supporting metric camera movements. Experimental results demonstrate that SHARP delivers robust zero-shot generalization across datasets. It sets a new state of the art on multiple datasets, reducing LPIPS by 25–34% and DISTS by 21–43% versus the best prior model, while lowering the synthesis time by three orders of magnitude.
 
+## Quest 3 viewer and gallery (this fork)
+
+This fork adds a web gallery and a WebXR viewer (Meta Quest 3, AR/VR), and a
+hybrid mesh + Gaussian representation that renders much faster on the headset.
+
+### Run everything
+
+```bash
+cd /projects/ml-sharp
+scripts/start_server.sh
+```
+
+This starts three processes and stops all of them on Ctrl+C:
+
+| Process | What it does | Log |
+|---|---|---|
+| `node web.js` | Gallery and viewer: HTTP on port 3000, HTTPS on port 3443 | `logs/web.log` |
+| `sharp predict-with-info ... --loop` (GPU 0) | Turns photos in `images/` into scenes in `output2/` | `logs/predict.log` |
+| `sharp bake-hybrid -i output2 --watch` (GPU 1) | Bakes each new scene into `<scene>_hybrid.glb` + `.ply` | `logs/bake.log` |
+
+Run it inside `tmux` or `screen` so it keeps running after you log out:
+
+```bash
+tmux new -s sharp 'scripts/start_server.sh'   # detach with Ctrl+B then D; reattach: tmux attach -t sharp
+```
+
+Options (environment variables): `SHARP_ENV` (conda env, default
+`/conda_envs/sharp`), `PREDICT_GPU` (default 0), `BAKE_GPU` (default 1), e.g.
+`PREDICT_GPU=2 BAKE_GPU=3 scripts/start_server.sh`.
+
+Requirements: Node.js with this folder's `npm install` done, the conda env with
+this project installed, two CUDA GPUs (or set both variables to the same GPU),
+and an HTTPS certificate in `certs/key.pem` + `certs/cert.pem` (WebXR needs
+HTTPS; without them only HTTP on port 3000 runs).
+
+### Use it
+
+1. Open `https://<server-ip>:3443/` (it redirects to the gallery). On the Quest,
+   accept the self-signed certificate warning once.
+2. Drag photos onto the gallery (or use **Select Files**). Each appears in the
+   gallery once predicted (a few seconds; refresh the page) and switches to
+   its hybrid once baked (10–20 s later).
+3. At the top of the gallery choose **Original splats** or **Hybrid** and the XR
+   options, then open a scene and tap **START AR** (or **ENTER VR**).
+
+Wait until `logs/predict.log` shows `Started watching images` before dropping
+photos: files that arrive while the watcher is still starting (~10 s) are
+missed. To process a missed photo, re-save it without changing it, e.g.
+`python3 -c "open('images/<photo>.jpg','ab').close()"`.
+
+Headset controls (right controller): thumbstick moves the scene, trigger
+re-centres it, grip drags it, A / B go to the next / previous scene, **hold A
+for 1 s to exit AR/VR**.
+
+More: baking guide in [`docs/hybrid-baking.md`](docs/hybrid-baking.md);
+design, measurements and lessons learned in
+[`docs/quest-xr-findings.md`](docs/quest-xr-findings.md).
+
 ## Getting started
 
 We recommend to first create a python environment:

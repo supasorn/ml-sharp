@@ -46,6 +46,29 @@ this project installed, two CUDA GPUs (or set both variables to the same GPU),
 and an HTTPS certificate in `certs/key.pem` + `certs/cert.pem` (WebXR needs
 HTTPS; without them only HTTP on port 3000 runs).
 
+### Conda environment
+
+Use **`/conda_envs/sharp`**. It has this project installed in editable mode
+(so it always runs the current code), plus PyTorch, gsplat, trimesh and
+pyvista. On this machine gsplat needs the CUDA 13 runtime; the baking code
+loads it by itself (`load_gsplat()` in `src/sharp/cli/bake_layers.py`).
+
+- `scripts/start_server.sh` calls the env's programs directly
+  (`/conda_envs/sharp/bin/sharp`), so you don't need to activate anything. Use
+  another env with `SHARP_ENV=/path/to/env scripts/start_server.sh`.
+- To run `sharp` commands yourself (baking, prediction), activate it first, or
+  call the binary directly:
+
+  ```bash
+  conda activate /conda_envs/sharp
+  sharp bake-hybrid -i output2
+  # or, without activating:
+  /conda_envs/sharp/bin/sharp bake-hybrid -i output2
+  ```
+
+The web server (`node web.js`) doesn't use conda: it runs on the system
+Node.js with the packages from `npm install`.
+
 ### Use it
 
 1. Open `https://<server-ip>:3443/` (it redirects to the gallery). On the Quest,

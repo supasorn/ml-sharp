@@ -1,0 +1,215 @@
+# Quest 3 XR viewing of SHARP scenes — findings and experiment log
+
+Everything learned while making SHARP's Gaussian-splat scenes viewable (and
+fast) on a Meta Quest 3 in AR/VR, including what did **not** work. Numbers
+are from the headset unless marked "offline".
+
+Main test scene for performance: `20260104_122019_7039` (hybrid: 512k splats,
+original: 1.18M). Quality test scene: `20251023_155037` (palm trees, people).
+
+---
+
+## 1. System overview
+
+| Piece | Where | Notes |
+|---|---|---|
+| Prediction | `sharp predict-with-info -i images -o output2 --loop` | Watches `images/`, writes `output2/<scene>.ply` + `.json` (focal, size, depths). |
+| Hybrid bake | `sharp bake-hybrid -i output2` (`src/sharp/cli/bake_hybrid.py`) | Writes `<scene>_hybrid.glb` (textured mesh) + `<scene>_hybrid.ply` (remaining splats). ~10–20 s/scene on an RTX 3090. All 79 scenes baked with current defaults. |
+| Other bakes | `sharp bake-layers`, `sharp quest-lod` | Older approaches (see §5); `bake_layers.py` also hosts shared helpers (gsplat loading, splat rendering, edge detection). |
+| Server | `node web.js` | HTTP 3000, HTTPS 3443 (WebXR needs HTTPS; cert/key in `certs/`, git-ignored). `/` → gallery `/list`; `/scenes` JSON; `/fps` logs XR reports to `logs/xr_perf.jsonl` (git-ignored); `/delete` removes a scene and its derived files. |
+| Viewer | `web/index.html` | Spark 0.1.10 + three.js r178. `?lod=full|hybrid|layers|quest`. |
+| XR controls | `web/js/XRSceneController.js` | Ported from `/projects/img3dviewer`'s `XRMeshController`. |
+| Splat drawing | `web/js/splatFlat.js` | Non-instanced, one triangle per splat (default). See §3. |
+| Benchmarks | `web/js/xrBench.js` | Self-running in-headset benchmarks (`?bench=<name>`). |
+| Gallery | `web/list.html` | Original/Hybrid switch, XR options, presets, Performance tests panel (hidden when no test is pending). |
+
+**GPU environment quirk:** the cached gsplat CUDA extension was built with the
+system CUDA 13 toolkit while PyTorch is cu128. `load_gsplat()` in
+`bake_layers.py` preloads `/usr/local/cuda/lib64/libcudart.so.13` and puts the
+env's `bin/` (ninja) on PATH. Use the conda env `/conda_envs/sharp`.
+
+### Viewer URL parameters
+
+| Param | Default | Meaning |
+|---|---|---|
+| `scene` | — | Scene name (bare `/` redirects to the gallery). |
+| `lod` | `full` | `full` original splats, `hybrid` mesh + splats, `layers`, `quest`. |
+| `variant` | `_hybrid` | Load a hybrid baked with another `--name-suffix`. |
+| `xrscale` | 0.8 | Eye-buffer resolution scale (fixed per session in WebXR). |
+| `foveation` | 1 | Quest fixed foveation (0 off … 1 max; blurs the periphery). |
+| `xrstddev` | 2.24 (√5) | Splat extent in sigmas in XR (Spark default √8 = 2.83). |
+| `xrmaxpx` | 512 | Max splat radius on screen (Spark `maxPixelRadius`). |
+| `xrpush` | 0 | Start the scene this many metres further away. |
+| `adaptive` | 0 | Lower splat extent / size cap / foveation when frames drop. |
+| `splatdraw` | (triangles) | `instanced` = Spark's own drawing, `quads` = non-instanced quads. |
+| `bench` | — | Self-running benchmark (see §6). |
+| `autoorbit` | on | `false` = old meta-based desktop orbit centre. |
+| `test` | — | Label stored with FPS reports. |
+
+### XR controls (main hand = right by default)
+
+Thumbstick: move along gaze · Trigger: re-centre · Grip: drag · Stick-click
+(hold): rotate with hand · A tap: next scene, **A hold 1 s: exit XR** (works in
+any state) · B tap: previous, B hold 1 s: reload. Secondary: thumbstick scales
+the scene; B/Y opens the settings menu (swap hands, toggles, delete scene with
+confirm). The scene auto-centres on the headset 0.5 s after entering XR.
+
+---
+
+## 2. Key findings (read this first)
+
+1. **Quest 3 splat rendering was limited by Spark's *instanced* drawing**, not
+   by pixels, CPU, sorting, splat maths or data reads. Each splat is an
+   instance of a tiny quad; with instancing, the GPU's vertex batches are
+   mostly empty. Drawing the same splats **non-instanced** (+39%) and as
+   **one triangle each** (+16% more) took the test scene from **34.5 → 55 fps**
+   with an identical image (`web/js/splatFlat.js`, the default).
+2. After that fix, throughput is ~28M splats/s (was ~18M). FPS ≈ 28M /
+   splat count, so ~390k splats is roughly the budget for 72 fps.
+3. **The hybrid representation** (big textured triangles for view-consistent
+   planar regions + the remaining splats, mesh drawn first and splats
+   depth-tested against it) removes a median 65% of splats (22–83% across 79
+   scenes) at ~30–32 dB vs the original splats for head moves up to 0.45 m
+   (offline). It degrades gracefully with movement, unlike layered depth meshes.
+4. **Hidden splats must be kept for the full range users actually move.**
+   Removing splats only revealed beyond 0.4 m caused black holes at mesh edges
+   when moving further; keeping those within 1 m (`--keep-move 1.0`) costs
+   +1.4% splats and cuts far-move holes from ~2% to ~0.1% of pixels.
+5. **Quest AR stationary mode:** a custom `immersive-ar` request with only
+   `optionalFeatures: ['local']` made the Quest switch to its roomscale
+   boundary. three's stock `ARButton` (adds `dom-overlay`) keeps stationary
+   mode. A page cannot choose the boundary type itself.
+6. **Quick proxy estimates were repeatedly far too optimistic** (prepass,
+   occluder, visibility removal). Measure the actual payoff (count splats
+   removed with the real test, or run a self-running headset benchmark)
+   before building.
+
+---
+
+## 3. Performance investigation (headset, scene `20260104_122019_7039`)
+
+All runs at `xrscale=1, foveation=0, xrstddev=2.24` unless noted. "Steady"
+excludes the loading seconds. Raw logs: `logs/xr_perf_run*.jsonl` (local only).
+
+| Run | Question | Result | Conclusion |
+|---|---|---|---|
+| 0 | Resolution (pre-logging) | hybrid 30.7 fps @1.0 vs 33.5 @0.5 | 4× fewer pixels ≈ +9%: **not fill-bound** |
+| 1 | Resolution, full vs hybrid | hybrid 36.0 / 33.3 (1.0 / 0.5); full 13.6 / 15.8 | FPS × splats ≈ 16–18M/s: **splat-count bound**; Spark rebuild/sort counters 0 while still (sortOnce works) |
+| 2 | Back-layer pruning (strict/loose) | 36.3 → 40.0 → 44.6 fps (505k → 469k → 417k) | Speed follows splat count, **but visible artifacts** (see §5) |
+| 3 | Splats in left eye only | 36.1 → **67.8 fps** | Cost is per splat **per eye** |
+| 4 | CPU time per frame | 0.7 ms of 27 ms; Spark prep 0.09 ms | **GPU-bound** |
+| 5 | Skip Spark's covariance/eigen maths | 36.8 → 39.7 (+6%) | Not the maths |
+| 6 | 2-px points vs 2-px quads | 39.7 → **90 fps** (display cap) | Per-vertex/primitive overhead (later: instancing) |
+| 7 | Real point-sprite splats | quads 35.5, points **22.9** | Square points shade ~1.9× pixels + extra per-pixel cost: **dead end** |
+| 8 | Skip splat data texel reads (synthetic grid) | normal 34.2; reads 38.5; no reads 38.9 | Reads ≈ 1%: not the data fetch |
+| 9 | Instanced triangle vs quad | 33.9 vs 34.4 | 3 vs 4 vertices irrelevant **with instancing** |
+| 10 | Instanced vs non-instanced quads | 34.5 → **48.0 fps** | **Instancing was the bottleneck** |
+| 11 | Non-instanced quads vs triangles | 47.5 → **55.0 fps** | Vertex count matters once batches are full; triangles default |
+
+Other headset observations:
+- Close-up scenes cost more at the input view (wider-angle photos fill more
+  of the view; more large splats) and when leaning in (~1.35× pixel work vs
+  ~1.09× for far scenes). Not a depth-test effect.
+- `xrscale` and foveation barely change FPS (not fill-bound); `xrstddev`
+  2.24 vs 2.83 mainly changes look (2.24 looks blotchy/blocky).
+
+---
+
+## 4. Hybrid bake: design and offline results
+
+**Algorithm** (`bake_hybrid.py`, details in its module docstring):
+1. Render the splats from the input view (gsplat, RGB + expected depth).
+2. A pixel is meshable if opaque, not on a depth edge (slope-aware disparity
+   test on a 3×3 median-filtered depth), and *view-consistent*: reprojected as
+   a textured point into 29 "teacher" renders of the splats within ±0.4 m, its
+   colour matches where it's visible.
+3. Adaptive quadtree (64 px → `--min-block` 2 px); a block is accepted if it
+   has no hard-bad pixels, ≤30% colour-inconsistent pixels, and a plane fits
+   its disparity within 0.5 px parallax at 0.4 m. Crack-free fan triangulation.
+4. Texture = render of the splats (matches them; `--texture photo` is sharper).
+5. Remove splats on the meshed surface (footprint 2σ + 1 px inside the mesh),
+   splats behind it that no move within `--keep-move` reveals, and splats
+   hidden behind the mesh from every viewpoint within `--keep-move` over their
+   whole quad (`--visibility`, lossless; ~4% more).
+6. Mesh sits 1% in front of its surface: the depth test hides the splats on it
+   (the texture already contains them) while border splats draw past its edge.
+
+**Offline quality** (exact GPU depth-test emulation, see §7), test scene:
+
+| Min block | Splats removed | Triangles | PSNR vs original splats, 0 / 0.15 / 0.35 / 0.45 m |
+|---|---|---|---|
+| 4 px | 51% | 37k | 32.1 / 31.8 / 30.5 / 29.9 dB |
+| **2 px (default)** | 59% | 94k | 31.7 / 31.4 / 30.0 / 29.5 dB |
+| 1 px | 63% | 210k | 31.3 / 31.0 / 29.6 / 29.1 dB |
+
+Ideal (every non-edge pixel meshed): 65% removable, so finer triangulation
+than 1–2 px blocks isn't worth it. A quadtree bug (blocks overhanging the
+right/bottom edge were dropped, not split) cost 11 points of coverage; fixed.
+
+Across all 79 scenes: mesh covers median 87% of the view; splats removed
+median 65% (22–83%); kept 198k–917k (median 415k).
+
+Where the remaining splats are (test scene): ~41% of the image is unmeshed —
+mostly real depth edges (95% of edge pixels show a colour change) and
+fragmented foliage. Only ~6% is low-texture, so texture-aware "rough
+geometry" relaxation would gain little on this kind of scene.
+
+**Black holes when moving far** (scene `20260104_122019_7039`, % of pixels
+left uncovered): with `--keep-move` 0.4 → 0.01% @0.45 m, 1.4% @0.6 m, 2.2%
+@0.8 m; with 1.0 → ≤0.13% up to 1 m (+1.4% splats). Default is 1.0.
+
+---
+
+## 5. Approaches that did not work (and why)
+
+| Approach | Outcome | Why |
+|---|---|---|
+| Layered depth meshes (`bake-layers`) | Broke quickly when moving; ghost copies, smears | SHARP's splat grid isn't the photo's pixel grid (centres drift), so splat-centre meshes take the wrong photo colours; rebuilt in image space from splat renders it improved but stayed fragile. Superseded by the hybrid. |
+| `quest-lod` (prune co-located back layer + merge flat 2×2 blocks) | Only −33% splats on the test scene | SHARP's opacity is ~0.99 almost everywhere, merges are limited by texture |
+| Opaque-core depth prepass | Removed | Only 0.04% of splat pixels have alpha ≥ 0.996 — a pixel becomes opaque through many overlapping tails, not single cores |
+| Depth-only occluder mesh (verified lossless) | Removed | Lossless but culled only 2–7% of pixel work; the "51–72% behind the surface" proxy counted visible volumetric splats (sky, foliage) |
+| Back-layer pruning (strict / loose) | Removed | −7% / −18% splats but visible flicker at mesh edges / see-through squares, despite ≤0.06% "holes" offline |
+| Point-sprite splats | Removed | Slower with real splat sizes (see run 7) |
+| Multiview (both eyes in one pass) | Not attempted | three r178's WebGLRenderer has no multiview (only its WebGPU renderer); Spark needs WebGLRenderer |
+| Lowering resolution / foveation for speed | Little gain | Not fill-bound |
+
+---
+
+## 6. How to measure on the headset
+
+- Prefer **self-running benchmarks**: `?bench=<name>` (`web/js/xrBench.js`)
+  runs all variants in one XR session (10 s per phase, first 2 s skipped),
+  logs each phase to `logs/xr_perf.jsonl` and exits XR by itself. Add the
+  link to `PERF_TESTS` in `web/list.html` (the panel shows only pending tests).
+- Otherwise the viewer posts a report every 2 s while in XR with fps, splat
+  count, Spark rebuild/sort counts, CPU ms per frame and settings.
+- Ask the user to test as rarely as possible: one link, one session.
+- The user cares about what they see in the headset; offline metrics missed
+  artifacts that were obvious in XR (pruning flicker), so confirm visually.
+
+## 7. Offline evaluation pitfalls (cost many wrong conclusions)
+
+The harness renders splats with gsplat and meshes with pyvista/VTK:
+- **Don't flip** VTK textures or screenshots: with camera up = (0,−1,0) and
+  focal point +z the image is already in OpenCV orientation. An earlier
+  double flip mirrored vertical parallax and invalidated results.
+- `p.get_image_depth()` needs a prior `screenshot()` and
+  `reset_camera_clipping_range=False`; background reads back as the far plane
+  (treat > 0.95·far as "no geometry").
+- gsplat's anti-aliasing blur is resolution dependent: render reference and
+  test at the same (supersampled) resolution.
+- Emulate the GPU depth test exactly by turning the rendered mesh into opaque
+  pixel-sized splats composited with the kept splats (pass 1: kept colour,
+  mesh black; pass 2: kept black, mesh white; image = C1 + C2·mesh). Fill the
+  spill around the mesh border with the nearest mesh colour, not black.
+- PSNR vs the photo is ~18–22 dB even when perfect (splat renders are softer);
+  compare against splat renders instead.
+
+## 8. Open ideas
+
+- A per-eye pre-pass computing each splat's projected ellipse once, so each
+  of its 3 vertices only reads the result (vertex work still matters).
+- Fewer splats at a visible cost (careful: the user notices artifacts).
+- Photo-textured hybrid meshes (`--texture photo`): sharper than the splats.
+- Holes revealed beyond SHARP's own second layer could be filled with a
+  blurred far backdrop.

@@ -183,6 +183,7 @@ left uncovered): with `--keep-move` 0.4 → 0.01% @0.45 m, 1.4% @0.6 m, 2.2%
 | Point-sprite splats | Removed | Slower with real splat sizes (see run 7) |
 | Multiview (both eyes in one pass) | Not attempted | three r178's WebGLRenderer has no multiview (only its WebGPU renderer); Spark needs WebGLRenderer |
 | Lowering resolution / foveation for speed | Little gain | Not fill-bound |
+| Semi-transparent textured layers for the remaining hybrid splats (`scripts/eval_alpha_layers.py`, offline only) | Not built | Geometrically promising: per 16-px tile, ≤4 tilted planes within 0.5 px parallax at 1 m take a median 37% of the remaining splats (26–67% over 8 scenes; 3–8× extra blended overdraw). But ~60% of the remaining splats lie *between* layers in depth (mostly hidden splats kept for reveals), and no viewer draw order fixes that: best (mesh → sorted layers writing depth where α > 0.5 → splats) costs ~1 dB at 0.15 m and grainy edges at the input view (36 vs 52 dB). Layers only behind every remaining splat of their tile keep 0.2%. The highest-payoff scene ghosts even with exact per-pixel order (−4 dB, smeared people) |
 
 ---
 
@@ -215,6 +216,12 @@ The harness renders splats with gsplat and meshes with pyvista/VTK:
   spill around the mesh border with the nearest mesh colour, not black.
 - PSNR vs the photo is ~18–22 dB even when perfect (splat renders are softer);
   compare against splat renders instead.
+- `scripts/eval_alpha_layers.py` is a gsplat-only alternative: the mesh (and
+  any planar layers) are ray-cast per eye pixel and composited as tiny
+  per-pixel Gaussians (`eps2d` ≈ 0 so they don't leak), giving exact
+  per-pixel depth order; colour/black pass variants emulate viewer draw
+  orders. Its numbers run slightly harsher than the VTK harness (hybrid at
+  0.15 m: 29.8 vs 31.4 dB), so compare within one harness only.
 
 ## 8. Open ideas
 

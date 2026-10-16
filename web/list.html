@@ -478,7 +478,8 @@
     // these compare hybrid variants at full resolution.
     // Tests currently needed (the panel hides when there are none). A benchmark
     // link runs all its variants in one XR session and exits by itself.
-    const PERF_TESTS = [];
+    const PERF_TESTS = [
+    ];
     function renderPerfLinks() {
       $('#perfTests').toggle(PERF_TESTS.length > 0);
       const scene = $('#perfScene').val().trim();
@@ -487,6 +488,7 @@
         const params = new URLSearchParams({ scene, ui: 'true', lod: t.lod, xrscale: t.xrscale, foveation: 0,
                                              xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: 0, test: t.test });
         if (t.variant) params.set('variant', t.variant);
+        if (t.bench) params.set('bench', t.bench);
         if (t.bench) params.set('bench', t.bench);
         $('<a>').attr('href', '/?' + params.toString()).text(t.label).appendTo($links);
       }

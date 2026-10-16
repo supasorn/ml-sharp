@@ -90,6 +90,8 @@
     import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js';
   import { SparkRenderer } from "@sparkjsdev/spark";
     import { XRSceneController } from "/js/XRSceneController.js";
+    import { setupBench } from "/js/xrBench.js";
+    import { createFlatSplats } from "/js/splatFlat.js";
     import { ARButton } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/webxr/ARButton.js";
     import { FontLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/FontLoader.js";
     import { TextGeometry } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/geometries/TextGeometry.js";
@@ -360,6 +362,30 @@
       applyQuality(adapt.q);
     }
 
+    // Draw splats without instancing, one triangle each (web/js/splatFlat.js):
+    // same shader maths, order and image as Spark's instanced quads; on Quest 3
+    // 34 -> 48 fps from dropping instancing, -> 55 fps with triangles.
+    // ?splatdraw=instanced keeps Spark's own drawing; ?splatdraw=quads uses
+    // non-instanced quads (both for comparison).
+    const splatDraw = getQueryParam('splatdraw');
+    const flatSplats = splatDraw === 'instanced' ? null
+      : createFlatSplats(THREE, spark, { corners: splatDraw === 'quads' ? 4 : 3 });
+    if (flatSplats) {
+      scene.add(flatSplats.mesh);
+      flatSplats.set(true);
+    }
+
+    // Self-running XR benchmark (?bench=<name>, see web/js/xrBench.js); its
+    // phases are logged instead of the periodic FPS reports.
+    const benchName = getQueryParam('bench');
+    const xrBench = benchName ? setupBench(benchName, {
+      renderer, flatSplats,
+      report: (fields) => fetch('/fps', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...fields, scene: file, lod: lodMode, splats: countSplats(splat), xrScale }),
+      }).catch(() => {}),
+    }) : null;
+
     // Diagnostics for the FPS reports: how often Spark rebuilds its splat data
     // (needs a new accumulator) and re-sorts (GPU readback + sort). Both are
     // expensive; with sortOnce they should be rare, not per frame.
@@ -383,6 +409,7 @@
     // server console (node web.js) every 2 s.
     let fpsFrames = 0, fpsStart = performance.now();
     function reportXRFps() {
+      if (xrBench) return;  // the benchmark logs per phase instead
       if (!renderer.xr.isPresenting) { fpsFrames = 0; fpsStart = performance.now(); return; }
       fpsFrames++;
       const elapsed = performance.now() - fpsStart;
@@ -393,6 +420,7 @@
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ test: getQueryParam('test') || null, fps: +fps.toFixed(1), scene: file, lod: lodMode,
                                variant: lodMode === 'hybrid' ? hybridName : null,
+                               splatdraw: flatSplats ? `flat${flatSplats.corners}` : 'instanced',
                                splats: countSplats(splat), xrScale, xrStdDev: +xrStdDev.toFixed(2),
                                xrMaxPx, quality: xrAdaptive ? +adapt.q.toFixed(2) : null,
                                rebuilds: sparkStats.rebuilds, sorts: sparkStats.sorts,
@@ -931,6 +959,8 @@
       const frameStart = performance.now();
       stats.begin();
       xrController.update();
+      if (xrBench) xrBench.step(performance.now());
+      if (flatSplats) flatSplats.sync();
       reportXRFps();
       adaptQuality(performance.now());
       // let amplitude = guiParams.amplitude * 0.005 * distance;

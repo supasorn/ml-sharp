@@ -164,17 +164,21 @@ def quadtree_blocks(hard_bad, soft_bad, disp, max_err, max_soft, max_block, min_
     x0, y0 = xs.ravel(), ys.ravel()
     accepted = []
     while s >= min_block and len(x0):
+        on_grid = (x0 < W - 1) & (y0 < H - 1)
+        x0, y0 = x0[on_grid], y0[on_grid]
+        # Blocks overhanging the right/bottom edge can't be accepted, but are
+        # split (not dropped) so smaller blocks still cover up to the edge.
         fits = (x0 + s < W) & (y0 + s < H)
-        x0, y0 = x0[fits], y0[fits]
-        x1, y1 = x0 + s + 1, y0 + s + 1
+        x1, y1 = np.minimum(x0 + s + 1, W), np.minimum(y0 + s + 1, H)
         box = lambda t: t[y1, x1] - t[y0, x1] - t[y1, x0] + t[y0, x0]
         n_hard, n_soft = box(hard), box(soft)
-        ok = (n_hard == 0) & (n_soft <= max_soft * (s + 1) ** 2)
+        area = (x1 - x0) * (y1 - y0)
+        ok = fits & (n_hard == 0) & (n_soft <= max_soft * area)
         if ok.any():
             ok[ok] = plane_fit_error(disp, good, x0[ok], y0[ok], s) <= max_err
         accepted += [(x, y, s) for x, y in zip(x0[ok], y0[ok])]
         # Split the rest, unless they're entirely unusable.
-        split = ~ok & (n_hard + n_soft < (s + 1) ** 2)
+        split = ~ok & (n_hard + n_soft < area)
         h = s // 2
         x0 = np.concatenate([x0[split] + dx for dx in (0, h, 0, h)])
         y0 = np.concatenate([y0[split] + dy for dy in (0, 0, h, h)])

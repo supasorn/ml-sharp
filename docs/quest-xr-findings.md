@@ -16,6 +16,7 @@ original: 1.18M). Quality test scene: `20251023_155037` (palm trees, people).
 | Prediction | `sharp predict-with-info -i images -o output2 --loop` | Watches `images/`, writes `output2/<scene>.ply` + `.json` (focal, size, depths). |
 | Hybrid bake | `sharp bake-hybrid -i output2` (`src/sharp/cli/bake_hybrid.py`) | Writes `<scene>_hybrid.glb` (textured mesh) + `<scene>_hybrid.ply` (remaining splats). ~10–20 s/scene on an RTX 3090. All 79 scenes baked with current defaults. |
 | Other bakes | `sharp bake-layers`, `sharp quest-lod` | Older approaches (see §5); `bake_layers.py` also hosts shared helpers (gsplat loading, splat rendering, edge detection). |
+| Whole stack | `scripts/start_server.sh` | Web server + prediction watcher (GPU 0) + `bake-hybrid --watch` (GPU 1); photos dropped on the gallery become hybrids automatically. Logs in `logs/`. |
 | Server | `node web.js` | HTTP 3000, HTTPS 3443 (WebXR needs HTTPS; cert/key in `certs/`, git-ignored). `/` → gallery `/list`; `/scenes` JSON; `/fps` logs XR reports to `logs/xr_perf.jsonl` (git-ignored); `/delete` removes a scene and its derived files. |
 | Viewer | `web/index.html` | Spark 0.1.10 + three.js r178. `?lod=full|hybrid|layers|quest`. |
 | XR controls | `web/js/XRSceneController.js` | Ported from `/projects/img3dviewer`'s `XRMeshController`. |
@@ -54,6 +55,12 @@ any state) · B tap: previous, B hold 1 s: reload. Secondary: thumbstick scales
 the scene; B/Y opens the settings menu (swap hands, toggles, delete scene with
 confirm). The scene auto-centres on the headset 0.5 s after entering XR.
 
+Moving / dragging / re-centring is done by offsetting the XR reference space
+(moving the viewer), not by moving the scene: Spark regenerates and re-sorts
+every splat whenever a splat object's world transform changes (GPU readback
+stall, visible as stutter). Only scaling and hand rotation still move the
+scene. Thumbsticks have a 0.15 dead zone.
+
 ---
 
 ## 2. Key findings (read this first)
@@ -79,7 +86,11 @@ confirm). The scene auto-centres on the headset 0.5 s after entering XR.
    `optionalFeatures: ['local']` made the Quest switch to its roomscale
    boundary. three's stock `ARButton` (adds `dom-overlay`) keeps stationary
    mode. A page cannot choose the boundary type itself.
-6. **Quick proxy estimates were repeatedly far too optimistic** (prepass,
+6. **Never move the splat objects for navigation.** Spark compares each
+   SplatMesh's world matrix every frame; any change regenerates all splats and
+   re-sorts them (seen as 20–117 rebuilds per 2 s and 72 → 58 fps while
+   moving the scene). Move the viewer via `XRReferenceSpace.getOffsetReferenceSpace`.
+7. **Quick proxy estimates were repeatedly far too optimistic** (prepass,
    occluder, visibility removal). Measure the actual payoff (count splats
    removed with the real test, or run a self-running headset benchmark)
    before building.

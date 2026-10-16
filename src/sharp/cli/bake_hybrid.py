@@ -450,7 +450,7 @@ def bake(path: Path, args) -> None:
                    "--move so moving further than the meshing range doesn't open holes at mesh edges "
                    "(1.0 vs 0.4: +1.4% splats, far-move holes 2% -> 0.1%).")
 @click.option("--visibility/--no-visibility", default=True, show_default=True,
-              help="Also remove Gaussians hidden behind the mesh from every viewpoint within --move.")
+              help="Also remove Gaussians hidden behind the mesh from every viewpoint within --keep-move.")
 @click.option("--vis-std", default=float(np.sqrt(8)), show_default=True,
               help="Splat quad radius (sigmas) assumed by the visibility test (sqrt(8) = largest the viewer draws).")
 @click.option("--footprint-sigma", default=2.0, show_default=True,
@@ -466,15 +466,63 @@ def bake(path: Path, args) -> None:
 @click.option("--images-dir", type=click.Path(path_type=Path), default="images", show_default=True,
               help="Folder holding source photos (for --texture photo).")
 @click.option("--overwrite", is_flag=True, help="Rebuild existing outputs.")
+@click.option("--watch", is_flag=True,
+              help="Keep running and bake new scenes as they appear in the input folder (e.g. from the prediction watcher).")
+@click.option("--poll", default=5.0, show_default=True, help="Seconds between folder checks in --watch mode.")
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
-def bake_hybrid_cli(input_path: Path, verbose: bool, **kwargs):
+def bake_hybrid_cli(input_path: Path, verbose: bool, watch: bool, poll: float, **kwargs):
     """Bake a hybrid mesh + Gaussians scene (<scene>_hybrid.glb + <scene>_hybrid.ply)."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
     args = type("Args", (), kwargs)
-    if input_path.is_dir():
-        paths = sorted(p for p in input_path.glob("*.ply")
-                       if not p.stem.endswith(("_quest", "_pruned", "_mesh", "_hybrid")))
-    else:
-        paths = [input_path]
-    for path in paths:
+    if watch:
+        if not input_path.is_dir():
+            raise click.BadParameter("--watch needs a folder", param_hint="--input-path")
+        if args.overwrite:
+            raise click.BadParameter("--watch can't be combined with --overwrite (it would rebake every scene repeatedly)")
+        watch_folder(input_path, args, poll)
+        return
+    for path in scene_plys(input_path):
         bake(path, args)
+
+
+def scene_plys(input_path: Path) -> list[Path]:
+    """Scene .ply files in a folder (or the given file), excluding derived outputs."""
+    if not input_path.is_dir():
+        return [input_path]
+    return sorted(p for p in input_path.glob("*.ply")
+                  if not p.stem.endswith(("_quest", "_pruned", "_mesh", "_hybrid")))
+
+
+def watch_folder(folder: Path, args, poll: float, settle: float = 3.0) -> None:
+    """Bake scenes as they appear, until interrupted.
+
+    A scene is baked once its .ply and .json both exist and haven't changed for
+    `settle` seconds (the prediction watcher writes the .ply, then the .json),
+    and it has no hybrid outputs yet. A failed scene is logged and retried only
+    if its files change.
+    """
+    import time
+
+    LOGGER.info("Watching %s for new scenes (every %.0f s); Ctrl+C to stop.", folder, poll)
+    failed: dict[Path, tuple[float, float]] = {}
+    while True:
+        for ply in scene_plys(folder):
+            meta = ply.with_suffix(".json")
+            out_glb = ply.with_name(f"{ply.stem}{args.name_suffix}.glb")
+            out_ply = ply.with_name(f"{ply.stem}{args.name_suffix}.ply")
+            if (out_glb.exists() and out_ply.exists() and not args.overwrite) or not meta.exists():
+                continue
+            try:
+                stamps = (ply.stat().st_mtime, meta.stat().st_mtime)
+            except FileNotFoundError:
+                continue
+            if time.time() - max(stamps) < settle or failed.get(ply) == stamps:
+                continue
+            LOGGER.info("New scene: %s", ply.name)
+            try:
+                bake(ply, args)
+                failed.pop(ply, None)
+            except Exception:  # keep watching; retry only if the files change
+                LOGGER.exception("Baking %s failed", ply.name)
+                failed[ply] = stamps
+        time.sleep(poll)

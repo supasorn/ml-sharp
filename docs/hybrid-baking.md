@@ -69,9 +69,35 @@ message.
 ~15 minutes). Output per scene: 2–14 MB `.glb` (median 7) + 11–51 MB `.ply`
 (median 23).
 
-**New scenes:** the watcher doesn't bake automatically. After new photos are
-processed, run `sharp bake-hybrid -i output2` again; only the new scenes are
-baked.
+**New scenes:** run `sharp bake-hybrid -i output2` again (only new scenes are
+baked), or keep a watcher running (next section).
+
+## Automatic baking (drop a photo, get a hybrid)
+
+`--watch` keeps the bake running and bakes each new scene as soon as its
+`.ply` and `.json` are complete (unchanged for 3 s) and it has no hybrid yet:
+
+```bash
+sharp bake-hybrid -i output2 --watch        # --poll 5 by default
+```
+
+A failed scene is logged and only retried if its files change. `--watch`
+can't be combined with `--overwrite`.
+
+The whole stack is started by one script, which stops all parts on Ctrl+C:
+
+```bash
+scripts/start_server.sh
+```
+
+It runs the web server (`node web.js`), the prediction watcher
+(`sharp predict-with-info -i images -o output2 --loop`, GPU 0) and the
+hybrid-bake watcher (GPU 1), logging to `logs/web.log`, `logs/predict.log`
+and `logs/bake.log`. Override with `SHARP_ENV`, `PREDICT_GPU`, `BAKE_GPU`.
+
+Flow: drop photos on the gallery → saved to `images/` → predicted into
+`output2/` (the scene appears in the gallery; hybrid view falls back to the
+original splats) → baked (~10–20 s later, the hybrid is used).
 
 ## What the log line means
 

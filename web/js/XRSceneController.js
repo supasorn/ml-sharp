@@ -62,8 +62,16 @@ export class XRSceneController {
     this.sEnabled = true;
     this.motionInd = 1;  // main hand: 0 = left, 1 = right
 
-    this.lastGroupPos = null;
-    this.lastContPos = null;
+    // Scene placement in the session's base reference space. It is applied by
+    // offsetting the XR reference space (moving the viewer), not by moving the
+    // scene: Spark regenerates and re-sorts all splats whenever a splat
+    // object's world transform changes (a GPU readback stall), so moving the
+    // scene stuttered. Scale and hand rotation still move the scene.
+    this.baseSpace = null;
+    this.placePos = new THREE.Vector3();
+    this.placeQuat = new THREE.Quaternion();
+    this.dragStartPlace = null;
+    this.dragStartCont = null;
 
     this.menuGroup = new THREE.Group();
     this.menuGroup.visible = false;
@@ -146,12 +154,31 @@ export class XRSceneController {
 
   // --- Scene placement ------------------------------------------------------
 
+  /** A point in the current (offset) XR space -> the base reference space. */
+  _toBase(v) {
+    return v.clone().applyQuaternion(this.placeQuat).add(this.placePos);
+  }
+
+  /** Make the scene (at the three.js world origin) appear at the placement:
+   *  the offset space's origin sits at placePos / placeQuat in the base space. */
+  _applyPlacement() {
+    if (!this.baseSpace || typeof XRRigidTransform === "undefined") return;
+    const p = this.placePos, q = this.placeQuat;
+    this.renderer.xr.setReferenceSpace(this.baseSpace.getOffsetReferenceSpace(
+      new XRRigidTransform({ x: p.x, y: p.y, z: p.z }, { x: q.x, y: q.y, z: q.z, w: q.w })));
+  }
+
   /** Session start: scene at the reference-space origin (your head), pushed by homePush. */
   applyHome() {
     if (!this.group) return;
-    this.group.position.set(0, 0, -this.homePush);
+    this.group.position.set(0, 0, 0);
     this.group.quaternion.identity();
     this.group.scale.setScalar(1);
+    // three resets its custom reference space for each new session, so this is the base.
+    this.baseSpace = this.renderer.xr.getReferenceSpace();
+    this.placePos.set(0, 0, -this.homePush);
+    this.placeQuat.identity();
+    this._applyPlacement();
   }
 
   /** Place the scene at your head, facing your gaze (yaw only), pushed forward by
@@ -162,10 +189,14 @@ export class XRSceneController {
     const pos = new THREE.Vector3(), quat = new THREE.Quaternion();
     cam.getWorldPosition(pos);
     cam.getWorldQuaternion(quat);
-    const euler = new THREE.Euler(0, 0, 0, "YXZ").setFromQuaternion(quat);
-    this.group.quaternion.setFromEuler(new THREE.Euler(0, euler.y, 0, "YXZ"));
-    this.group.position.copy(pos).add(new THREE.Vector3(0, 0, -this.homePush).applyQuaternion(this.group.quaternion));
-    if (this.content && this.content.parent === this.group) {
+    const headPos = this._toBase(pos);
+    const headQuat = this.placeQuat.clone().multiply(quat);
+    const yaw = new THREE.Euler(0, 0, 0, "YXZ").setFromQuaternion(headQuat).y;
+    this.placeQuat.setFromEuler(new THREE.Euler(0, yaw, 0, "YXZ"));
+    this.placePos.copy(headPos).add(new THREE.Vector3(0, 0, -this.homePush).applyQuaternion(this.placeQuat));
+    this._applyPlacement();
+    if (this.content && this.content.parent === this.group &&
+        (!this.content.position.equals(new THREE.Vector3()) || this.content.quaternion.w !== 1)) {
       this.content.position.set(0, 0, 0);
       this.content.quaternion.identity();
     }
@@ -180,6 +211,10 @@ export class XRSceneController {
     this.content.position.set(0, 0, 0);
     this.content.quaternion.identity();
     this.menuGroup.visible = false;
+    this.baseSpace = null;
+    this.placePos.set(0, 0, 0);
+    this.placeQuat.identity();
+    this.dragStartPlace = this.dragStartCont = null;
   }
 
   // --- Per-frame update -----------------------------------------------------
@@ -192,7 +227,9 @@ export class XRSceneController {
     for (const source of session.inputSources) {
       const hand = source.handedness === "left" ? 0 : source.handedness === "right" ? 1 : -1;
       if (hand < 0 || !source.gamepad || !source.gamepad.buttons) continue;
-      if (source.gamepad.axes[3]) motionUD[hand] = source.gamepad.axes[3];
+      // Dead zone: a slightly off-centre stick must not keep nudging the scene.
+      const ud = source.gamepad.axes[3] || 0;
+      if (Math.abs(ud) > 0.15) motionUD[hand] = ud;
       source.gamepad.buttons.forEach((button, i) => {
         const b = this.butts[hand][i];
         if (!b) return;
@@ -255,23 +292,26 @@ export class XRSceneController {
     if (mUD) {
       const dir = new THREE.Vector3();
       this.renderer.xr.getCamera().getWorldDirection(dir);
-      this.group.position.addScaledVector(dir, -mUD * 0.01);
+      this.placePos.addScaledVector(dir.applyQuaternion(this.placeQuat), -mUD * 0.01);
+      this._applyPlacement();
     }
 
     // Main: trigger resets the scene in front of you.
     if (mButt[0].pressed) this.resetPlacement();
 
     if (mCont) {
-      // Grip: drag.
+      // Grip: drag (in base space, so the hand's position doesn't shift as the
+      // reference space moves under it).
       if (mButt[1].pressed) {
-        if (this.lastContPos === null) {
-          this.lastContPos = mCont.position.clone();
-          this.lastGroupPos = this.group.position.clone();
+        const contBase = this._toBase(mCont.position);
+        if (this.dragStartPlace === null) {
+          this.dragStartPlace = this.placePos.clone();
+          this.dragStartCont = contBase.clone();  // own copy: contBase is modified below
         }
-        this.group.position.copy(this.lastGroupPos).add(new THREE.Vector3().subVectors(mCont.position, this.lastContPos));
+        this.placePos.copy(this.dragStartPlace).add(contBase.sub(this.dragStartCont));
+        this._applyPlacement();
       } else {
-        this.lastContPos = null;
-        this.lastGroupPos = null;
+        this.dragStartPlace = this.dragStartCont = null;
       }
       // Thumbstick click: hold to rotate the scene with the controller.
       if (this.content) {

@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--quality", type=int, default=2, help="UASTC level 0-4 (slower = better)")
     ap.add_argument("--zstd", type=int, default=18, help="Zstandard level (0 = none)")
     ap.add_argument("--rdo", type=float, default=0, help="UASTC RDO lambda (0 = off; ~1 = smaller files)")
+    ap.add_argument("--levels", type=int, default=3,
+                    help="mipmap levels (box filter; 1 = none). The Quest shrinks full-resolution cells 2-3x; "
+                         "with cells' 4-texel borders, levels 0-2 stay free of neighbouring cells")
     ap.add_argument("--decoded", type=Path, help="also write a .glb with the decoded pages as PNG")
     a = ap.parse_args()
     g, bin_ = read_glb(a.src)
@@ -78,6 +81,8 @@ def main():
             enc = Path(td) / f"p{i}.ktx2"
             args = ["create", "--format", "R8G8B8A8_UNORM", "--encode", "uastc", "--uastc-quality", a.quality,
                     "--assign-tf", "linear"]
+            if a.levels > 1:
+                args += ["--generate-mipmap", "--mipmap-filter", "box", "--levels", a.levels]
             if a.rdo > 0:
                 args += ["--uastc-rdo", "--uastc-rdo-l", a.rdo]
             if a.zstd > 0:
@@ -101,7 +106,7 @@ def main():
         write_glb(a.decoded, json.loads(json.dumps(g)), dec_views)
     n = len(g["images"])
     print(f"{a.src.name}: {n} pages, PNG {png_bytes / 2**20:.1f} MB -> KTX2 {ktx_bytes / 2**20:.1f} MB, "
-          f"GPU {n * 4096 * 4096 * 4 / 2**20:.0f} MB RGBA8 -> {n * 4096 * 4096 / 2**20:.0f} MB ASTC 4x4, "
+          f"GPU {n * 4096 * 4096 * 4 / 2**20:.0f} MB RGBA8 -> {n * 4096 * 4096 / 2**20 * (4 / 3 if a.levels > 1 else 1):.0f} MB ASTC 4x4, "
           f"{time.time() - t0:.0f}s", flush=True)
 
 

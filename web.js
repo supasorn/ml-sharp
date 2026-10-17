@@ -42,27 +42,61 @@ app.post('/fps', express.json(), (req, res) => {
   res.sendStatus(204);
 });
 
-// Small JPEG thumbnail of a scene's photo (for the in-XR gallery), made once with
-// the sharp conda env's Pillow (EXIF orientation applied) and cached.
+// Small JPEG thumbnails (in-XR gallery, pending items), made once with the sharp conda env's Pillow
+// (EXIF orientation applied, HEIC via pillow_heif) and cached.
 const THUMB_DIR = path.join(__dirname, 'renderings', 'thumbs');
+const THUMB_PX = 512;   // gallery cards are 250 css px (500 device px on high-DPI screens)
+function sendThumb(src, out, res, what) {
+  if (fs.existsSync(out) && fs.statSync(out).mtimeMs >= fs.statSync(src).mtimeMs) return res.sendFile(out);
+  fs.mkdirSync(THUMB_DIR, { recursive: true });
+  const py = 'import sys\nfrom PIL import Image, ImageOps\ntry:\n import pillow_heif; pillow_heif.register_heif_opener()\n' +
+             'except ImportError:\n pass\nim = ImageOps.exif_transpose(Image.open(sys.argv[1])).convert("RGB")\n' +
+             `im.thumbnail((${THUMB_PX}, ${THUMB_PX}))\nim.save(sys.argv[2], quality=85)`;
+  execFile('/conda_envs/sharp/bin/python', ['-c', py, src, out], (err) => {
+    if (err) { console.error('thumbnail failed:', what, err.message); return res.sendStatus(500); }
+    res.sendFile(out);
+  });
+}
 app.get('/thumb/:scene', (req, res) => {
   const scene = req.params.scene;
   const jsonPath = path.join(__dirname, 'output2', scene + '.json');
   if (scene.includes('/') || scene.includes('..') || !fs.existsSync(jsonPath)) return res.sendStatus(404);
-  const out = path.join(THUMB_DIR, scene + '.jpg');
-  if (fs.existsSync(out)) return res.sendFile(out);
   let image;
   try { image = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).image; } catch (e) { return res.sendStatus(404); }
   const src = path.join(__dirname, 'images', image || '');
   if (!image || !fs.existsSync(src)) return res.sendStatus(404);
-  fs.mkdirSync(THUMB_DIR, { recursive: true });
-  const py = 'import sys\nfrom PIL import Image, ImageOps\nim = ImageOps.exif_transpose(Image.open(sys.argv[1])).convert("RGB")\n' +
-             'im.thumbnail((384, 384))\nim.save(sys.argv[2], quality=85)';
-  execFile('/conda_envs/sharp/bin/python', ['-c', py, src, out], (err) => {
-    if (err) { console.error('thumbnail failed:', scene, err.message); return res.sendStatus(500); }
-    res.sendFile(out);
-  });
+  sendThumb(src, path.join(THUMB_DIR, `${scene}_${THUMB_PX}.jpg`), res, scene);
 });
+// Thumbnail of a photo in images/ by file name (pending items have no scene yet).
+app.get('/thumb-img/:file', (req, res) => {
+  const file = req.params.file;
+  const src = path.join(__dirname, imgdir, file);
+  if (file.includes('/') || file.includes('..') || !fs.existsSync(src)) return res.sendStatus(404);
+  sendThumb(src, path.join(THUMB_DIR, `_img_${file}_${THUMB_PX}.jpg`), res, file);
+});
+
+// Photos in images/ that have no scene yet (being predicted, or waiting for it), newest first.
+const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp', '.avif', '.tif', '.tiff', '.bmp']);
+function pendingImages() {
+  const outDir = path.join(__dirname, 'output2');
+  const used = new Set();
+  for (const f of fs.readdirSync(outDir)) {
+    if (!f.endsWith('.json')) continue;
+    used.add(f.slice(0, -5));
+    try { const im = JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8')).image; if (im) used.add(im); } catch (e) {}
+  }
+  return fs.readdirSync(path.join(__dirname, imgdir))
+    .filter((f) => IMAGE_EXTS.has(path.extname(f).toLowerCase()))
+    .filter((f) => !used.has(f) && !used.has(path.basename(f, path.extname(f))))
+    .map((f) => ({ file: f, mtime: fs.statSync(path.join(__dirname, imgdir, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime);
+}
+app.get('/pending', (req, res) => {
+  try { res.json(pendingImages()); } catch (e) { res.status(500).send('Cannot read directory'); }
+});
+
+// Import from Google Photos (Picker API): see google_photos.js for setup; credentials in secrets/.
+require('./google_photos')(app, { imagesDir: path.join(__dirname, imgdir), secretsDir: path.join(__dirname, 'secrets') });
 
 // View modes a scene can be shown in (gallery page and in-XR gallery grey out the rest).
 function sceneModes(dir, name) {
@@ -119,11 +153,12 @@ app.get('/list', (req, res) => {
       } catch (e) {
         imageName = '';
       }
-      const imgSrc = `/images/${encodeURIComponent(imageName)}`;
+      // Cached thumbnail (fast) instead of the full photo; made on first request.
+      const imgSrc = `/thumb/${encodeURIComponent(name)}`;
       return `
         <div class="scene-item" data-modes="${sceneModes(dir, name).join(' ')}">
           <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
-            <img src='${imgSrc}' alt='${name}' />
+            <img src='${imgSrc}' alt='${name}' loading='lazy' />
           </a>
         </div>
       `;
@@ -132,7 +167,22 @@ app.get('/list', (req, res) => {
     // Read the template and inject the items
     const templatePath = path.join(__dirname, 'web', 'list.html');
     let template = fs.readFileSync(templatePath, 'utf8');
-    template = template.replace('<!-- SCENE_ITEMS_PLACEHOLDER -->', items);
+    // Photos still being processed: dimmed thumbnail with a spinner (not clickable), newest first.
+    let pending = '';
+    try {
+      pending = pendingImages().map(({ file, mtime }) => {
+        const stale = Date.now() - mtime > 30 * 60 * 1000;
+        return `
+        <div class="scene-item pending" data-file="${encodeURIComponent(file)}" title="${file}">
+          <div class="pending-wrap">
+            <img src='/thumb-img/${encodeURIComponent(file)}' alt='${file}' loading='lazy' />
+            ${stale ? '' : '<div class="pending-spinner"></div>'}
+            <div class="pending-label">${stale ? 'Still not processed — check logs/predict.log' : 'Processing…'}</div>
+          </div>
+        </div>`;
+      }).join('\n');
+    } catch (e) {}
+    template = template.replace('<!-- SCENE_ITEMS_PLACEHOLDER -->', pending + items);
     res.send(template);
   });
 });

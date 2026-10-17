@@ -45,6 +45,8 @@ EXPORT_DIR = os.environ.get("EXPORT_DIR", "")
 EVAL = int(os.environ.get("EVAL", 1))
 FITFLAT = bool(os.environ.get("FITFLAT", "1") != "0")  # fronto-parallel patches (tilted RANSAC planes mix depths)
 TEXDS = int(os.environ.get("TEXDS", 2))
+CELL_BORDER = int(os.environ.get("CELL_BORDER", 2))   # MPI export: border texels per cell (>= 2^L keeps mip level L clean)
+CELL_BORDER = int(os.environ.get("CELL_BORDER", 2))   # MPI export: border texels per cell (>= 2^L keeps mip level L clean)
 TEXFULL_THR = float(os.environ.get("TEXFULL_THR", 0.003))   # MPI export: cells losing more detail than this at 1/TEXDS keep full res
 MAXPAGES = int(os.environ.get("MAXPAGES", 4))              # ... within this many 4096^2 atlas pages
 BINS = int(os.environ.get("BINS", 0))
@@ -217,7 +219,7 @@ def run(scene: Path):
         ny, nx = -(-Hc // cell), -(-Wc // cell)
         b_t = torch.tensor(b, device=dev)
         crops, crops_b, rect_l, cen_l, cd_l = [], [], [], [], []
-        gb = 2 * TEXDS                                     # border (render px) of real neighbour texels, export only
+        gb = CELL_BORDER * TEXDS                          # border (render px) of real neighbour texels, export only
         cb = cell + 2 * gb
         # Layer extension (EXTEND render px): each bin's content is continued, opaque, underneath what is
         # already opaque in front of it (nearer bins, or the mesh), so moving the head reveals that colour

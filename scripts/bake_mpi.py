@@ -17,7 +17,10 @@ Scenes whose output is newer than their .ply are skipped (--overwrite redoes
 them, --reexport redoes only step 3, reusing the bake). Scenes run in parallel,
 one per GPU.
 
-Usage: python scripts/bake_mpi.py [-i output2] [--gpus 0,1,2,3] [--overwrite] [scene names...]
+--watch keeps running and bakes new scenes as they appear (MPI-only first, the default view, then
+Hybrid-MPI), on the GPU(s) in CUDA_VISIBLE_DEVICES; scripts/start_server.sh runs it.
+
+Usage: python scripts/bake_mpi.py [-i output2] [--gpus 0,1,2,3] [--overwrite] [--watch] [scene names...]
 """
 import argparse
 import os
@@ -32,7 +35,7 @@ from queue import Queue
 
 ROOT = Path(__file__).resolve().parents[1]
 SUFFIX = "_hybrid_k03r05"
-MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "REFINE": "1", "CULL": "0.05", "EXPORT": "_mpi", "EVAL": "0"}
+MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "REFINE": "1", "CULL": "0.05", "CELL_BORDER": "4", "EXPORT": "_mpi", "EVAL": "0"}
 
 
 def scene_plys(folder: Path, names):
@@ -45,6 +48,9 @@ def scene_plys(folder: Path, names):
 def bake(ply: Path, gpu: str, args, log):
     out = args.input / f"{ply.stem}{'_mpionly' if args.mpionly else '_mpi'}.glb"
     if out.exists() and out.stat().st_mtime > ply.stat().st_mtime and not (args.overwrite or args.reexport):
+        if not args.no_ktx2 and not out.with_name(out.stem + "_ktx2.glb").exists():
+            compress(out, args, log)                          # e.g. an earlier run stopped before compressing
+            return "compressed"
         return "skipped"
     work = args.work
     link = work / ply.name
@@ -77,6 +83,44 @@ def compress(glb: Path, args, log):
                     str(glb.with_name(glb.stem + "_ktx2.glb"))], check=True, stdout=log, stderr=subprocess.STDOUT)
 
 
+def watch(args):
+    """Bake scenes that lack their MPI outputs, forever: MPI-only first (the default view), then Hybrid-MPI.
+    A scene is picked up once its .ply and .json have been unchanged for a few seconds; a failed scene is
+    retried only after its .ply changes."""
+    gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    failed = {}
+    print(f"watching {args.input} (GPU {gpu}, every {args.poll:.0f} s)", flush=True)
+    while True:
+        for mpionly in (True, False):
+            for ply in scene_plys(args.input, set()):
+                sfx = "_mpionly" if mpionly else "_mpi"
+                out = args.input / f"{ply.stem}{sfx}.glb"
+                done_ = out.exists() and out.stat().st_mtime > ply.stat().st_mtime and (
+                    args.no_ktx2 or out.with_name(out.stem + "_ktx2.glb").exists())
+                key = (ply.stem, sfx)
+                if done_ or failed.get(key) == ply.stat().st_mtime:
+                    continue
+                if time.time() - max(ply.stat().st_mtime, ply.with_suffix(".json").stat().st_mtime) < 5:
+                    continue                                   # still being written
+                args.mpionly = mpionly
+                t0 = time.time()
+                try:
+                    with open(args.work / f"{ply.stem}{'_mpionly' if mpionly else ''}.log", "w") as log:
+                        status = bake(ply, gpu, args, log)
+                    print(f"{time.strftime('%H:%M:%S')} {ply.stem}{sfx}: {status} in {time.time() - t0:.0f}s", flush=True)
+                    if status == "skipped":                   # nothing to do after all: don't spin on it
+                        failed[key] = ply.stat().st_mtime
+                except (subprocess.CalledProcessError, OSError) as e:
+                    failed[key] = ply.stat().st_mtime if ply.exists() else None
+                    print(f"{time.strftime('%H:%M:%S')} {ply.stem}{sfx}: FAILED ({e})", flush=True)
+                break                                          # re-scan: newer scenes and MPI-only go first
+            else:
+                continue
+            break
+        else:
+            time.sleep(args.poll)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("-i", "--input", type=Path, default=ROOT / "output2")
@@ -86,9 +130,13 @@ def main():
     ap.add_argument("--reexport", action="store_true", help="redo only the MPI export (reuse the hybrid bakes)")
     ap.add_argument("--mpionly", action="store_true", help="MPI from all splats, no hybrid mesh (_mpionly.glb)")
     ap.add_argument("--no-ktx2", action="store_true", help="don't write the compressed-texture variant")
+    ap.add_argument("--watch", action="store_true", help="keep baking new scenes as they appear")
+    ap.add_argument("--poll", type=float, default=10.0, help="seconds between folder checks in --watch mode")
     ap.add_argument("scenes", nargs="*")
     args = ap.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
+    if args.watch:
+        return watch(args)
     plys = scene_plys(args.input, set(args.scenes))
     gpus = Queue()
     for g in args.gpus.split(","):

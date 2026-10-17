@@ -233,6 +233,18 @@ hybrid 32.5 / 26.4):
     the frame): pixels get opaque through several stacked semi-transparent
     layers, rarely one opaque layer (same lesson as the splat opaque-core
     pre-pass, §5). Not worth an extra pass.
+14. **Texture aliasing on the Quest**: full-resolution cells are drawn 2–3×
+    smaller than their texels at xrscale 1 (photo FOV ~56–74° over a ~104°
+    eye buffer), which aliases without mipmaps (sharp on desktop). Offline at
+    Quest density vs a 4× supersampled ideal: no mips sharpness 1.3–1.4
+    (aliasing), plain box mips 0.72–0.80 (blurry), mips with LOD bias −0.5
+    1.0 and +6–7 dB — but in the headset −0.5 still crawled when moving, plain
+    mips looked soft, and **xrscale 1.4 with bias −0.5 looked best** (Quest 3
+    grants 2352×2464 per eye and holds 120 Hz). Defaults now: xrscale 1.4 for
+    MPI views (1.0 for splat views), no foveation, KTX2 with 3 box mip levels,
+    4-texel cell borders (`CELL_BORDER`), trilinear + bias −0.5 (`?lodbias=`).
+    Still-image metrics can't separate motion crawl from blur: judge in the
+    headset.
 9. SHARP's own two layers are not a front/back pair (92% of same-index pairs
    lie within 1% depth, each layer alone is porous), so two full-resolution
    projective textured layers fail (17.8 dB at 10 cm alone, 19.7 with the mesh).

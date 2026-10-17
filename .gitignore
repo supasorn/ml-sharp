@@ -165,8 +165,9 @@ cython_debug/
 *.pt
 .aider*
 
-# Viewer server: HTTPS key/cert, XR performance logs, local scratch
+# Viewer server: HTTPS key/cert, Google OAuth credentials/token, XR performance logs, local scratch
 certs/
+secrets/
 logs/
 .hybtest/
 

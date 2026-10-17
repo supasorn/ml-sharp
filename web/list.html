@@ -31,6 +31,21 @@
       margin: 0 auto;
     }
 
+    /* Photos still being processed (no scene yet): dimmed thumbnail, spinner, label. */
+    .scene-item.pending { pointer-events: none; }
+    .scene-item.pending .pending-wrap { position: relative; }
+    .scene-item.pending img { filter: brightness(0.45) saturate(0.7); }
+    .pending-spinner {
+      position: absolute; top: 50%; left: 50%; width: 38px; height: 38px; margin: -27px 0 0 -19px;
+      border: 4px solid rgba(255, 255, 255, 0.25); border-top-color: #fff; border-radius: 50%;
+      animation: pending-spin 0.9s linear infinite;
+    }
+    @keyframes pending-spin { to { transform: rotate(360deg); } }
+    .pending-label {
+      position: absolute; left: 0; right: 0; top: 50%; margin-top: 22px; text-align: center;
+      color: #fff; font-size: 14px; font-weight: 600; letter-spacing: 0.02em; text-shadow: 0 1px 3px #000;
+      padding: 0 8px;
+    }
     .scene-item.unavailable {
       opacity: 0.3;
       filter: grayscale(1);
@@ -157,6 +172,44 @@
       border-radius: 4px;
       font-size: 18px;
     }
+    /* Import from Google Photos (google_photos.js) */
+    #google_import {
+      background: #fff;
+      color: #1f1f1f;
+      border: none;
+      padding: 12px 14px 12px 12px;
+      margin: 8px;
+      cursor: pointer;
+      border-radius: 4px;
+      font-size: 18px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      vertical-align: middle;
+    }
+    #google_import svg { width: 20px; height: 20px; }
+    #google_import:hover { background: #e8f0fe; }
+    #gModal {
+      position: fixed; inset: 0; z-index: 2000; display: none;
+      background: rgba(0, 0, 0, 0.6); align-items: center; justify-content: center;
+    }
+    #gModal .box {
+      background: #23272e; color: #eee; border-radius: 12px; padding: 22px 26px; width: min(440px, 92vw);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); font-size: 15px; line-height: 1.45;
+    }
+    #gModal h3 { margin: 0 0 12px; font-size: 19px; }
+    #gModal a { color: #8ab4f8; }
+    #gModal .gbtn {
+      background: #4f8cff; color: #fff; border: none; border-radius: 6px; padding: 10px 16px;
+      font-size: 15px; cursor: pointer; margin-top: 10px; text-decoration: none; display: inline-block;
+    }
+    #gModal .gbtn.secondary { background: #3a3f48; }
+    #gModal #gQr { background: #fff; padding: 10px; display: inline-block; margin: 10px 0; border-radius: 6px; }
+    #gModal code { background: #15181c; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+    #gModal .gstatus { margin-top: 10px; color: #b2d1ff; }
+    .opt-auto { margin-left: 6px; padding: 2px 8px; border-radius: 10px; border: 1px solid #555; background: transparent;
+                color: #bbb; font-size: 12px; cursor: pointer; }
+    .opt-auto.active { background: #4f8cff; border-color: #4f8cff; color: #fff; }
     /* View options bar */
     #options {
       display: flex;
@@ -319,6 +372,11 @@
 
   <input type="file" id="fileInput" multiple style="display: none;" />
   <button id="browse_file" onclick="$('#fileInput').click();">Select Files</button>
+  <button id="google_import" type="button" title="Pick photos in Google Photos; they are downloaded and processed like dropped photos">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285f4" d="M12 12V2a5 5 0 0 1 0 10z"/><path fill="#34a853" d="M12 12h10a5 5 0 0 1-10 0z"/><path fill="#fbbc04" d="M12 12v10a5 5 0 0 1 0-10z"/><path fill="#ea4335" d="M12 12H2a5 5 0 0 1 10 0z"/></svg>
+    Import from Google
+  </button>
+  <div id="gModal"><div class="box" id="gBox"></div></div>
   <label class="toggle-switch">
     <input type="checkbox" id="toggleDelete">
     <span class="slider"></span>
@@ -336,7 +394,8 @@
     </div>
     <div class="opt-group" title="Eye-buffer resolution in AR/VR (1 = full)">
       <span class="opt-label">xrscale</span>
-      <input type="range" id="optXrscale" min="0.5" max="1" step="0.05">
+      <input type="range" id="optXrscale" min="0.5" max="1.5" step="0.05">
+      <button type="button" class="opt-auto" id="xrscaleAuto" title="1.4 for the MPI views, 1.0 for the splat views">auto</button>
       <span class="opt-value" id="valXrscale"></span>
     </div>
     <div class="opt-group" title="Quest fixed foveated rendering (0 = off, 1 = max; blurs the view's edges)">
@@ -433,13 +492,22 @@
 
     // --- View options: applied to every scene link ---
     // Viewer defaults (web/index.html). Presets set every XR option (not the view).
-    const XR_DEFAULTS = { xrscale: 0.8, foveation: 1, xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: false };
-    const DEFAULT_OPTS = { lod: 'mpionly', ...XR_DEFAULTS };
-    const FULL_QUALITY = { ...XR_DEFAULTS, xrscale: 1, foveation: 0, xrstddev: 2.83 };
+    // xrscale 'auto': the viewer picks 1.4 for the MPI views and 1.0 for the splat views (no xrscale in the link).
+    const XR_DEFAULTS = { xrscale: 'auto', foveation: 0, xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: false };
+    const DEFAULT_OPTS = { lod: 'mpionly', optsVersion: 4, ...XR_DEFAULTS };
+    const FULL_QUALITY = { ...XR_DEFAULTS, foveation: 0, xrstddev: 2.83 };
     const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96, adaptive: true };
     let opts = { ...DEFAULT_OPTS };
     try {
-      opts = { ...opts, ...JSON.parse(localStorage.getItem('sceneViewOpts') || '{}') };
+      const saved = JSON.parse(localStorage.getItem('sceneViewOpts') || '{}');
+      // One-time switch of a remembered view mode to MPI-only, the new default (fastest and best looking
+      // on the Quest 3); later choices are remembered as before.
+      if ((saved.optsVersion || 1) < 2) { saved.lod = 'mpionly'; saved.optsVersion = 2; }
+      // One-time switch to full eye-buffer resolution and no foveation, the new defaults.
+      if (saved.optsVersion < 3) { saved.xrscale = 1; saved.foveation = 0; saved.optsVersion = 3; }
+      // One-time switch to automatic resolution (1.4 for MPI views), the new default.
+      if (saved.optsVersion < 4) { saved.xrscale = 'auto'; saved.optsVersion = 4; }
+      opts = { ...opts, ...saved };
       delete opts.nearclip;
       delete opts.xrsize;
       delete opts.prepass;
@@ -453,7 +521,10 @@
       $('#lodSeg button').each(function () {
         $(this).toggleClass('active', $(this).data('lod') === opts.lod);
       });
-      $('#optXrscale').val(opts.xrscale); $('#valXrscale').text(Number(opts.xrscale).toFixed(2));
+      const autoScale = opts.xrscale === 'auto';
+      $('#optXrscale').val(autoScale ? (['mpi', 'mpionly'].includes(opts.lod) ? 1.4 : 1) : opts.xrscale);
+      $('#valXrscale').text(autoScale ? 'auto' : Number(opts.xrscale).toFixed(2));
+      $('#xrscaleAuto').toggleClass('active', autoScale);
       $('#optFoveation').val(opts.foveation); $('#valFoveation').text(Number(opts.foveation).toFixed(1));
       $('#optXrstddev').val(opts.xrstddev); $('#valXrstddev').text(Number(opts.xrstddev).toFixed(2));
       $('#optXrmaxpx').val(opts.xrmaxpx); $('#valXrmaxpx').text(Math.round(opts.xrmaxpx));
@@ -463,7 +534,8 @@
       $('.scene-item a').each(function () {
         const url = new URL($(this).attr('href'), window.location.href);
         url.searchParams.set('lod', opts.lod);
-        url.searchParams.set('xrscale', opts.xrscale);
+        if (opts.xrscale === 'auto') url.searchParams.delete('xrscale');
+        else url.searchParams.set('xrscale', opts.xrscale);
         url.searchParams.set('foveation', opts.foveation);
         url.searchParams.set('xrstddev', opts.xrstddev);
         url.searchParams.set('xrmaxpx', opts.xrmaxpx);
@@ -472,7 +544,7 @@
         $(this).attr('href', url.pathname + url.search);
       });
       // Grey out scenes that don't have the selected view mode (not baked yet).
-      $('.scene-item').each(function () {
+      $('.scene-item').not('.pending').each(function () {
         const modes = ($(this).data('modes') || 'full').split(' ');
         $(this).toggleClass('unavailable', !modes.includes(opts.lod));
       });
@@ -515,12 +587,86 @@
       }
     }
 
+    // --- Import from Google Photos (server: google_photos.js) ---
+    let gPoll = null;
+    function gShow(html) { $('#gBox').html(html + '<div style="text-align:right"><button class="gbtn secondary" id="gClose">Close</button></div>'); $('#gModal').css('display', 'flex'); }
+    function gClose() { clearInterval(gPoll); gPoll = null; $('#gModal').hide(); }
+    async function gOpen() {
+      let st;
+      try { st = await (await fetch('/google/status')).json(); } catch (e) { return gShow('<h3>Import from Google</h3><p>Server not reachable.</p>'); }
+      if (!st.configured) {
+        return gShow('<h3>Import from Google</h3><p>Not set up yet. Create an OAuth client (type <b>Web application</b>) in a '
+          + 'Google Cloud project with the <b>Photos Picker API</b> enabled, then put its credentials in '
+          + '<code>secrets/google_oauth.json</code> on the server:</p><p><code>{"client_id": "…", "client_secret": "…", '
+          + '"redirect_uri": "http://localhost:3000/google/callback"}</code></p><p>Details: <code>google_photos.js</code>.</p>');
+      }
+      if (!st.signedIn) {
+        const local = ['localhost', '127.0.0.1'].includes(location.hostname);
+        return gShow('<h3>Import from Google</h3><p>Sign in once to allow picking photos. Google only accepts '
+          + `<code>${st.redirectUri}</code> as the return address, so open this page via localhost for the sign-in `
+          + '(on the server, or through <code>ssh -L 3000:localhost:3000 &lt;server&gt;</code>). After that, imports work '
+          + 'from any device.</p>'
+          + (local ? '<a class="gbtn" href="/google/login" target="_blank">Sign in with Google</a>'
+                   : '<a class="gbtn" href="http://localhost:3000/google/login" target="_blank">Sign in with Google (via localhost)</a>'));
+      }
+      gShow('<h3>Import from Google</h3><p>Pick photos in Google Photos; they are downloaded here and processed '
+        + 'automatically (original splats first, then the other view modes).</p>'
+        + '<button class="gbtn" id="gStart">Choose photos</button>');
+    }
+    async function gStart() {
+      let j;
+      try {
+        const r = await fetch('/google/session', { method: 'POST' });
+        j = await r.json();
+        if (!r.ok) throw new Error(j.error || r.status);
+      } catch (e) { return gShow(`<h3>Import from Google</h3><p>Could not start: ${e.message}</p>`); }
+      gShow('<h3>Pick your photos</h3><p>Open the picker here or scan the code with your phone, select photos, '
+        + 'then tap <b>Done</b>.</p>'
+        + `<p><a class="gbtn" href="${j.pickerUri}" target="_blank" rel="noopener">Open Google Photos picker</a></p>`
+        + '<div id="gQr"></div><div class="gstatus" id="gStatus">Waiting for your selection…</div>');
+      $.getScript('https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js', () => {
+        new QRCode(document.getElementById('gQr'), { text: j.pickerUri, width: 180, height: 180 });
+      });
+      gPoll = setInterval(async () => {
+        let s;
+        try { s = await (await fetch(`/google/session/${j.id}`)).json(); } catch (e) { return; }
+        const el = $('#gStatus');
+        if (s.state === 'picking') el.text('Waiting for your selection…');
+        else if (s.state === 'downloading') el.text(`Downloading ${s.done}/${s.total}…`);
+        else if (s.state === 'done') {
+          clearInterval(gPoll); gPoll = null;
+          el.html(`Imported ${s.done} photo${s.done === 1 ? '' : 's'}`
+            + (s.skipped ? ` (${s.skipped} video${s.skipped === 1 ? '' : 's'} skipped)` : '')
+            + (s.failed ? `, ${s.failed} failed` : '') + '. They appear in the gallery once processed '
+            + '(about a minute each). <a href="#" onclick="location.reload();return false;">Refresh gallery</a>');
+        } else if (s.state === 'error') {
+          clearInterval(gPoll); gPoll = null;
+          el.text(`Import failed: ${s.error}`);
+        }
+      }, 2000);
+    }
+
+    // Reload when the set of photos being processed changes (a photo arrived, e.g. from a Google import,
+    // or finished and became a scene), unless a dialog is open.
+    const pendingShown = $('.scene-item.pending').map(function () { return decodeURIComponent($(this).data('file')); }).get().sort().join('|');
+    setInterval(async () => {
+      if ($('#gModal').is(':visible')) return;
+      try {
+        const now = (await (await fetch('/pending')).json()).map((p) => p.file).sort().join('|');
+        if (now !== pendingShown) location.reload();
+      } catch (e) {}
+    }, 4000);
+
     $(document).ready(function () {
+      $('#google_import').on('click', gOpen);
+      $('#gModal').on('click', '#gClose', gClose).on('click', '#gStart', gStart)
+        .on('click', function (e) { if (e.target === this) gClose(); });
       applyOpts();
       renderPerfLinks();
       $('#perfScene').on('input', renderPerfLinks);
       $('#lodSeg').on('click', 'button', function () { setOpts({ lod: $(this).data('lod') }); });
       $('#optXrscale').on('input', function () { setOpts({ xrscale: parseFloat(this.value) }); });
+      $('#xrscaleAuto').on('click', function () { setOpts({ xrscale: 'auto' }); });
       $('#optFoveation').on('input', function () { setOpts({ foveation: parseFloat(this.value) }); });
       $('#optXrstddev').on('input', function () { setOpts({ xrstddev: parseFloat(this.value) }); });
       $('#optXrmaxpx').on('input', function () { setOpts({ xrmaxpx: parseFloat(this.value) }); });

@@ -4,6 +4,8 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 const app = express();
+// Password protection with --pw (asks for the ZIP password at start; visitors log in): see basic_auth.js.
+app.use(require('./basic_auth')());
 const PORT = 3000;
 const imgdir = 'images';
 

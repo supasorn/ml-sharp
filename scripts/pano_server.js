@@ -1,5 +1,6 @@
 // Standalone server for the 360 panorama viewer (separate from web.js).
-//   node scripts/pano_server.js   ->  http://<host>:3100/  (https on 3543 if certs/ exist; WebXR needs it)
+//   node scripts/pano_server.js [--pw]   ->  http://<host>:3100/  (https on 3543 if certs/ exist; WebXR needs it;
+//   --pw: visitors must log in, see basic_auth.js)
 // Lists the scenes under pano/<dir>/: splats (<name>.spz, scripts/pano_spz.py) and multi-sphere images
 // (<name>_msi.glb / <name>_msi_ktx2.glb, scripts/pano_msi.py).
 const express = require('express');
@@ -9,6 +10,8 @@ const path = require('path');
 const root = path.join(__dirname, '..');
 const panoDir = path.join(root, 'pano');
 const app = express();
+// Password protection with --pw (asks for the ZIP password at start; visitors log in): see basic_auth.js.
+app.use(require(path.join(root, 'basic_auth'))());
 
 app.get('/', (req, res) => res.sendFile(path.join(root, 'web', 'pano.html')));
 

@@ -14,6 +14,11 @@ Mirrors the perspective sparse MPI (eval_alpha_patches.py MPI mode, docs/quest-x
 - Export: <name>_msi.glb with the viewer's layer layout (one mesh per atlas page, surface_<k>, larger k
   drawn first) and <name>_msi_ktx2.glb (scripts/glb_ktx2.py, UASTC + 3 mips).
 
+Culling (--cull 0.05): cells that contribute less than this (alpha x transmittance in front) to every
+pixel from every eye position within +-0.3 m (centre, the 6 axis ends, 8 corners of a +-0.2 m box) are
+dropped, like the perspective MPI's CULL (docs/quest-xr-findings.md §4b.12). --ktx2-rdo passes a UASTC
+rate-distortion lambda to glb_ktx2.py (smaller download, same GPU memory).
+
 Eval (--eval): ray-sphere compositing of the bins (bin-centre radii, export resolution) vs gsplat
 renders of the splats, from the centre and moved 0.1 / 0.3 m.
 
@@ -169,6 +174,50 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     return apply_dominant
 
 
+CULL_EYES = ([(0, 0, 0)] + [tuple(0.3 * s * np.eye(3)[a]) for a in range(3) for s in (-1, 1)]
+             + [(x, y, z) for x in (-0.2, 0.2) for y in (-0.2, 0.2) for z in (-0.2, 0.2)])
+
+
+@torch.no_grad()
+def cell_contrib(alphas, centres, nc, dev, res=256, eyes=CULL_EYES):
+    """Largest contribution (alpha x transmittance of nearer spheres) of each cell over `eyes`.
+
+    alphas: {bin: (2, 6, R, R) uint8 coarse alpha of that sphere's cube map, [0] max-pooled, [1]
+    min-pooled}. Each eye shoots a cube of rays (res^2 per face), intersects them with every sphere
+    (bin-centre radius) near to far and keeps, per (bin, face, cell), the max of alpha x T. Both estimates
+    err towards keeping cells: a cell's own alpha is the block maximum, the occlusion it causes for the
+    spheres behind uses the block minimum (max-pooled occluders dropped visible slices of the ground).
+    Returns (B, 6, nc, nc) float.
+    """
+    B = len(centres)
+    best = torch.zeros(B, 6 * nc * nc, device=dev)
+    c = (torch.arange(res, device=dev) + 0.5) / res * 2 - 1
+    yy, xx = torch.meshgrid(c, c, indexing="ij")
+    cam = torch.stack([xx, yy, torch.ones_like(xx)], -1).reshape(-1, 3)
+    rots = [look_rotation(np.array(d, float)) for d in FACE_DIRS]
+    dirs = torch.cat([cam @ torch.tensor(R, device=dev, dtype=torch.float32).T for R in rots])
+    dirs = dirs / dirs.norm(dim=-1, keepdim=True)
+    order = sorted(alphas, reverse=True)                     # near first (bin B-1 = nearest)
+    for e in eyes:
+        eye = torch.tensor(e, device=dev, dtype=torch.float32)
+        de, ee = dirs @ eye, eye @ eye
+        T = torch.ones(len(dirs), device=dev)
+        for k in order:
+            rk = 1 / centres[k]
+            p = eye + (-de + torch.sqrt(de ** 2 - ee + rk ** 2))[:, None] * dirs
+            fi, fx, fy = cube_lookup(p / p.norm(dim=-1, keepdim=True))
+            a_map = alphas[k]
+            R_ = a_map.shape[-1]
+            ix = ((fx + 1) / 2 * R_).long().clamp(0, R_ - 1)
+            iy = ((fy + 1) / 2 * R_).long().clamp(0, R_ - 1)
+            a_own = a_map[0, fi, iy, ix].float() / 255
+            a_occ = a_map[1, fi, iy, ix].float() / 255
+            cidx = fi * nc * nc + (iy * nc // R_) * nc + (ix * nc // R_)
+            best[k].scatter_reduce_(0, cidx, a_own * T, reduce="amax")
+            T = T * (1 - a_occ)
+    return best.reshape(B, 6, nc, nc)
+
+
 def run(args):
     dev = torch.device("cuda")
     gs = load_gsplat()
@@ -213,6 +262,7 @@ def run(args):
     cells = []        # (bin, face, cy, cx)
     half_tex, full_tex, errs, wsum, rmean = [], {}, [], [], []
     eval_faces = {} if args.eval else None
+    cull_alpha = {}
     for k in range(B):                    # far first (bin 0 = lowest disparity)
         if not (b == k).any():
             continue
@@ -225,6 +275,11 @@ def run(args):
         inner = rgba[:, gb:gb + Fr, gb:gb + Fr]
         a_in = inner[..., 3].reshape(6, nc, cell, nc, cell)
         alive = (a_in >= 0.5 / 255).any(4).any(2)                                 # (6, nc, nc)
+        if args.cull > 0:                                     # coarse alpha, max and min (4 samples per cell side)
+            a_c = inner[..., 3][:, None]
+            pk = Fr // (nc * 4)
+            cull_alpha[k] = (torch.stack([F.max_pool2d(a_c, pk)[:, 0], -F.max_pool2d(-a_c, pk)[:, 0]]) * 255
+                             ).round().to(torch.uint8)
         a_cell = a_in.sum((2, 4))
         dw = (dist[:, gb:gb + Fr, gb:gb + Fr] * inner[..., 3]).reshape(6, nc, cell, nc, cell).sum((2, 4))
         if eval_faces is not None:
@@ -260,11 +315,18 @@ def run(args):
     N = len(cells)
     print(f"  {N} cells ({N / B:.0f}/bin), {len(full_tex)} full-res candidates, {time.time() - t0:.0f}s", flush=True)
 
-    # Adaptive resolution within the page budget.
+    keep = np.ones(N, bool)
+    if args.cull > 0:
+        contrib = cell_contrib(cull_alpha, centres, nc, dev)
+        keep = (contrib[tuple(torch.tensor(cells.T, device=dev).long())] >= args.cull).cpu().numpy()
+        del cull_alpha
+        print(f"  cull {args.cull}: keeping {keep.sum()} of {N} cells ({1 - keep.mean():.1%} dropped)", flush=True)
+
+    # Adaptive resolution within the page budget (kept cells only).
     hs, fs = half_tex.shape[1], (args.tile * SS + 2 * gb)
-    budget = 0.95 * args.maxpages * PAGE * PAGE - N * hs * hs
+    budget = 0.95 * args.maxpages * PAGE * PAGE - keep.sum() * hs * hs
     extra = fs * fs - hs * hs
-    cand = [i for i in np.argsort(-errs) if i in full_tex][:max(0, int(budget // extra))]
+    cand = [i for i in np.argsort(-errs) if i in full_tex and keep[i]][:max(0, int(budget // extra))]
     full = np.zeros(N, bool)
     full[cand] = True
     print(f"  {full.sum()} cells at full resolution", flush=True)
@@ -299,6 +361,12 @@ def run(args):
     dirs = np.einsum("nij,nkj->nki", R, cam)
     dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
     verts = dirs * corner_r[..., None]
+
+    # Drop culled cells (corners above were refined with all cells, so kept ones match their neighbours).
+    idx = np.nonzero(keep)[0]
+    cells, verts, full, half_tex = cells[idx], verts[idx], full[idx], half_tex[idx]
+    full_tex = {new: full_tex[old] for new, old in enumerate(idx) if old in full_tex}
+    N = len(idx)
 
     # Atlas: 24-texel slot grid; full cells take 2x2 slots from the top, half cells single slots from
     # the bottom. Pages hold consecutive runs of the far-to-near order (cells are already far first).
@@ -363,7 +431,8 @@ def run(args):
     print(f"  wrote {out_glb}: {json.dumps(info)}", flush=True)
     if not args.no_ktx2:
         subprocess.run([sys.executable, str(Path(__file__).parent / "glb_ktx2.py"), str(out_glb),
-                        str(out_glb.with_name(out_glb.stem + "_ktx2.glb"))], check=True)
+                        str(out_glb.with_name(out_glb.stem + "_ktx2.glb"))]
+                       + (["--rdo", str(args.ktx2_rdo)] if args.ktx2_rdo > 0 else []), check=True)
 
     if eval_faces is not None:
         info["eval"] = evaluate(gs, sp_all, eval_faces, centres, args)
@@ -453,6 +522,9 @@ def main():
     p.add_argument("--edge-darken", action="store_true",
                    help="Photo detail: keep darkening corrections at depth edges (mask only brightening).")
     p.add_argument("--no-refine", dest="refine", action="store_false")
+    p.add_argument("--cull", type=float, default=0.0,
+                   help="Drop cells contributing less than this from every eye within +-0.3 m (0 = off).")
+    p.add_argument("--ktx2-rdo", type=float, default=0.0, help="UASTC RDO lambda for the KTX2 file (0 = off).")
     p.add_argument("--no-ktx2", action="store_true")
     p.add_argument("--eval", action="store_true")
     p.add_argument("--eval-images", action="store_true")

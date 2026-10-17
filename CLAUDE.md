@@ -16,10 +16,14 @@ Quick facts:
   the hybrid-bake watcher (`sharp bake-hybrid -i output2 --watch`).
 - Bake hybrids: `sharp bake-hybrid -i output2` (outputs next to each scene);
   how-to with options and troubleshooting: `docs/hybrid-baking.md`.
-- Hybrid-MPI (`?lod=mpi`, gallery "Hybrid-MPI"): hybrid mesh + the remaining
-  splats as a sparse multi-plane image; bake all scenes with
-  `python scripts/bake_mpi.py` (not automatic for new scenes). Design, numbers
-  and pitfalls (premultiplied textures must not be sRGB): findings doc §4b, §7.
+- Default view is **MPI-only** (`?lod=mpionly`): all splats as a sparse
+  multi-plane image with compressed (KTX2/UASTC) textures — fastest and best
+  quality on the Quest 3. Hybrid-MPI (`?lod=mpi`) = hybrid mesh + MPI of the
+  remaining splats. Bake with `python scripts/bake_mpi.py` (Hybrid-MPI) and
+  `--mpionly`; both also write `_ktx2.glb` (needs KTX-Software in
+  `~/.local/opt/ktx-4.4.2`). Not automatic for new scenes. Design, headset
+  numbers and pitfalls (premultiplied textures must not be sRGB): findings doc
+  §4b, §7. Benchmark: `?bench=views&hz=120` (`web/js/xrBench.js`).
 - Quest 3 splat rendering is GPU-bound by per-splat vertex work; the viewer
   draws splats non-instanced as triangles (`web/js/splatFlat.js`). Measure
   speed with a self-running headset benchmark (`web/js/xrBench.js`) and the

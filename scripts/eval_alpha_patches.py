@@ -15,7 +15,7 @@ reported: exact per-pixel depth order.
 
 Usage: python scripts/eval_alpha_patches.py <scene>.ply [...]
   env: SUFFIX (hybrid bake), TILE, PX, MOVE, FITFLAT (default 1), EXPORT (=_patches writes
-  <scene>_patches.glb), EXPORT_DIR, TEXDS, TEXFULL_THR, MAXPAGES, BINS, MPI, BINMODE, REFINE, CULL, EXTEND, EVAL, DEBUG0, FLAT
+  <scene>_patches.glb), EXPORT_DIR, TEXDS, TEXFULL_THR, MAXPAGES, BINS, MPI, BINMODE, REFINE, CULL, OCC, OCC_BLK, OCC_EPS, NOMESH, SPLIT, EXTEND, EVAL, DEBUG0, FLAT
 """
 import json
 import os
@@ -51,7 +51,12 @@ BINS = int(os.environ.get("BINS", 0))
 MPI = bool(os.environ.get("MPI"))
 BINMODE = os.environ.get("BINMODE", "uniform")   # MPI bins: uniform in disparity, or kmeans (where the content is)
 REFINE = bool(os.environ.get("REFINE"))
-CULL = float(os.environ.get("CULL", 0))          # drop cells contributing less than this from every viewpoint          # MPI: per-cell depth (shared corners) instead of the bin's centre
+CULL = float(os.environ.get("CULL", 0))
+OCC = bool(os.environ.get("OCC"))
+NOMESH = bool(os.environ.get("NOMESH"))          # MPI-only: all splats of the original .ply, no hybrid mesh
+SPLIT = [int(x) for x in os.environ.get("SPLIT", "").split(",") if x]   # opaque-block split stats, block sizes (px)                # MPI: depth-only occluder quads for fully opaque blocks
+OCC_BLK = int(os.environ.get("OCC_BLK", 8))      # occluder block size (render px; multiple of TEXDS)
+OCC_EPS = float(os.environ.get("OCC_EPS", 0.002))  # occluders sit this fraction farther than their cell          # drop cells contributing less than this from every viewpoint          # MPI: per-cell depth (shared corners) instead of the bin's centre
 EXTEND = int(os.environ.get("EXTEND", 0))
 BG = float(os.environ.get("BG", 0))           # eval: background grey level shown through gaps (viewer: page/passthrough)     # MPI: px each layer is continued underneath opaque content in front             # with BINS: sparse MPI (one joint render per bin, cut into cells)         # >0: patches on this many global depth bins instead of per-tile fits       # export texture downsampling      # fronto-parallel patches only (no tilted planes)
 MARGIN = s1.MARGIN
@@ -158,14 +163,17 @@ def run(scene: Path):
     W, H, f = GW * SS, Hg * SS, fg * SS
     Wc, Hc = W + 2 * MARGIN, H + 2 * MARGIN
     full = splat_tensors(PlyData.read(scene)["vertex"].data, dev)
-    kv = PlyData.read(scene.with_name(scene.stem + SUFFIX + ".ply"))["vertex"].data
+    kv = PlyData.read(scene if NOMESH else scene.with_name(scene.stem + SUFFIX + ".ply"))["vertex"].data
     z = np.asarray(kv["z"], np.float64)
     ok = z > 0.05
     kv = kv[ok]; z = z[ok]
     kept = splat_tensors(kv, dev)
     u, w = fg * kv["x"] / z + GW / 2, fg * kv["y"] / z + Hg / 2
-    mesh = trimesh.load(scene.with_name(scene.stem + SUFFIX + ".glb")).to_geometry()
-    Tm = torch.tensor(mesh.vertices, device=dev, dtype=torch.float32)[torch.tensor(mesh.faces, device=dev)]
+    if NOMESH:                                  # MPI-only: no hybrid mesh (one triangle behind the camera, never hit)
+        Tm = torch.tensor([[[0.0, 0.0, -10.0], [1.0, 0.0, -10.0], [0.0, 1.0, -10.0]]], device=dev)
+    else:
+        mesh = trimesh.load(scene.with_name(scene.stem + SUFFIX + ".glb")).to_geometry()
+        Tm = torch.tensor(mesh.vertices, device=dev, dtype=torch.float32)[torch.tensor(mesh.faces, device=dev)]
     rgbM, aM = raster([full], (0.0, 0.0, 0.0), W, H, f)
     M = s1.TriMesh(Tm, torch.cat([rgbM, aM[..., None]], -1), W, H, 0, f, W, H)
     Kc = ev.K_of(W, H, f); Kc[0, 0, 2] += MARGIN; Kc[0, 1, 2] += MARGIN
@@ -370,8 +378,8 @@ def run(scene: Path):
     else:
         geomN, geomC, geom_inside, to_cell = nP, corners, inside, (lambda prim: prim)
 
-    def patch_samples(eye):
-        V, PIX, T, PR = [], [], [], []
+    def patch_samples(eye, with_local=False):
+        V, PIX, T, PR, LX, LY = [], [], [], [], [], []
         for prim, pix, p, ui, vi, t in cast(geomN, geomC, geom_inside, eye, W, H, f):
             prim = to_cell(prim)
             lx = (ui + MARGIN - 0.5 - rx0[prim]).clamp(0, None)
@@ -385,6 +393,10 @@ def run(scene: Path):
             c = (g(y0, x0) * (1 - fx) + g(y0, x1) * fx) * (1 - fy) + (g(y1, x0) * (1 - fx) + g(y1, x1) * fx) * fy
             k = (c[:, 3] > 1 / 255) & alive[prim]
             V.append(c[k]); PIX.append(pix[k]); T.append(t[k]); PR.append(prim[k])
+            if with_local:
+                LX.append(lx[k]); LY.append(ly[k])
+        if with_local:
+            return torch.cat(V), torch.cat(PIX), torch.cat(T), torch.cat(PR), torch.cat(LX), torch.cat(LY)
         return torch.cat(V), torch.cat(PIX), torch.cat(T), torch.cat(PR)
 
 
@@ -418,6 +430,47 @@ def run(scene: Path):
         print(f"  culling: {int((~alive).sum())} of {P} cells ({(~alive).float().mean().item():.0%}, "
               f"{fill[~alive.cpu().numpy()].sum() / fill.sum():.0%} of cell area) never contribute >= {CULL} "
               f"from {len(eyes_c)} viewpoints within +-{MOVE} m -> dropped", flush=True)
+
+    # Occluders (MPI, OCC=1): fully opaque OCC_BLK-px blocks of the kept cells (every texel alpha > 0.99 at render
+    # resolution, so also after box downsampling), as depth-only quads drawn with the opaque mesh. They sit
+    # flat at the cell's farthest corner pushed OCC_EPS farther, so they never hide their own layer, only layers
+    # behind; fragments there then fail the depth test before shading. A cell opaque in all blocks gets one quad.
+    occ_rects = np.zeros((0, 4), np.int64); occ_disp = np.zeros(0)
+    if MPI and OCC:
+        cellpx = rects[0, 2] - rects[0, 0]
+        nb = cellpx // OCC_BLK
+        al = atlas[:, 3].reshape(P, nb, OCC_BLK, nb, OCC_BLK).float().amin((2, 4)) > 0.99      # (P, nb, nb)
+        al &= alive[:, None, None]
+        full_c = al.all(2).all(1)
+        far = (cdisp.min(1) * (1 - OCC_EPS))
+        ci_, by_, bx_ = (x.cpu().numpy() for x in torch.nonzero(al & ~full_c[:, None, None], as_tuple=True))
+        fc = torch.nonzero(full_c)[:, 0].cpu().numpy()
+        r0 = rects[ci_]
+        occ_rects = np.concatenate([rects[fc], np.stack([r0[:, 0] + bx_ * OCC_BLK, r0[:, 1] + by_ * OCC_BLK,
+                                                         r0[:, 0] + (bx_ + 1) * OCC_BLK, r0[:, 1] + (by_ + 1) * OCC_BLK], 1)])
+        occ_disp = np.concatenate([far[fc], far[ci_]])
+        print(f"  occluders: {len(occ_rects)} quads ({len(fc)} whole cells + {len(ci_)} blocks), covering "
+              f"{((occ_rects[:, 2] - occ_rects[:, 0]) * (occ_rects[:, 3] - occ_rects[:, 1])).sum() / (W * H):.2f}x "
+              f"the frame", flush=True)
+
+    def occluder_depth(eye):
+        """Per-pixel depth (along the eye ray, inf = none) of the nearest occluder quad."""
+        dep = torch.full((W * H,), float("inf"), device=dev)
+        if not len(occ_rects):
+            return dep
+        Ro = torch.tensor(occ_rects, device=dev, dtype=torch.float32)
+        do = torch.tensor(occ_disp, device=dev, dtype=torch.float32).clamp(min=float(dmin))
+        n_o = torch.stack([torch.zeros_like(do), torch.zeros_like(do), do], 1)   # flat: n.p = 1 <=> z = 1/d
+        ou = (torch.stack([Ro[:, 0], Ro[:, 2], Ro[:, 0], Ro[:, 2]], 1) - MARGIN) / SS
+        ov = (torch.stack([Ro[:, 1], Ro[:, 1], Ro[:, 3], Ro[:, 3]], 1) - MARGIN) / SS
+        oc = torch.stack([(ou - GW / 2) / fg, (ov - Hg / 2) / fg, torch.ones_like(ou)], -1) / do[:, None, None]
+
+        def o_inside(prim, ui, vi):
+            lx, ly = ui + MARGIN - Ro[prim, 0], vi + MARGIN - Ro[prim, 1]
+            return (lx >= 0) & (lx < Ro[prim, 2] - Ro[prim, 0]) & (ly >= 0) & (ly < Ro[prim, 3] - Ro[prim, 1])
+        for prim, pix, p, ui, vi, t in cast(n_o, oc, o_inside, eye, W, H, f):
+            dep.scatter_reduce_(0, pix, t, "amin")
+        return dep
 
     if os.environ.get("DEBUG0"):
         Rk, _ = raster([kept], (0.0, 0.0, 0.0), W, H, f)
@@ -466,16 +519,55 @@ def run(scene: Path):
         eyes |= {f"x+{mv}": (mv, 0, 0), f"x-{mv}": (-mv, 0, 0), f"y+{mv/2}": (0, mv / 2, 0),
                  f"z+{0.4*mv:.2f}": (0, 0, 0.4 * mv)}
     res = {}
+    print(f"  size: {int(alive.sum())} cells kept -> {2 * int(alive.sum())} layer triangles"
+          f"{'' if NOMESH else f' + {len(M.T)} mesh triangles'}", flush=True)
+    # Opaque-block split (stats only): blocks of SPLIT render px whose texels all have alpha > 0.99 (render res),
+    # drawn as opaque quads with depth write, front to back; their texels leave the transparent layers.
+    split_masks = {}
+    if MPI and SPLIT:
+        cellpx = rects[0, 2] - rects[0, 0]
+        for blk in SPLIT:
+            nbk = cellpx // blk
+            m_ = atlas[:, 3].reshape(P, nbk, blk, nbk, blk).float().amin((2, 4)) > 0.99
+            split_masks[blk] = m_ & alive[:, None, None]
     for name, eye in eyes.items():
         R, _ = raster([full], eye, W, H, f)
-        ms = M.samples(eye, W, H, f, opaque=True)
-        Hy, _ = raster([kept, ms], eye, W, H, f)
+        if NOMESH:
+            Hy, ms = R, None
+        else:
+            ms = M.samples(eye, W, H, f, opaque=True)
+            Hy, _ = raster([kept, ms], eye, W, H, f)
         mrgb, mdep = s2.mesh_layer(M, eye, W, H, f)
         if BG:                                  # background behind everything (the viewer's canvas is transparent)
             mrgb = torch.where(torch.isinf(mdep)[:, None], torch.full_like(mrgb, BG), mrgb)
-        vals, pix, t, prim = patch_samples(eye)
+        vals, pix, t, prim, lxs, lys = patch_samples(eye, with_local=True)
         k = t < mdep[pix]
-        vals, pix, t, prim = vals[k], pix[k], t[k], prim[k]
+        vals, pix, t, prim, lxs, lys = vals[k], pix[k], t[k], prim[k], lxs[k], lys[k]
+        n_mesh = len(t)
+        res_split = {}
+        for blk, msk in split_masks.items():
+            bx = (lxs.round().long() // blk).clamp(0, msk.shape[2] - 1)
+            by = (lys.round().long() // blk).clamp(0, msk.shape[1] - 1)
+            is_o = msk[prim, by, bx]
+            dep_o = torch.full((W * H,), float("inf"), device=dev).scatter_reduce_(0, pix[is_o], t[is_o], "amin")
+            front = dep_o[pix]
+            keep_t = ~is_o & (t < front)                      # transparent fragments still drawn
+            keep_o = is_o & (t <= front)                      # the nearest opaque block per pixel (front to back)
+            n_t, n_o = int(keep_t.sum()), int(torch.isfinite(dep_o).sum())
+            vv = vals.clone(); vv[is_o, :3] = vv[is_o, :3] / vv[is_o, 3:].clamp(min=1e-3); vv[is_o, 3] = 1.0
+            ks = keep_t | keep_o
+            img_s = composite_vals(vv[ks], pix[ks], t[ks], mrgb, W * H).reshape(H, W, 3)
+            res_split[blk] = psnr(R, img_s)
+            print(f"  {name:8s} split {blk}px: layer fragments/px {n_mesh / (W * H):.2f} -> transparent "
+                  f"{n_t / (W * H):.2f} + opaque {n_o / (W * H):.2f} = {(n_t + n_o) / (W * H):.2f} "
+                  f"({1 - (n_t + n_o) / max(n_mesh, 1):.0%} fewer); PSNR {res_split[blk]:.2f}", flush=True)
+        if not SPLIT:
+            print(f"  {name:8s} layer fragments/px: {n_mesh / (W * H):.2f}", flush=True)
+        if OCC and len(occ_rects):                # depth pre-pass: drop fragments behind an occluder
+            k = t <= occluder_depth(eye)[pix]
+            vals, pix, t, prim = vals[k], pix[k], t[k], prim[k]
+            print(f"  {name:8s} layer fragments/px: {n_mesh / (W * H):.2f} after mesh test -> "
+                  f"{len(t) / (W * H):.2f} after occluders ({1 - len(t) / max(n_mesh, 1):.0%} fewer)", flush=True)
         ex = composite_vals(vals, pix, t, mrgb, W * H).reshape(H, W, 3)
         dist = (centre - torch.tensor(eye, device=dev)).norm(dim=1)
         rank = torch.empty(P, device=dev); rank[torch.argsort(dist)] = torch.arange(P, device=dev, dtype=torch.float32)
@@ -486,10 +578,10 @@ def run(scene: Path):
             OUT.mkdir(parents=True, exist_ok=True)
             row = torch.cat([R, Hy, so], 1).clamp(0, 1)
             Image.fromarray((row.cpu().numpy() * 255).astype(np.uint8)).resize((3 * GW, Hg)).save(
-                OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_c{CULL}_e{EXTEND}_bg{BG}_{name}.jpg", quality=92)
+                OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_c{CULL}{"_occ" if OCC else ""}{"_nomesh" if NOMESH else ""}_e{EXTEND}_bg{BG}_{name}.jpg", quality=92)
         del vals, pix, t, prim, ms
         torch.cuda.empty_cache()
-    (OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_c{CULL}.json").write_text(json.dumps(
+    (OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_c{CULL}{"_occ" if OCC else ""}{"_nomesh" if NOMESH else ""}.json").write_text(json.dumps(
         {"patches": P, "overdraw": float(area.sum() / (W * H)), "psnr": res}, indent=1))
 
 
@@ -531,7 +623,9 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
                 d = (up - t1.permute(0, 3, 1, 2))[:, :3, gb:cb - gb, gb:cb - gb].abs().mean((1, 2, 3))
                 err[c0:c0 + 8192] = d
             err = err.cpu().numpy()
-            budget = 0.75 * MAXPAGES * page * page - len(rects) * (cb // ds) ** 2
+            live = np.ones(len(rects), bool) if alive is None else alive.astype(bool)
+            err[~live] = -1                                          # culled cells: never upgraded, not budgeted
+            budget = 0.75 * MAXPAGES * page * page - live.sum() * (cb // ds) ** 2
             extra = cb * cb - (cb // ds) ** 2
             cand = np.argsort(-err)
             cand = cand[err[cand] > TEXFULL_THR][:max(0, int(budget // extra))]

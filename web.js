@@ -32,7 +32,8 @@ function sortedSceneNames(dir) {
 const PERF_LOG = path.join(__dirname, 'logs', 'xr_perf.jsonl');
 app.post('/fps', express.json(), (req, res) => {
   console.log('[xr fps]', JSON.stringify(req.body));
-  const entry = { time: new Date().toISOString(), ...req.body };
+  // The browser's user agent identifies the device (Quest / phone / desktop) beyond the client's own guess.
+  const entry = { time: new Date().toISOString(), ...req.body, ua: (req.headers['user-agent'] || '').slice(0, 200) };
   fs.mkdir(path.dirname(PERF_LOG), { recursive: true }, () => {
     fs.appendFile(PERF_LOG, JSON.stringify(entry) + '\n', (err) => {
       if (err) console.error('Could not write', PERF_LOG, err.message);
@@ -69,6 +70,7 @@ function sceneModes(dir, name) {
   const modes = ['full'];
   if (has('_hybrid.glb') && has('_hybrid.ply')) modes.push('hybrid');
   if (has('_mpi.glb')) modes.push('mpi');
+  if (has('_mpionly.glb')) modes.push('mpionly');
   return modes;
 }
 app.get('/scene-modes', (req, res) => {
@@ -212,7 +214,7 @@ app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
   // Delete all files in output2/ with the same base name, plus files derived
   // from it (bake-hybrid / bake-layers / quest-lod outputs and previews).
   // Exact suffixes, so deleting "foo" never touches "foo_2".
-  const derived = ['_hybrid.glb', '_hybrid.ply', '_surfaces.glb', '_patches.glb', '_mpi.glb', '_surfaces_mesh.glb', '_patches_mesh.glb', '_mpi_mesh.glb', '_layers.glb', '_quest.ply',
+  const derived = ['_hybrid.glb', '_hybrid.ply', '_surfaces.glb', '_patches.glb', '_mpi.glb', '_mpionly.glb', '_mpi_ktx2.glb', '_mpionly_ktx2.glb', '_surfaces_mesh.glb', '_patches_mesh.glb', '_mpi_mesh.glb', '_layers.glb', '_quest.ply',
                    '_hybrid_vs_splats.jpg', '_hybrid_coverage.jpg', '_layers_vs_splats.jpg']
     .map(suffix => scene + suffix);
   const files = fs.readdirSync(outputDir);

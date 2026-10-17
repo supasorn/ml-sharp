@@ -331,6 +331,7 @@
         <button type="button" data-lod="full">Original splats</button>
         <button type="button" data-lod="hybrid">Hybrid</button>
         <button type="button" data-lod="mpi" title="Hybrid mesh + the remaining splats as a sparse multi-plane image (scripts/bake_mpi.py); falls back to the original splats when not baked">Hybrid-MPI</button>
+        <button type="button" data-lod="mpionly" title="All splats as a sparse multi-plane image, no mesh (scripts/bake_mpi.py --mpionly)">MPI-only</button>
       </div>
     </div>
     <div class="opt-group" title="Eye-buffer resolution in AR/VR (1 = full)">
@@ -433,7 +434,7 @@
     // --- View options: applied to every scene link ---
     // Viewer defaults (web/index.html). Presets set every XR option (not the view).
     const XR_DEFAULTS = { xrscale: 0.8, foveation: 1, xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: false };
-    const DEFAULT_OPTS = { lod: 'full', ...XR_DEFAULTS };
+    const DEFAULT_OPTS = { lod: 'mpionly', ...XR_DEFAULTS };
     const FULL_QUALITY = { ...XR_DEFAULTS, xrscale: 1, foveation: 0, xrstddev: 2.83 };
     const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96, adaptive: true };
     let opts = { ...DEFAULT_OPTS };
@@ -490,6 +491,14 @@
     // Tests currently needed (the panel hides when there are none). A benchmark
     // link runs all its variants in one XR session and exits by itself.
     const PERF_TESTS = [
+      // Self-running: Original splats, Hybrid, Hybrid-MPI (+ compressed), MPI-only (+ compressed) for
+      // 20260914_113455_56657 and 20200927_161631, ~4 min; hold still facing the scene. Ends the session itself.
+      { label: 'Bench: view modes + compressed textures (2 scenes, ~4 min)', lod: 'full', xrscale: 1,
+        test: 'bench-views', bench: 'views' },
+      // Same at 120 Hz (if granted) with the largest scene added, ~6 min.
+      { label: 'Bench: view modes + compressed, 120 Hz (3 scenes, ~6 min)', lod: 'full', xrscale: 1,
+        test: 'bench-views-120', bench: 'views', hz: 120,
+        benchscenes: '20260914_113455_56657,20200927_161631,20250101_140017' },
     ];
     function renderPerfLinks() {
       $('#perfTests').toggle(PERF_TESTS.length > 0);
@@ -500,7 +509,8 @@
                                              xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: 0, test: t.test });
         if (t.variant) params.set('variant', t.variant);
         if (t.bench) params.set('bench', t.bench);
-        if (t.bench) params.set('bench', t.bench);
+        if (t.hz) params.set('hz', t.hz);
+        if (t.benchscenes) params.set('benchscenes', t.benchscenes);
         $('<a>').attr('href', '/?' + params.toString()).text(t.label).appendTo($links);
       }
     }

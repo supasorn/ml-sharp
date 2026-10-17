@@ -19,7 +19,7 @@ original: 1.18M). Quality test scene: `20251023_155037` (palm trees, people).
 | Whole stack | `scripts/start_server.sh` | Web server + prediction watcher (GPU 0) + `bake-hybrid --watch` (GPU 1); photos dropped on the gallery become hybrids automatically. Logs in `logs/`. |
 | Server | `node web.js` | HTTP 3000, HTTPS 3443 (WebXR needs HTTPS; cert/key in `certs/`, git-ignored). `/` → gallery `/list`; `/scenes` JSON; `/fps` logs XR reports to `logs/xr_perf.jsonl` (git-ignored); `/delete` removes a scene and its derived files. |
 | Hybrid-MPI bake | `python scripts/bake_mpi.py` (all scenes, one per GPU; `--reexport`, `--overwrite`) | Per scene: `bake-hybrid --keep-move 0.3 --max-depth-ratio 0.05` into `renderings/mpi_work/`, then the remaining splats as a sparse MPI (`scripts/eval_alpha_patches.py` MPI mode). Writes `<scene>_mpi_mesh.glb` + `<scene>_mpi.glb` to `output2/`. ~50 s/scene/GPU. See §4b. Not run automatically for new scenes. |
-| Viewer | `web/index.html` | Spark 0.1.10 + three.js r178. `?lod=full|hybrid|mpi|layers|quest` (`patches`, `surfaces`: experimental). |
+| Viewer | `web/index.html` | Spark 0.1.10 + three.js r178. `?lod=mpionly` (default)`|mpi|hybrid|full|layers|quest` (`patches`, `surfaces`: experimental); compressed layer textures by default (`?tex=png` off); `?hz=120` asks for 120 Hz; secondary thumbstick flick cycles modes in XR. FPS reports carry device info (`device`, `xrMode`, `refreshHz`, `fb`, `ua`). |
 | XR controls | `web/js/XRSceneController.js` | Ported from `/projects/img3dviewer`'s `XRMeshController`. Secondary X opens the in-XR gallery (`web/js/XRGallery.js`: thumbnails from `/thumb/<scene>`, view-mode buttons, scenes without the mode greyed out via `/scene-modes`). |
 | Splat drawing | `web/js/splatFlat.js` | Non-instanced, one triangle per splat (default). See §3. |
 | Benchmarks | `web/js/xrBench.js` | Self-running in-headset benchmarks (`?bench=<name>`). |
@@ -227,13 +227,43 @@ hybrid 32.5 / 26.4):
     depth test already rejected their pixels, so the fill saving is smaller
     than the cell count. (The export emulator shows extra single-pixel holes
     after culling: its triangle edge test cracks the mesh, a GPU's doesn't.)
+13. **Bake-time occluders for a depth pre-pass** (`OCC=1`, off): fully opaque
+    8×8-px blocks of a cell as depth-only quads (behind their own cell by
+    0.2%). Lossless but only 3–7% fewer layer fragments (17–28k quads, 0.35×
+    the frame): pixels get opaque through several stacked semi-transparent
+    layers, rarely one opaque layer (same lesson as the splat opaque-core
+    pre-pass, §5). Not worth an extra pass.
 9. SHARP's own two layers are not a front/back pair (92% of same-index pairs
    lie within 1% depth, each layer alone is porous), so two full-resolution
    projective textured layers fail (17.8 dB at 10 cm alone, 19.7 with the mesh).
 
 Headset (`20200927_161631`, xrscale 1, foveation 0): hybrid 33 fps; per-tile
-patches 46–54 fps (varies with view direction → fill-bound, 71× overdraw); the
-MPI (24× overdraw) has not been benchmarked yet.
+patches 46–54 fps (varies with view direction → fill-bound, 71× overdraw).
+
+**MPI-only** (`?lod=mpionly`, now the default view; `bake_mpi.py --mpionly`):
+the same sparse MPI built from *all* splats, no hybrid mesh. Offline it beats
+Hybrid-MPI by 4–6 dB at 10 cm and even the splat hybrid at every move (the
+hybrid mesh was the largest remaining error), at 2–2.7× the blended layer
+fragments but fewer triangles. **Compressed textures** (`scripts/glb_ktx2.py`:
+Basis UASTC KTX2 + Zstd, `<x>_ktx2.glb`, loaded by default; `?tex=png` for the
+uncompressed files): 4× less GPU texture memory, ~2.4× smaller files, −0.5 dB at
+the input view, ~0 when moving.
+
+Headset benchmark (`?bench=views`, `web/js/xrBench.js`; Quest 3, AR, 120 Hz via
+`&hz=120`, 1680×1760 per eye, fps):
+
+| Mode | 20260914_113455_56657 | 20200927_161631 | 20250101_140017 |
+|---|---|---|---|
+| Original splats | 32.5 | 28.9 | 26.0 |
+| Hybrid | 79.5 | 42.7 | 36.8 |
+| Hybrid-MPI | 119.7 | 76.2 | 57.6 |
+| Hybrid-MPI, compressed | 119.5 | 109.8 | 79.7 |
+| MPI-only | 119.6 | 89.6 | 62.1 |
+| MPI-only, compressed | 119.7 | 119.0 | 94.8 |
+
+Texture reads were a real bottleneck (compression +31–53% on heavy scenes;
+hidden at 90 Hz, where every MPI mode sat at the cap), and MPI-only is faster
+than Hybrid-MPI (no mesh triangles, no uncompressed mesh texture).
 
 ---
 

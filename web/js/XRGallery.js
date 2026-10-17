@@ -235,3 +235,37 @@ export class XRGallery {
     else if (sticksX.every((x) => Math.abs(x) < 0.2)) this._stickMoved = false;
   }
 }
+
+/**
+ * XRToast: a short text label floating in front of the head (e.g. the new view mode), fading out after
+ * `seconds`. Call `show(text)`, and `update()` every frame.
+ */
+export class XRToast {
+  constructor(renderer, scene) {
+    this.renderer = renderer;
+    this.mesh = label(0.34, 0.06, "", { bg: "rgba(20,22,28,0.85)", px: 46 });
+    this.mesh.visible = false;
+    this.mesh.renderOrder = 1004;
+    scene.add(this.mesh);
+    this.until = 0;
+  }
+
+  show(text, seconds = 1.6) {
+    this.mesh.setText(text);
+    const cam = this.renderer.xr.getCamera();
+    const pos = new THREE.Vector3(), quat = new THREE.Quaternion();
+    cam.getWorldPosition(pos); cam.getWorldQuaternion(quat);
+    this.mesh.position.copy(pos).add(new THREE.Vector3(0, -0.12, -0.7).applyQuaternion(quat));
+    this.mesh.quaternion.copy(quat);
+    this.mesh.material.opacity = 1;
+    this.mesh.visible = true;
+    this.until = performance.now() + seconds * 1000;
+  }
+
+  update() {
+    if (!this.mesh.visible) return;
+    const left = (this.until - performance.now()) / 1000;
+    if (left <= 0) { this.mesh.visible = false; return; }
+    this.mesh.material.opacity = Math.min(1, left / 0.4);   // fade out over the last 0.4 s
+  }
+}

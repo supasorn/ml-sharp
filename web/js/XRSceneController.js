@@ -15,6 +15,7 @@
  *
  * SECONDARY CONTROLLER:
  * - Thumbstick Up/Down: Scale the scene.
+ * - Thumbstick Left/Right (flick): Previous/next view mode (if `onCycleLod` is given).
  * - Button A/X (4): Open/close the scene gallery (if `gallery` is given).
  * - Button B/Y (5): Open/close the settings menu.
  *
@@ -57,6 +58,8 @@ export class XRSceneController {
     this.onDeleteScene = options.onDeleteScene || (() => {});
     this.homePush = options.homePush || 0;
     this.gallery = options.gallery || null;
+    this.onCycleLod = options.onCycleLod || null;
+    this._lodStickMoved = false;
 
     this.minScale = 0.05;
     this.maxScale = 20;
@@ -299,6 +302,17 @@ export class XRSceneController {
         this._stickMoved = false;
       }
       return;  // other inputs are blocked while the menu is open
+    }
+
+    // Secondary: thumbstick flick left/right cycles the view mode.
+    if (this.onCycleLod) {
+      const lr = motionLR[sInd];
+      if (Math.abs(lr) > 0.7 && !this._lodStickMoved && Math.abs(lr) > Math.abs(sUD) * 1.5) {
+        this._lodStickMoved = true;
+        this.onCycleLod(lr > 0 ? 1 : -1);
+      } else if (Math.abs(lr) < 0.3) {
+        this._lodStickMoved = false;
+      }
     }
 
     // Secondary: thumbstick scales the scene (around its placement point).

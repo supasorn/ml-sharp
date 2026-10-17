@@ -9,7 +9,11 @@ Per scene <name>.ply (+ .json) in the input folder:
    invisible from every viewpoint in the head range dropped,
    16-px cells, scripts/eval_alpha_patches.py MPI mode) written to
    <input>/<name>_mpi.glb.
-Scenes whose _mpi.glb is newer than their .ply are skipped (--overwrite redoes
+--mpionly instead builds the MPI from all splats of <name>.ply (no hybrid bake,
+no mesh) and writes <input>/<name>_mpionly.glb (viewer ?lod=mpionly).
+After each export, the textures are also compressed (scripts/glb_ktx2.py, Basis UASTC) into
+<name>_mpi_ktx2.glb / <name>_mpionly_ktx2.glb, which the viewer loads by default (--no-ktx2 skips this).
+Scenes whose output is newer than their .ply are skipped (--overwrite redoes
 them, --reexport redoes only step 3, reusing the bake). Scenes run in parallel,
 one per GPU.
 
@@ -39,7 +43,7 @@ def scene_plys(folder: Path, names):
 
 
 def bake(ply: Path, gpu: str, args, log):
-    out = args.input / f"{ply.stem}_mpi.glb"
+    out = args.input / f"{ply.stem}{'_mpionly' if args.mpionly else '_mpi'}.glb"
     if out.exists() and out.stat().st_mtime > ply.stat().st_mtime and not (args.overwrite or args.reexport):
         return "skipped"
     work = args.work
@@ -48,6 +52,12 @@ def bake(ply: Path, gpu: str, args, log):
         link.symlink_to(ply.resolve())
     shutil.copy(ply.with_suffix(".json"), work / f"{ply.stem}.json")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
+    if args.mpionly:
+        env |= MPI_ENV | {"NOMESH": "1", "EXPORT": "_mpionly", "SUFFIX": SUFFIX, "EXPORT_DIR": str(args.input)}
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "eval_alpha_patches.py"), str(link)], check=True,
+                       env=env, stdout=log, stderr=subprocess.STDOUT)
+        compress(out, args, log)
+        return "done"
     cmd = [str(Path(sys.executable).with_name("sharp")), "bake-hybrid", "-i", str(link), "--keep-move", "0.3",
            "--max-depth-ratio", "0.05", "--name-suffix", SUFFIX] + (["--overwrite"] if args.overwrite else [])
     subprocess.run(cmd, check=True, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -55,7 +65,16 @@ def bake(ply: Path, gpu: str, args, log):
     env |= MPI_ENV | {"SUFFIX": SUFFIX, "EXPORT_DIR": str(args.input)}
     subprocess.run([sys.executable, str(ROOT / "scripts" / "eval_alpha_patches.py"), str(link)], check=True,
                    env=env, stdout=log, stderr=subprocess.STDOUT)
+    compress(out, args, log)
     return "done"
+
+
+def compress(glb: Path, args, log):
+    """<x>.glb -> <x>_ktx2.glb (compressed textures), unless --no-ktx2."""
+    if args.no_ktx2:
+        return
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "glb_ktx2.py"), str(glb),
+                    str(glb.with_name(glb.stem + "_ktx2.glb"))], check=True, stdout=log, stderr=subprocess.STDOUT)
 
 
 def main():
@@ -65,6 +84,8 @@ def main():
     ap.add_argument("--gpus", default="0,1,2,3")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--reexport", action="store_true", help="redo only the MPI export (reuse the hybrid bakes)")
+    ap.add_argument("--mpionly", action="store_true", help="MPI from all splats, no hybrid mesh (_mpionly.glb)")
+    ap.add_argument("--no-ktx2", action="store_true", help="don't write the compressed-texture variant")
     ap.add_argument("scenes", nargs="*")
     args = ap.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
@@ -79,7 +100,7 @@ def main():
     def job(ply):
         gpu = gpus.get()
         try:
-            with open(args.work / f"{ply.stem}.log", "w") as log:
+            with open(args.work / f"{ply.stem}{'_mpionly' if args.mpionly else ''}.log", "w") as log:
                 status = bake(ply, gpu, args, log)
         except subprocess.CalledProcessError as e:
             status = f"FAILED ({e.returncode}), see {args.work / (ply.stem + '.log')}"

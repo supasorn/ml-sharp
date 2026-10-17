@@ -128,9 +128,10 @@
     import * as dat from "https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.module.js";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
     import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js';
+    import { KTX2Loader } from 'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/KTX2Loader.js';
   import { SparkRenderer } from "@sparkjsdev/spark";
     import { XRSceneController } from "/js/XRSceneController.js";
-    import { XRGallery } from "/js/XRGallery.js";
+    import { XRGallery, XRToast } from "/js/XRGallery.js";
     import { setupBench } from "/js/xrBench.js";
     import { createFlatSplats } from "/js/splatFlat.js";
     import { ARButton } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/webxr/ARButton.js";
@@ -416,6 +417,22 @@
       flatSplats.set(true);
     }
 
+    // Device info for the FPS log, so reports from the Quest, a phone and a desktop can be told apart.
+    function deviceInfo() {
+      const ua = navigator.userAgent;
+      const device = /OculusBrowser|Quest|Pacific/i.test(ua) ? 'quest'
+                   : /Android|iPhone|iPad|Mobile/i.test(ua) ? 'phone' : 'desktop';
+      const s = renderer.xr.getSession();
+      const layer = renderer.xr.getBaseLayer?.();
+      return {
+        device,
+        xrMode: s ? (s.environmentBlendMode === 'opaque' ? 'vr' : 'ar') : null,
+        refreshHz: s?.frameRate ?? null,
+        fb: (layer?.framebufferWidth ?? layer?.textureWidth)
+          ? `${layer.framebufferWidth ?? layer.textureWidth}x${layer.framebufferHeight ?? layer.textureHeight}` : null,
+      };
+    }
+
     // Self-running XR benchmark (?bench=<name>, see web/js/xrBench.js); its
     // phases are logged instead of the periodic FPS reports.
     const benchName = getQueryParam('bench');
@@ -423,8 +440,18 @@
       renderer, flatSplats,
       report: (fields) => fetch('/fps', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...fields, scene: file, lod: lodMode, splats: countSplats(splat), xrScale }),
+        body: JSON.stringify({ scene: file, lod: lodMode, tex: texKtx2 ? 'ktx2' : 'png', splats: countSplats(splat),
+                               xrScale, ...deviceInfo(), ...fields }),
       }).catch(() => {}),
+      // bench=views: show one (scene, lod, tex) in place, re-centred in front of the viewer.
+      loadView: async ({ scene, lod, tex }) => {
+        lodMode = lod;
+        texKtx2 = tex === 'ktx2';
+        await stepScene(0, scene);
+        xrController.resetPlacement();
+      },
+      onPhase: (text, seconds) => xrToast.show(text, seconds),
+      scenes: (getQueryParam('benchscenes') || '').split(',').filter(Boolean),
     }) : null;
 
     // Diagnostics for the FPS reports: how often Spark rebuilds its splat data
@@ -468,7 +495,8 @@
                                // CPU per frame: median of our frame callback (incl. draw submission),
                                // and Spark's per-eye preparation averaged per frame.
                                cpuMs: sparkStats.cpuMs.length ? +sparkStats.cpuMs.sort((x, y) => x - y)[sparkStats.cpuMs.length >> 1].toFixed(2) : null,
-                               sparkMs: sparkStats.frames ? +(sparkStats.sparkMs / sparkStats.frames).toFixed(2) : null }),
+                               sparkMs: sparkStats.frames ? +(sparkStats.sparkMs / sparkStats.frames).toFixed(2) : null,
+                               ...deviceInfo() }),
       }).catch(() => {});
       sparkStats.rebuilds = 0;
       sparkStats.sorts = 0;
@@ -545,11 +573,16 @@
     // `sharp bake-hybrid`; ?lod=surfaces loads <scene>_hybrid.glb (mesh only) +
     // <scene>_surfaces.glb (experimental, scripts/eval_alpha_surfaces2.py);
     // ?lod=patches loads <scene>_hybrid.glb + <scene>_patches.glb (scripts/eval_alpha_patches.py);
-    // ?lod=mpi the same with <scene>_mpi.glb (its MPI=1 sparse multi-plane mode).
+    // ?lod=mpi the same with <scene>_mpi.glb (its MPI=1 sparse multi-plane mode);
+    // ?lod=mpionly loads only <scene>_mpionly.glb (MPI from all splats, no mesh).
     // All fall back to the full splats when missing.
     // ?variant=_hybrid_s2 (etc.) loads a hybrid baked with another --name-suffix.
     const hybridName = /^_[A-Za-z0-9_]+$/.test(getQueryParam('variant') || '') ? getQueryParam('variant') : '_hybrid';
-    let lodMode = getQueryParam('lod') || 'full';  // changeable from the in-XR gallery
+    // Default view: MPI-only (all splats as a sparse multi-plane image), the fastest and best-looking mode on
+    // the Quest 3 (docs/quest-xr-findings.md §4b); falls back to the original splats when not baked.
+    let lodMode = getQueryParam('lod') || 'mpionly';  // changeable in XR (gallery, secondary thumbstick)
+    const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
+                        { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'mpionly', label: 'MPI-only' }];
     async function splatUrlFor(scene) {
       const full = `../output2/${scene}.ply`;
       if (lodMode !== 'quest') return full;
@@ -638,18 +671,43 @@
     // ?lod=patches uses the same drawing for <scene>_patches.glb
     // (scripts/eval_alpha_patches.py): overlapping textured quads, one per group
     // of splats, already ordered back to front (atlas pages and triangles).
-    async function loadSurfaces(scene, suffix = '_surfaces') {
+    // Default (unless ?tex=png): load the layer files with compressed textures (<scene><suffix>_ktx2.glb, Basis UASTC via
+    // scripts/glb_ktx2.py), transcoded by KTX2Loader to ASTC on the Quest / BC7 on desktops; falls back to
+    // the uncompressed file when there is none.
+    // Compressed layer textures by default (much faster on the Quest 3); ?tex=png for the uncompressed files.
+    let texKtx2 = getQueryParam('tex') !== 'png';   // also switched by the views benchmark
+    let ktx2Loader = null;
+    function layerLoader() {
+      const loader = new GLTFLoader();
+      if (texKtx2) {
+        ktx2Loader ??= new KTX2Loader()
+          .setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/libs/basis/')
+          .detectSupport(renderer);
+        loader.setKTX2Loader(ktx2Loader);
+      }
+      return loader;
+    }
+
+    async function loadSurfaces(scene, suffix = '_surfaces', withMesh = true) {
       // The opaque mesh these layers were built with: <scene><suffix>_mesh.glb if present, else the hybrid's.
+      // MPI-only (?lod=mpionly) has no mesh.
       let meshURL = `../output2/${scene}${suffix}_mesh.glb`;
-      try {
-        if (!(await fetch(meshURL, { method: 'HEAD' })).ok) meshURL = `../output2/${scene}_hybrid.glb`;
-      } catch (e) { meshURL = `../output2/${scene}_hybrid.glb`; }
-      const [meshGltf, surfGltf] = await Promise.all([
-        new GLTFLoader().loadAsync(meshURL),
-        new GLTFLoader().loadAsync(`../output2/${scene}${suffix}.glb`),
+      if (withMesh) {
+        try {
+          if (!(await fetch(meshURL, { method: 'HEAD' })).ok) meshURL = `../output2/${scene}_hybrid.glb`;
+        } catch (e) { meshURL = `../output2/${scene}_hybrid.glb`; }
+      }
+      let layerURL = `../output2/${scene}${suffix}.glb`;
+      if (texKtx2) {
+        const k = `../output2/${scene}${suffix}_ktx2.glb`;
+        try { if ((await fetch(k, { method: 'HEAD' })).ok) layerURL = k; } catch (e) {}
+      }
+      const gltfs = await Promise.all([
+        ...(withMesh ? [new GLTFLoader().loadAsync(meshURL)] : []),
+        layerLoader().loadAsync(layerURL),
       ]);
       const group = new THREE.Group();
-      for (const gltf of [meshGltf, surfGltf]) {
+      for (const gltf of gltfs) {
         const model = gltf.scene;
         model.quaternion.set(1, 0, 0, 0);
         model.position.set(offset[0], offset[1], offset[2]);
@@ -705,11 +763,11 @@
         }
         console.warn(`No ${url}; using full splats.`);
       }
-      if (['surfaces', 'patches', 'mpi'].includes(lodMode)) {
+      if (['surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode)) {
         const suffix = `_${lodMode}`;
         const url = `../output2/${scene}${suffix}.glb`;
         try {
-          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadSurfaces(scene, suffix);
+          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadSurfaces(scene, suffix, lodMode !== 'mpionly');
         } catch (e) {
           console.error(`Failed to load ${url}:`, e);
         }
@@ -754,7 +812,7 @@
     let splat;
     if (hybrid === "true") {
       splat = createSplat(splatURL);
-    } else if (['layers', 'hybrid', 'surfaces', 'patches', 'mpi'].includes(lodMode)) {
+    } else if (['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode)) {
       splat = await loadContent(file);
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading
@@ -810,19 +868,34 @@
       thumbUrl: (name) => `/thumb/${encodeURIComponent(name)}`,
       current: () => file,
       lod: () => lodMode,
-      lods: [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
-             { id: 'mpi', label: 'Hybrid-MPI' }],
+      lods: VIEW_MODES,
       onSelectScene: async (name) => {
         xrGallery.close();
         if (name !== file) await stepScene(0, name);
       },
-      onSelectLod: async (id) => {
-        if (id === lodMode) return;
-        lodMode = id;
-        xrGallery.refresh();
-        await stepScene(0);
-      },
+      onSelectLod: (id) => switchLod(id),
     });
+
+    // View-mode switching in XR (gallery buttons, or a flick of the secondary thumbstick left/right):
+    // reload the current scene in the new mode and show its name briefly.
+    const xrToast = new XRToast(renderer, scene);
+    const modeLabel = (id) => (VIEW_MODES.find((m) => m.id === id) || { label: id }).label;
+    async function switchLod(id) {
+      if (id === lodMode || switching) return;
+      lodMode = id;
+      xrGallery.refresh();
+      xrToast.show(`${modeLabel(id)}…`, 30);
+      await stepScene(0);
+      xrToast.show(modeLabel(lodMode));
+    }
+    async function cycleLod(delta) {
+      let have = VIEW_MODES.map((m) => m.id);
+      try { have = (await (await fetch('/scene-modes')).json())[file] || ['full']; } catch (e) {}
+      const order = VIEW_MODES.map((m) => m.id).filter((id) => have.includes(id));
+      if (!order.length) return;
+      const i = order.indexOf(lodMode);
+      await switchLod(order[(i + delta + order.length) % order.length]);
+    }
 
     // Delete the current scene from the XR menu: switch to the next scene
     // first, then delete the old one's files on the server.
@@ -857,11 +930,23 @@
       onDeleteScene: () => deleteCurrentScene(),
       homePush: xrPush,
       gallery: xrGallery,
+      onCycleLod: (delta) => cycleLod(delta),
     });
     // Centre the scene on the headset shortly after entering XR (like pressing
     // the trigger): the 'local' origin isn't reliably where your head is, and
     // tracking needs a moment to settle.
+    // ?hz=120 (or 72, 90): ask the headset for that display rate if it supports it (Quest 3: 72/90/120);
+    // the rate granted is shown briefly and logged with every FPS report (refreshHz).
+    const targetHz = parseFloat(getQueryParam('hz') || '0');
     renderer.xr.addEventListener('sessionstart', () => {
+      const session = renderer.xr.getSession();
+      if (targetHz && session?.updateTargetFrameRate) {
+        const ok = (session.supportedFrameRates || []).includes(targetHz);
+        (ok ? session.updateTargetFrameRate(targetHz) : Promise.reject(new Error('unsupported')))
+          .then(() => xrToast.show(`${session.frameRate ?? targetHz} Hz`, 3))
+          .catch(() => xrToast.show(`${targetHz} Hz not available (${(session.supportedFrameRates || []).join('/') || '?'}); `
+                                    + `running at ${session.frameRate ?? '?'} Hz`, 5));
+      }
       xrController.applyHome();
       setTimeout(() => {
         if (renderer.xr.isPresenting) xrController.resetPlacement();
@@ -1053,6 +1138,7 @@
       const frameStart = performance.now();
       stats.begin();
       xrController.update();
+      xrToast.update();
       if (xrBench) xrBench.step(performance.now());
       if (flatSplats) flatSplats.sync();
       reportXRFps();

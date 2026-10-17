@@ -54,8 +54,8 @@ start() {
   pids+=($!)
 }
 start web.log node web.js
-start predict.log env CUDA_VISIBLE_DEVICES="${PREDICT_GPU:-0}" "$ENV/bin/sharp" predict-with-info -i images -o output2 --loop
-start mpi.log env CUDA_VISIBLE_DEVICES="${MPI_GPU:-1}" "$ENV/bin/python" scripts/bake_mpi.py -i output2 --watch --mpionly
+start predict.log env CUDA_VISIBLE_DEVICES="${PREDICT_GPU:-0}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "$ENV/bin/sharp" predict-with-info -i images -o output2 --loop
+start mpi.log env CUDA_VISIBLE_DEVICES="${MPI_GPU:-1}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "$ENV/bin/python" scripts/bake_mpi.py -i output2 --watch --mpionly
 echo "$$ ${pids[*]}" > "$PIDFILE"
 
 echo "Started web server, prediction watcher and MPI-only watcher (pids ${pids[*]})."

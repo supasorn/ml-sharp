@@ -253,10 +253,25 @@ def load_gsplat():
     The cached gsplat CUDA extension was built with the system CUDA 13 toolkit
     and links libcudart.so.13, which PyTorch (cu128) doesn't ship; load it
     globally first. JIT builds also need the env's ninja on PATH.
+
+    The home directory is shared between machines with different GPUs and CUDA
+    toolkits, so each machine JIT-builds into its own directory, for its own
+    GPUs only; one shared build directory ends up mixing objects for different
+    GPUs ("Failed to set maximum shared memory size").
     """
     import ctypes
     import os
+    import socket
     import sys
+
+    import torch
+
+    if "TORCH_EXTENSIONS_DIR" not in os.environ:
+        os.environ["TORCH_EXTENSIONS_DIR"] = os.path.expanduser(
+            f"~/.cache/torch_extensions/host_{socket.gethostname()}")
+    if "TORCH_CUDA_ARCH_LIST" not in os.environ and torch.cuda.is_available():
+        caps = sorted({torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
+        os.environ["TORCH_CUDA_ARCH_LIST"] = ";".join(f"{a}.{b}" for a, b in caps)
 
     cudart = "/usr/local/cuda/lib64/libcudart.so.13"
     if os.path.exists(cudart):

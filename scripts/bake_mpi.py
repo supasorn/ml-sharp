@@ -95,9 +95,11 @@ def watch(args):
     """Bake scenes that lack their MPI outputs, forever: MPI-only first (the default view), then Hybrid-MPI
     (not with --mpionly).
     A scene is picked up once its .ply and .json have been unchanged for a few seconds; a failed scene is
-    retried only after its .ply changes."""
+    retried only after its .ply changes, except that running out of GPU memory (shared GPUs) is retried up to
+    6 times, waiting 30 s, 1 min, 2 min, ... up to 10 min in between (a scene too big for the GPU never fits)."""
     gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
     failed = {}
+    oom = {}                                                   # key -> (retries so far, retry not before)
     print(f"watching {args.input} for {'MPI-only' if args.mpionly else 'MPI-only + Hybrid-MPI'} "
           f"(GPU {gpu}, every {args.poll:.0f} s)", flush=True)
     while True:
@@ -108,7 +110,7 @@ def watch(args):
                 done_ = out.exists() and out.stat().st_mtime > ply.stat().st_mtime and (
                     args.no_ktx2 or out.with_name(out.stem + "_ktx2.glb").exists())
                 key = (ply.stem, sfx)
-                if done_ or failed.get(key) == ply.stat().st_mtime:
+                if done_ or failed.get(key) == ply.stat().st_mtime or oom.get(key, (0, 0))[1] > time.time():
                     continue
                 if time.time() - max(ply.stat().st_mtime, ply.with_suffix(".json").stat().st_mtime) < 5:
                     continue                                   # still being written
@@ -120,9 +122,19 @@ def watch(args):
                     print(f"{time.strftime('%H:%M:%S')} {ply.stem}{sfx}: {status} in {time.time() - t0:.0f}s", flush=True)
                     if status == "skipped":                   # nothing to do after all: don't spin on it
                         failed[key] = ply.stat().st_mtime
+                    oom.pop(key, None)
                 except (subprocess.CalledProcessError, OSError) as e:
-                    failed[key] = ply.stat().st_mtime if ply.exists() else None
-                    print(f"{time.strftime('%H:%M:%S')} {ply.stem}{sfx}: FAILED ({e})", flush=True)
+                    tries = oom.get(key, (0, 0))[0]
+                    logf = args.work / f"{ply.stem}{'_mpionly' if mpionly else ''}.log"
+                    if "OutOfMemoryError" in logf.read_text(errors="ignore") and tries < 6:
+                        wait = min(30 * 2 ** tries, 600)           # shared GPUs: wait for memory, then retry
+                        oom[key] = (tries + 1, time.time() + wait)
+                        print(f"{time.strftime('%H:%M:%S')} {ply.stem}{sfx}: out of GPU memory, "
+                              f"retry {tries + 1} in {wait} s", flush=True)
+                    else:
+                        failed[key] = ply.stat().st_mtime if ply.exists() else None
+                        oom.pop(key, None)
+                        print(f"{time.strftime('%H:%M:%S')} {ply.stem}{sfx}: FAILED ({e})", flush=True)
                 break                                          # re-scan: newer scenes and MPI-only go first
             else:
                 continue

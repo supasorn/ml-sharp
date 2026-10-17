@@ -31,6 +31,7 @@ from sharp.utils.gaussians import (
     load_ply,
     unproject_gaussians,
 )
+import threading
 import time
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -51,6 +52,8 @@ class MyEventHandler(FileSystemEventHandler):
         self.output_path = output_path
         self.device = device
         self.with_rendering = with_rendering
+        self.lock = threading.Lock()   # the watchdog thread and the rescan in the main loop
+        self.failures = {}             # (image path, mtime) -> failed attempts
 
     def on_closed(self, event: FileSystemEvent) -> None:
         if event.is_directory:
@@ -60,6 +63,49 @@ class MyEventHandler(FileSystemEventHandler):
 
         if not any(event.src_path.endswith(ext) for ext in extensions):
             return
+        self.safe_process(Path(event.src_path))
+
+    def safe_process(self, image_path: Path) -> None:
+        """Process one image; an error (e.g. out of GPU memory on a shared GPU) must not kill the watcher
+        thread. Failed images are retried by rescan(): out of GPU memory (shared GPUs) until it fits, other
+        errors up to 3 attempts."""
+        with self.lock:
+            try:
+                self.process(image_path)
+            except torch.OutOfMemoryError:
+                LOGGER.warning("Out of GPU memory on %s; retrying in 30 s", image_path)
+                torch.cuda.empty_cache()
+            except Exception:
+                LOGGER.exception("Failed to process %s", image_path)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                try:
+                    key = (image_path, image_path.stat().st_mtime)
+                    self.failures[key] = self.failures.get(key, 0) + 1
+                except OSError:
+                    pass
+
+    def rescan(self) -> None:
+        """Process images that have no .ply/.json yet: failed attempts, and images added while not watching."""
+        extensions = io.get_supported_image_extensions()
+        root = self.input_path if self.input_path.is_dir() else self.input_path.parent
+        for image_path in sorted(root.rglob("*")):
+            if image_path.suffix not in extensions or not image_path.is_file():
+                continue
+            if (self.output_path / f"{image_path.stem}.ply").exists() and (
+                self.output_path / f"{image_path.stem}.json"
+            ).exists():
+                continue
+            try:
+                mtime = image_path.stat().st_mtime
+            except OSError:
+                continue
+            if time.time() - mtime < 10 or self.failures.get((image_path, mtime), 0) >= 3:
+                continue  # still being written (the watcher gets it), or given up
+            LOGGER.info("Rescan: %s has no output yet", image_path)
+            self.safe_process(image_path)
+
+    def process(self, image_path: Path) -> None:
 
         # image_paths = []
         # if self.input_path.is_file():
@@ -75,7 +121,7 @@ class MyEventHandler(FileSystemEventHandler):
 #
         # LOGGER.info("Processing %d valid image files.", len(image_paths))
 
-        image_paths = [Path(event.src_path)]
+        image_paths = [image_path]
 
         for (i, image_path) in enumerate(image_paths):
             print(f"Processing image {i+1}/{len(image_paths)}: {image_path}")
@@ -293,7 +339,8 @@ def predict_cli(
     else:
         try:
             while True:
-                time.sleep(1)
+                event_handler.rescan()
+                time.sleep(30)
         except KeyboardInterrupt:
             observer.stop()
         observer.join()

@@ -45,8 +45,14 @@ EXPORT_DIR = os.environ.get("EXPORT_DIR", "")
 EVAL = int(os.environ.get("EVAL", 1))
 FITFLAT = bool(os.environ.get("FITFLAT", "1") != "0")  # fronto-parallel patches (tilted RANSAC planes mix depths)
 TEXDS = int(os.environ.get("TEXDS", 2))
-CELL_BORDER = int(os.environ.get("CELL_BORDER", 2))   # MPI export: border texels per cell (>= 2^L keeps mip level L clean)
-CELL_BORDER = int(os.environ.get("CELL_BORDER", 2))   # MPI export: border texels per cell (>= 2^L keeps mip level L clean)
+CELL_BORDER = int(os.environ.get("CELL_BORDER", 2))
+EXPORT_KTX2 = bool(os.environ.get("EXPORT_KTX2"))        # also write <name>_ktx2.glb directly (compressed pages)
+KTX2_LEVELS = int(os.environ.get("KTX2_LEVELS", 3))      # mipmap levels in the KTX2 pages
+CULL_SCALE = float(os.environ.get("CULL_SCALE", 1.0))    # resolution of the culling renders (0.5 = half)   # MPI export: border texels per cell (>= 2^L keeps mip level L clean)
+CELL_BORDER = int(os.environ.get("CELL_BORDER", 2))
+EXPORT_KTX2 = bool(os.environ.get("EXPORT_KTX2"))        # also write <name>_ktx2.glb directly (compressed pages)
+KTX2_LEVELS = int(os.environ.get("KTX2_LEVELS", 3))      # mipmap levels in the KTX2 pages
+CULL_SCALE = float(os.environ.get("CULL_SCALE", 1.0))    # resolution of the culling renders (0.5 = half)   # MPI export: border texels per cell (>= 2^L keeps mip level L clean)
 TEXFULL_THR = float(os.environ.get("TEXFULL_THR", 0.003))   # MPI export: cells losing more detail than this at 1/TEXDS keep full res
 MAXPAGES = int(os.environ.get("MAXPAGES", 4))              # ... within this many 4096^2 atlas pages
 BINS = int(os.environ.get("BINS", 0))
@@ -157,8 +163,12 @@ def composite_vals(vals, pix, key, mrgb, npix):
     return C + torch.exp(L)[:, None] * mrgb
 
 
+T0 = time.time()                                   # per-run clock for the timing in log lines
+
+
 def run(scene: Path):
-    t0 = time.time()
+    global T0
+    t0 = T0 = time.time()
     meta = json.loads(scene.with_suffix(".json").read_text())
     Hg = int(round(GW * meta["height"] / meta["width"]))
     fg = meta["focal_length_px"] * GW / meta["width"]
@@ -380,9 +390,13 @@ def run(scene: Path):
     else:
         geomN, geomC, geom_inside, to_cell = nP, corners, inside, (lambda prim: prim)
 
-    def patch_samples(eye, with_local=False):
+    def patch_samples(eye, with_local=False, scale=1.0):
         V, PIX, T, PR, LX, LY = [], [], [], [], [], []
-        for prim, pix, p, ui, vi, t in cast(geomN, geomC, geom_inside, eye, W, H, f):
+        Ws, Hs, fs = (W, H, f) if scale == 1.0 else (round(W * scale), round(H * scale), f * scale)
+        ins = geom_inside if scale == 1.0 else (lambda prim, ui, vi: geom_inside(prim, ui / scale, vi / scale))
+        for prim, pix, p, ui, vi, t in cast(geomN, geomC, ins, eye, Ws, Hs, fs):
+            if scale != 1.0:
+                ui, vi = ui / scale, vi / scale                         # input-view coords at render resolution
             prim = to_cell(prim)
             lx = (ui + MARGIN - 0.5 - rx0[prim]).clamp(0, None)
             ly = (vi + MARGIN - 0.5 - ry0[prim]).clamp(0, None)
@@ -410,8 +424,8 @@ def run(scene: Path):
         best = torch.zeros(P, device=dev)
         eyes_c = [(x, y, zz) for x in (-MOVE, 0.0, MOVE) for y in (-MOVE / 2, 0.0, MOVE / 2) for zz in (0.0, 0.4 * MOVE)]
         for eye in eyes_c:
-            vals, pix, t, prim = patch_samples(eye)
-            _, mdep_c = s2.mesh_layer(M, eye, W, H, f)
+            vals, pix, t, prim = patch_samples(eye, scale=CULL_SCALE)
+            _, mdep_c = s2.mesh_layer(M, eye, round(W * CULL_SCALE), round(H * CULL_SCALE), f * CULL_SCALE)
             k = t < mdep_c[pix]
             vals, pix, t, prim = vals[k], pix[k], t[k], prim[k]
             o = torch.argsort(pix.double() * 1e7 + t.double())
@@ -424,14 +438,15 @@ def run(scene: Path):
             if eye == (0.0, 0.0, 0.0):
                 prim0 = prim.clone()
             del vals, pix, t, prim, o, a, la, cs, contrib
-            torch.cuda.empty_cache()
         alive = best >= CULL
-        print(f"  input view: {len(prim0) / (W * H):.2f} -> {alive[prim0].sum().item() / (W * H):.2f} layer fragments "
+        torch.cuda.empty_cache()
+        npx = round(W * CULL_SCALE) * round(H * CULL_SCALE)
+        print(f"  input view: {len(prim0) / npx:.2f} -> {alive[prim0].sum().item() / npx:.2f} layer fragments "
               f"per pixel after the mesh depth test", flush=True)
         fill = area.astype(np.float64)
         print(f"  culling: {int((~alive).sum())} of {P} cells ({(~alive).float().mean().item():.0%}, "
               f"{fill[~alive.cpu().numpy()].sum() / fill.sum():.0%} of cell area) never contribute >= {CULL} "
-              f"from {len(eyes_c)} viewpoints within +-{MOVE} m -> dropped", flush=True)
+              f"from {len(eyes_c)} viewpoints within +-{MOVE} m -> dropped [{time.time() - t0:.0f}s]", flush=True)
 
     # Occluders (MPI, OCC=1): fully opaque OCC_BLK-px blocks of the kept cells (every texel alpha > 0.99 at render
     # resolution, so also after box downsampling), as depth-only quads drawn with the opaque mesh. They sit
@@ -595,10 +610,7 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
     are box-downsampled by TEXDS and trimmed to the texels with alpha. With `border` (atlas of the same cells
     with a margin of gb render px of real neighbour texels, MPI), cells keep that margin instead of a
     duplicated-edge gutter and aren't trimmed, so filtering across cell seams sees the right colours."""
-    from trimesh.visual.material import PBRMaterial
-    from trimesh.visual.texture import TextureVisuals
     ds = TEXDS
-    at = atlas.float().clamp(0, 1).cpu().numpy()
     def down(t):                                                     # box filter (premultiplied, so exact)
         if ds == 1:
             return t
@@ -634,32 +646,64 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
             full[cand] = True
             print(f"  adaptive textures: {full.sum()} of {len(rects)} cells at full resolution "
                   f"(error > {TEXFULL_THR}, budget {MAXPAGES} pages)", flush=True)
-        atb = atb.cpu().float().clamp(0, 1).numpy()                  # on the CPU: a float copy of the whole border atlas can exceed GPU memory
-    for i in range(len(rects)):
-        if alive is not None and not alive[i]:
-            continue
-        x0, y0, x1, y1 = rects[i]
-        t = down(at[off[i]:off[i] + area[i]].reshape(y1 - y0, x1 - x0, 4))
-        m = t[..., 3] >= 0.5 / 255
-        if not m.any():
-            continue
-        if border is not None:
-            # Shrink the quad to the texels with alpha (the rest is fill the GPU would blend for nothing),
-            # keeping `g` texels of real data around it for filtering, so the result is unchanged.
-            tb = atb[i] if full[i] else down(atb[i])
-            g, sp = (gb, 1) if full[i] else (gb // ds, ds)               # border texels, render px per texel
-            inner = tb[g:tb.shape[0] - g, g:tb.shape[1] - g, 3] >= 0.5 / 255
-            if not inner.any():
-                continue
-            ys, xs = np.nonzero(inner.any(1))[0], np.nonzero(inner.any(0))[0]
-            texs[i] = tb[ys[0]:ys[-1] + 1 + 2 * g, xs[0]:xs[-1] + 1 + 2 * g]
+        # Batched (GPU, chunked): every cell's texture at its chosen resolution (full, or box-downsampled by ds;
+        # premultiplied, so averaging is exact), and the bounding box of its texels with alpha inside the cell.
+        # Textures stay 8-bit from here on.
+        live = np.ones(len(rects), bool) if alive is None else alive.astype(bool)
+        g2 = gb // ds
+        half_u8 = np.zeros((len(rects), cb // ds, cb // ds, 4), np.uint8)
+        bbox = np.full((len(rects), 4), -1, np.int64)                 # first row, last row, first col, last col
+        full_t = torch.tensor(full, device=atb.device)
+
+        def first_last(m):                                            # m: (n, L) bool -> first, last index (or -1)
+            anyv = m.any(1)
+            L = m.shape[1]
+            idx = torch.arange(L, device=m.device)
+            first = torch.where(m, idx, L).amin(1)
+            last = torch.where(m, idx, -1).amax(1)
+            return torch.where(anyv, first, -1), torch.where(anyv, last, -1)
+        for c0 in range(0, len(rects), 16384):
+            t1 = atb[c0:c0 + 16384].float().clamp(0, 1)                # (n, cb, cb, 4)
+            th = torch.nn.functional.avg_pool2d(t1.permute(0, 3, 1, 2), ds).permute(0, 2, 3, 1) if ds > 1 else t1
+            half_u8[c0:c0 + len(t1)] = (th * 255 + 0.5).byte().cpu().numpy()
+            inner_h = th[:, g2:th.shape[1] - g2, g2:th.shape[2] - g2, 3] >= 0.5 / 255
+            inner_f = t1[:, gb:cb - gb, gb:cb - gb, 3] >= 0.5 / 255
+            fsel = full_t[c0:c0 + len(t1)]
+            for inner, sel in ((inner_h, ~fsel), (inner_f, fsel)):
+                if not sel.any():
+                    continue
+                r0, r1 = first_last(inner[sel].any(2))
+                k0, k1 = first_last(inner[sel].any(1))
+                ids = torch.nonzero(sel)[:, 0].cpu().numpy() + c0
+                bbox[ids] = torch.stack([r0, r1, k0, k1], 1).cpu().numpy()
+        full_ids = np.nonzero(full & live)[0]
+        full_u8 = {}
+        for c0 in range(0, len(full_ids), 16384):                     # full-resolution cells only
+            ids = full_ids[c0:c0 + 16384]
+            full_u8.update(zip(ids, (atb[torch.tensor(ids, device=atb.device)].float().clamp(0, 1) * 255 + 0.5)
+                               .byte().cpu().numpy()))
+        for i in np.nonzero(live & (bbox[:, 0] >= 0))[0]:
+            x0, y0 = rects[i, 0], rects[i, 1]
+            r0, r1, k0, k1 = bbox[i]
+            tb, g, sp = (full_u8[i], gb, 1) if full[i] else (half_u8[i], g2, ds)
+            texs[i] = tb[r0:r1 + 1 + 2 * g, k0:k1 + 1 + 2 * g]
             pad[i] = g
-            geo[i] = (x0 + xs[0] * sp, y0 + ys[0] * sp, x0 + (xs[-1] + 1) * sp, y0 + (ys[-1] + 1) * sp)
-            continue
-        ys, xs = np.nonzero(m.any(1))[0], np.nonzero(m.any(0))[0]
-        texs[i] = np.pad(t[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1], ((1, 1), (1, 1), (0, 0)), mode="edge")
-        pad[i] = 1
-        geo[i] = (x0 + xs[0] * ds, y0 + ys[0] * ds, x0 + (xs[-1] + 1) * ds, y0 + (ys[-1] + 1) * ds)
+            geo[i] = (x0 + k0 * sp, y0 + r0 * sp, x0 + (k1 + 1) * sp, y0 + (r1 + 1) * sp)
+    else:
+        at = atlas.float().clamp(0, 1).cpu().numpy()
+        for i in range(len(rects)):
+            if alive is not None and not alive[i]:
+                continue
+            x0, y0, x1, y1 = rects[i]
+            t = down(at[off[i]:off[i] + area[i]].reshape(y1 - y0, x1 - x0, 4))
+            m = t[..., 3] >= 0.5 / 255
+            if not m.any():
+                continue
+            ys, xs = np.nonzero(m.any(1))[0], np.nonzero(m.any(0))[0]
+            texs[i] = (np.pad(t[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1], ((1, 1), (1, 1), (0, 0)), mode="edge")
+                       * 255 + 0.5).astype(np.uint8)
+            pad[i] = 1
+            geo[i] = (x0 + xs[0] * ds, y0 + ys[0] * ds, x0 + (xs[-1] + 1) * ds, y0 + (ys[-1] + 1) * ds)
     order = [i for i in np.argsort(-centre[:, 2].cpu().numpy()) if i in texs]   # far first
 
     def shelf(ids):
@@ -685,13 +729,13 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         while (pl := shelf(order[start:end])) is None:
             end = start + max(1, int((end - start) * 0.97))
         pages.append((order[start:end], pl)); start = end
-    meshes, texels = {}, 0
+    meshes, texels = [], 0
     for pg, (ids, pl) in enumerate(pages):
         img = np.zeros((page, page, 4), np.uint8)
         for i in ids:
             px, py = pl[i]
             t, g = texs[i], pad[i]
-            img[py - g:py - g + t.shape[0], px - g:px - g + t.shape[1]] = (t * 255 + 0.5).astype(np.uint8)
+            img[py - g:py - g + t.shape[0], px - g:px - g + t.shape[1]] = t
             texels += t.shape[0] * t.shape[1]
         r = np.array([geo[i] for i in ids], np.float64)
         cu = (np.stack([r[:, 0], r[:, 2], r[:, 2], r[:, 0]], 1) - MARGIN) / SS
@@ -712,19 +756,73 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         uu = np.stack([px, px + tw, px + tw, px], 1) / page
         vv = np.stack([py, py, py + th, py + th], 1) / page
         faces = (np.arange(len(ids))[:, None, None] * 4 + np.array([[0, 1, 2], [0, 2, 3]])[None]).reshape(-1, 3)
-        mat = PBRMaterial(name=f"patches_{pg}", baseColorTexture=Image.fromarray(img, "RGBA"), metallicFactor=0.0,
-                          roughnessFactor=1.0, doubleSided=True, alphaMode="BLEND")
-        vis = TextureVisuals(uv=np.stack([uu.reshape(-1), 1 - vv.reshape(-1)], 1), material=mat)
+        # glTF uv: origin at the top-left of the image (no flip)
+        uv = np.stack([uu.reshape(-1), vv.reshape(-1)], 1).astype(np.float32)
         # The viewer draws surface_<k> with larger k first (k = 0 is the front).
-        meshes[f"surface_{len(pages) - 1 - pg}"] = trimesh.Trimesh(
-            vertices=V.reshape(-1, 3).astype(np.float32), faces=faces, process=False, visual=vis)
+        meshes.append((f"surface_{len(pages) - 1 - pg}", V.reshape(-1, 3).astype(np.float32),
+                       faces.astype(np.uint32), uv, img))
     path = (Path(EXPORT_DIR) if EXPORT_DIR else scene.parent) / f"{scene.stem}{EXPORT}.glb"
-    trimesh.Scene(meshes).export(path)
+    write_layer_glbs(path, meshes, ktx2=EXPORT_KTX2)
     quad_px = sum((geo[i][2] - geo[i][0]) * (geo[i][3] - geo[i][1]) for i in texs)
     print(f"  quads cover {quad_px / (GW * SS * Hg * SS):.1f}x the frame (fill before blending/depth test)", flush=True)
-    print(f"  wrote {path} ({path.stat().st_size / 2**20:.0f} MB, {len(pages)} atlas pages of {page}^2, "
+    print(f"  [{time.time() - T0:.0f}s] wrote {path} ({path.stat().st_size / 2**20:.0f} MB, {len(pages)} atlas pages of {page}^2, "
           f"{len(texs)} patches, {texels / 1e6:.0f}M texels = {texels / (len(pages) * page * page):.0%} of the pages)",
           flush=True)
+
+
+def write_layer_glbs(path, meshes, ktx2=False):
+    """Write the layer meshes [(name, V, faces, uv, page RGBA uint8)] as <path> (PNG pages, fast compression) and,
+    with ktx2, also <stem>_ktx2.glb (Basis UASTC KTX2 pages with mipmaps, KHR_texture_basisu; see glb_ktx2.py),
+    encoding the pages in parallel."""
+    import io, tempfile
+    from concurrent.futures import ThreadPoolExecutor
+    from glb_ktx2 import write_glb, encode_pages
+
+    def png(img, level):
+        b = io.BytesIO(); Image.fromarray(img, "RGBA").save(b, format="PNG", compress_level=level); return b.getvalue()
+    with ThreadPoolExecutor(len(meshes) or 1) as ex:
+        pngs = list(ex.map(lambda m: png(m[4], 1), meshes))
+
+    def build(images, mime, basisu):
+        g = {"asset": {"version": "2.0", "generator": "ml-sharp eval_alpha_patches"}, "scene": 0,
+             "scenes": [{"nodes": list(range(len(meshes)))}], "nodes": [], "meshes": [], "materials": [],
+             "textures": [], "images": [], "accessors": [], "bufferViews": []}
+        views = []
+
+        def view(data, target=None):
+            g["bufferViews"].append({"buffer": 0, **({"target": target} if target else {})})
+            views.append(data)
+            return len(views) - 1
+
+        def accessor(arr, ctype, typ, target, minmax=False):
+            a = {"bufferView": view(arr.tobytes(), target), "componentType": ctype, "count": len(arr), "type": typ}
+            if minmax:
+                a["min"] = arr.min(0).tolist(); a["max"] = arr.max(0).tolist()
+            g["accessors"].append(a)
+            return len(g["accessors"]) - 1
+        for k, ((name, V, F, uv, _), im) in enumerate(zip(meshes, images)):
+            pos = accessor(V, 5126, "VEC3", 34962, minmax=True)
+            tex = accessor(uv, 5126, "VEC2", 34962)
+            idx = accessor(F.reshape(-1), 5125, "SCALAR", 34963)
+            g["images"].append({"bufferView": view(im), "mimeType": mime})
+            g["textures"].append({"extensions": {"KHR_texture_basisu": {"source": k}}} if basisu else {"source": k})
+            g["materials"].append({"name": f"patches_{k}", "doubleSided": True, "alphaMode": "BLEND",
+                                   "pbrMetallicRoughness": {"baseColorTexture": {"index": k},
+                                                            "metallicFactor": 0.0, "roughnessFactor": 1.0}})
+            g["meshes"].append({"name": name, "primitives": [{"attributes": {"POSITION": pos, "TEXCOORD_0": tex},
+                                                               "indices": idx, "material": k}]})
+            g["nodes"].append({"name": name, "mesh": k})
+        if basisu:
+            g["extensionsUsed"] = g["extensionsRequired"] = ["KHR_texture_basisu"]
+        return g, views
+    g, views = build(pngs, "image/png", False)
+    write_glb(path, g, views)
+    if ktx2:
+        with tempfile.TemporaryDirectory() as td:
+            raw = [png(m[4], 0) for m in meshes]                      # uncompressed PNG: just a container for ktx
+            kt = encode_pages(raw, td, levels=KTX2_LEVELS)
+        g, views = build(kt, "image/ktx2", True)
+        write_glb(Path(path).with_name(Path(path).stem + "_ktx2.glb"), g, views)
 
 
 if __name__ == "__main__":

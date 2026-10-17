@@ -21,7 +21,10 @@ one per GPU.
 Hybrid-MPI; with --mpionly only MPI-only), on the GPU(s) in CUDA_VISIBLE_DEVICES; scripts/start_server.sh
 runs `--watch --mpionly`.
 
-Usage: python scripts/bake_mpi.py [-i output2] [--gpus 0,1,2,3] [--overwrite] [--watch] [scene names...]
+--gpus auto picks, for each scene, the GPU with the most free memory (the machine is shared), and a scene
+that runs out of GPU memory is retried up to 3 times after a short wait; --jobs sets how many run at once.
+
+Usage: python scripts/bake_mpi.py [-i output2] [--gpus 0,1,2,3|auto] [--jobs N] [--overwrite] [--watch] [scenes...]
 """
 import argparse
 import os
@@ -36,7 +39,8 @@ from queue import Queue
 
 ROOT = Path(__file__).resolve().parents[1]
 SUFFIX = "_hybrid_k03r05"
-MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "REFINE": "1", "CULL": "0.05", "CELL_BORDER": "4", "EXPORT": "_mpi", "EVAL": "0"}
+MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "REFINE": "1", "CULL": "0.05", "CELL_BORDER": "4",
+           "EXPORT_KTX2": "1", "CULL_SCALE": "0.5", "EXPORT": "_mpi", "EVAL": "0"}
 
 
 def scene_plys(folder: Path, names):
@@ -79,6 +83,9 @@ def bake(ply: Path, gpu: str, args, log):
 def compress(glb: Path, args, log):
     """<x>.glb -> <x>_ktx2.glb (compressed textures), unless --no-ktx2."""
     if args.no_ktx2:
+        return
+    k = glb.with_name(glb.stem + "_ktx2.glb")
+    if k.exists() and k.stat().st_mtime >= glb.stat().st_mtime:   # the export already wrote it (EXPORT_KTX2)
         return
     subprocess.run([sys.executable, str(ROOT / "scripts" / "glb_ktx2.py"), str(glb),
                     str(glb.with_name(glb.stem + "_ktx2.glb"))], check=True, stdout=log, stderr=subprocess.STDOUT)
@@ -124,11 +131,19 @@ def watch(args):
             time.sleep(args.poll)
 
 
+def freest_gpu():
+    """Index of the GPU with the most free memory (nvidia-smi)."""
+    out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True, check=True).stdout
+    return max((int(f), i.strip()) for i, f in (l.split(",") for l in out.strip().splitlines()))[1]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("-i", "--input", type=Path, default=ROOT / "output2")
     ap.add_argument("--work", type=Path, default=ROOT / "renderings" / "mpi_work")
-    ap.add_argument("--gpus", default="0,1,2,3")
+    ap.add_argument("--gpus", default="0,1,2,3", help="GPU list (one scene per GPU at a time) or 'auto'")
+    ap.add_argument("--jobs", type=int, default=2, help="scenes at once with --gpus auto")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--reexport", action="store_true", help="redo only the MPI export (reuse the hybrid bakes)")
     ap.add_argument("--mpionly", action="store_true", help="MPI from all splats, no hybrid mesh (_mpionly.glb)")
@@ -141,27 +156,37 @@ def main():
     if args.watch:
         return watch(args)
     plys = scene_plys(args.input, set(args.scenes))
+    auto = args.gpus == "auto"
     gpus = Queue()
-    for g in args.gpus.split(","):
+    for g in (["auto"] * args.jobs if auto else args.gpus.split(",")):
         gpus.put(g)
     lock = threading.Lock()
     done = [0]
     t0 = time.time()
 
     def job(ply):
-        gpu = gpus.get()
+        slot = gpus.get()
+        logf = args.work / f"{ply.stem}{'_mpionly' if args.mpionly else ''}.log"
         try:
-            with open(args.work / f"{ply.stem}{'_mpionly' if args.mpionly else ''}.log", "w") as log:
-                status = bake(ply, gpu, args, log)
-        except subprocess.CalledProcessError as e:
-            status = f"FAILED ({e.returncode}), see {args.work / (ply.stem + '.log')}"
+            for attempt in range(4):
+                gpu = freest_gpu() if slot == "auto" else slot
+                try:
+                    with open(logf, "w") as log:
+                        status = bake(ply, gpu, args, log)
+                    break
+                except subprocess.CalledProcessError as e:
+                    status = f"FAILED ({e.returncode}), see {logf}"
+                    if "OutOfMemoryError" not in logf.read_text(errors="ignore") or attempt == 3:
+                        break
+                    time.sleep(30)                         # shared GPUs: wait for memory, then retry
+                    status += f" (out of GPU memory, retry {attempt + 1})"
         finally:
-            gpus.put(gpu)
+            gpus.put(slot)
         with lock:
             done[0] += 1
             print(f"[{done[0]}/{len(plys)} {time.time() - t0:.0f}s] {ply.stem}: {status}", flush=True)
 
-    with ThreadPoolExecutor(len(args.gpus.split(","))) as ex:
+    with ThreadPoolExecutor(args.jobs if auto else len(args.gpus.split(","))) as ex:
         list(ex.map(job, plys))
 
 

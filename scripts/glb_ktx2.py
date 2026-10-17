@@ -30,6 +30,31 @@ def ktx(*args):
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
+def ktx_args(quality=2, zstd=18, rdo=0.0, levels=3):
+    """`ktx create` arguments for the layer pages: UASTC, linear transfer (premultiplied display-space values
+    sampled raw), box mipmaps, Zstandard."""
+    a = ["create", "--format", "R8G8B8A8_UNORM", "--encode", "uastc", "--uastc-quality", quality, "--assign-tf", "linear"]
+    if levels > 1:
+        a += ["--generate-mipmap", "--mipmap-filter", "box", "--levels", levels]
+    if rdo > 0:
+        a += ["--uastc-rdo", "--uastc-rdo-l", rdo]
+    if zstd > 0:
+        a += ["--zstd", zstd]
+    return a
+
+
+def encode_pages(pngs, td, **kw):
+    """PNG bytes per page -> KTX2 bytes per page, all pages encoded in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    def one(i):
+        src, dst = Path(td) / f"p{i}.png", Path(td) / f"p{i}.ktx2"
+        src.write_bytes(pngs[i])
+        ktx(*ktx_args(**kw), src, dst)
+        return dst.read_bytes()
+    with ThreadPoolExecutor(len(pngs) or 1) as ex:
+        return list(ex.map(one, range(len(pngs))))
+
+
 def read_glb(path):
     b = Path(path).read_bytes()
     n = struct.unpack("<I", b[12:16])[0]
@@ -74,29 +99,19 @@ def main():
     t0 = time.time()
     png_bytes = ktx_bytes = 0
     with tempfile.TemporaryDirectory() as td:
-        for i, im in enumerate(g["images"]):
+        pngs = [views[im["bufferView"]] for im in g["images"]]
+        png_bytes = sum(len(p) for p in pngs)
+        kts = encode_pages(pngs, td, quality=a.quality, zstd=a.zstd, rdo=a.rdo, levels=a.levels)   # pages in parallel
+        ktx_bytes = sum(len(k) for k in kts)
+        for i, (im, kb) in enumerate(zip(g["images"], kts)):
             bv = im["bufferView"]
-            src = Path(td) / f"p{i}.png"
-            src.write_bytes(views[bv])
-            enc = Path(td) / f"p{i}.ktx2"
-            args = ["create", "--format", "R8G8B8A8_UNORM", "--encode", "uastc", "--uastc-quality", a.quality,
-                    "--assign-tf", "linear"]
-            if a.levels > 1:
-                args += ["--generate-mipmap", "--mipmap-filter", "box", "--levels", a.levels]
-            if a.rdo > 0:
-                args += ["--uastc-rdo", "--uastc-rdo-l", a.rdo]
-            if a.zstd > 0:
-                args += ["--zstd", a.zstd]
-            ktx(*args, src, enc)
-            png_bytes += len(views[bv]); kb = enc.read_bytes(); ktx_bytes += len(kb)
-            views_k = kb
             gk["images"][i] = {"bufferView": bv, "mimeType": "image/ktx2"}
-            dec_views_i = None
             if a.decoded:
-                dec = Path(td) / f"d{i}.png"
+                enc, dec = Path(td) / f"e{i}.ktx2", Path(td) / f"d{i}.png"
+                enc.write_bytes(kb)
                 ktx("extract", "--transcode", "rgba8", enc, dec)
                 dec_views[bv] = dec.read_bytes()
-            views[bv] = views_k
+            views[bv] = kb
     for t in gk["textures"]:
         t["extensions"] = {"KHR_texture_basisu": {"source": t.pop("source")}}
     gk["extensionsUsed"] = sorted(set(gk.get("extensionsUsed", [])) | {"KHR_texture_basisu"})

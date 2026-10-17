@@ -5,7 +5,7 @@ Per scene <name>.ply (+ .json) in the input folder:
    (not the input folder: the gallery and the bake watcher treat files there
    as scenes / outputs).
 2. The hybrid's mesh is copied to <input>/<name>_mpi_mesh.glb.
-3. The remaining splats become a sparse multi-plane image (128 depth bins,
+3. The remaining splats become a sparse multi-plane image (128 depth bins, per-cell depth,
    16-px cells, scripts/eval_alpha_patches.py MPI mode) written to
    <input>/<name>_mpi.glb.
 Scenes whose _mpi.glb is newer than their .ply are skipped (--overwrite redoes
@@ -27,7 +27,7 @@ from queue import Queue
 
 ROOT = Path(__file__).resolve().parents[1]
 SUFFIX = "_hybrid_k03r05"
-MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "EXPORT": "_mpi", "EVAL": "0"}
+MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "REFINE": "1", "EXPORT": "_mpi", "EVAL": "0"}
 
 
 def scene_plys(folder: Path, names):

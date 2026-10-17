@@ -201,6 +201,23 @@ hybrid 32.5 / 26.4):
    texture resolution (half resolution unless the cell loses > 0.003 of
    detail, ≤ 4 pages of 4096²) keeps foliage sharp.
 7. **Viewer must not treat the premultiplied textures as sRGB** (see §7).
+8. **Snapping must not cross the mesh**: a splat whose bin is the mesh's bin at
+   its centre pixel moves one bin farther (behind the mesh) or nearer (in
+   front). Otherwise splats kept just behind the mesh for disocclusions (often
+   SHARP's large, blurry fill) were snapped in front of it and smudged the
+   grass (34% of the remaining splats on `20260914_113455_56657`; input view
+   35.0 → 43.7 dB, 10 cm 30.8 → 32.1 dB vs hybrid 33.0).
+10. **Per-cell depth** (`REFINE=1`, default in `bake_mpi.py`): each cell's
+    corners take the alpha-weighted mean disparity of the bin's splats in the
+    neighbouring cells (shared corners, so a bin stays crack-free), instead of
+    the bin centre. Free at render time; +0.1 to +0.4 dB at 10–30 cm
+    (`20260914_113455_56657`: 32.1 / 27.2 → 32.4 / 27.6 dB at 10 / 30 cm).
+    **K-means bins** (`BINMODE=kmeans`, bins where the disparities are) did not
+    help: same quality as uniform + refine at 2.2× the overdraw (content split
+    over more layers).
+9. SHARP's own two layers are not a front/back pair (92% of same-index pairs
+   lie within 1% depth, each layer alone is porous), so two full-resolution
+   projective textured layers fail (17.8 dB at 10 cm alone, 19.7 with the mesh).
 
 Headset (`20200927_161631`, xrscale 1, foveation 0): hybrid 33 fps; per-tile
 patches 46–54 fps (varies with view direction → fill-bound, 71× overdraw); the

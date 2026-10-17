@@ -62,8 +62,45 @@
       width: 100%;
     }
 
-    #save-sbs {
-      /* display: none; */
+    /* Back-to-gallery button: top left, next to the fps counter. */
+    #gallery-btn {
+      position: fixed;
+      top: 10px;
+      left: 92px;
+      z-index: 1000;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      background: rgba(20, 22, 28, 0.55);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+      color: #f2f4f8;
+      font: 600 14px/1 'Segoe UI', system-ui, -apple-system, Arial, sans-serif;
+      letter-spacing: 0.02em;
+      text-decoration: none;
+      transition: background 0.15s, border-color 0.15s, transform 0.15s;
+    }
+    #gallery-btn svg {
+      width: 16px;
+      height: 16px;
+      fill: currentColor;
+      opacity: 0.9;
+    }
+    #gallery-btn:hover {
+      background: rgba(79, 140, 255, 0.85);
+      border-color: rgba(255, 255, 255, 0.4);
+      transform: translateY(-1px);
+    }
+    #gallery-btn:active {
+      transform: translateY(0);
+    }
+    #gallery-btn:focus-visible {
+      outline: 2px solid #4f8cff;
+      outline-offset: 2px;
     }
   </style>
   <script type="importmap">
@@ -80,7 +117,10 @@
 
 <body>
   <div id="container"></div>
-  <button id="save-sbs" style="position:fixed;top:20px;right:20px;z-index:10;">Save Side-by-Side Image</button>
+  <a id="gallery-btn" href="/list" title="Back to the scene gallery">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+    <span>Gallery</span>
+  </a>
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
@@ -468,52 +508,6 @@
     controls.enablePan = true;
     controls.update();
 
-
-    // --- Side-by-side save functionality ---
-    document.getElementById('save-sbs').onclick = async function () {
-      const sbsWidth = width * 2;
-      const sbsHeight = height;
-      const sbsCanvas = document.createElement('canvas');
-      sbsCanvas.width = sbsWidth;
-      sbsCanvas.height = sbsHeight;
-      console.log("A", width, height);
-      const sbsCtx = sbsCanvas.getContext('2d');
-
-      // Save original camera position
-      const origPos = camera.position.clone();
-      const origQuat = camera.quaternion.clone();
-
-      // Stereo offset
-      const eyeSep = 0.03;
-      const srcW = renderer.domElement.width;
-      const srcH = renderer.domElement.height;
-
-      // LEFT EYE
-      // camera.position.x = 10;
-      // camera.updateMatrixWorld();
-      // camera.lookAt(0, 0, -5);
-      renderer.render(scene, camera);
-      sbsCtx.drawImage(renderer.domElement, 0, 0, srcW, srcH, 0, 0, width, height);
-
-      // RIGHT EYE
-      // camera.position.x = origPos.x + eyeSep;
-      // camera.updateMatrixWorld();
-      // camera.lookAt(0, 0, -5);
-      // renderer.render(scene, camera);
-      // sbsCtx.drawImage(renderer.domElement, 0, 0, width, height, width, 0, width, height);
-
-      // Restore camera
-      camera.position.copy(origPos);
-      camera.quaternion.copy(origQuat);
-      camera.updateMatrixWorld();
-      renderer.render(scene, camera);
-
-      // Download
-      const link = document.createElement('a');
-      link.download = 'side_by_side.png';
-      link.href = sbsCanvas.toDataURL('image/png');
-      link.click();
-    }
 
     const target = controls.target;
     let initialDistance = camera.position.distanceTo(target);

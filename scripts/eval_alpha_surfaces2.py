@@ -19,7 +19,7 @@ Compositing is done in torch per pixel (samples sit exactly on pixel
 centres); with OPT=0 it matches v1's gsplat-based composite.
 
 Usage: python scripts/eval_alpha_surfaces2.py <scene>.ply [...]
-  env: SUFFIX, K, STEP, PEEL_TOL, MOVE, OPT (iterations, default 0), NTRAIN, LR, SMOOTH, NOSPLIT, EXPORT, EXPORT_DIR, EVAL
+  env: SUFFIX, K, STEP, PEEL_TOL, MOVE, OPT (iterations, default 0), NTRAIN, LR, SMOOTH, NOSPLIT, EXPORT, EXPORT_DIR, EVAL, SHARPLAYERS, NOMESH
 """
 import json
 import os
@@ -40,7 +40,9 @@ import eval_alpha_surfaces as s1  # noqa: E402
 from eval_alpha_layers import cast, dev, psnr, raster, splat_tensors  # noqa: E402
 
 GW, SS = ev.GW, ev.SS
-K = s1.K = int(os.environ.get("K", 4))
+SHARPLAYERS = bool(os.environ.get("SHARPLAYERS"))   # surfaces = SHARP's own two layers (not depth peeling)
+NOMESH = bool(os.environ.get("NOMESH"))             # all splats as surfaces, no hybrid mesh
+K = s1.K = 2 if SHARPLAYERS else int(os.environ.get("K", 4))
 STEP = int(os.environ.get("STEP", 2))
 MOVE = float(os.environ.get("MOVE", 0.3))
 OPT = int(os.environ.get("OPT", 0))
@@ -242,17 +244,33 @@ def run(scene: Path):
     Hg = int(round(GW * meta["height"] / meta["width"]))
     fg = meta["focal_length_px"] * GW / meta["width"]
     W, H, f = GW * SS, Hg * SS, fg * SS
-    full = splat_tensors(PlyData.read(scene)["vertex"].data, dev)
-    kv = PlyData.read(scene.with_name(scene.stem + SUFFIX + ".ply"))["vertex"].data
+    fv = PlyData.read(scene)["vertex"].data
+    full = splat_tensors(fv, dev)
+    kv = fv if NOMESH else PlyData.read(scene.with_name(scene.stem + SUFFIX + ".ply"))["vertex"].data
     kept = splat_tensors(kv, dev)
     z = np.asarray(kv["z"], np.float64)
     u, w = fg * kv["x"] / np.maximum(z, 1e-6) + GW / 2, fg * kv["y"] / np.maximum(z, 1e-6) + Hg / 2
     gap = 1.0 / (fg * MOVE)
-    layer = s1.peel_layers(kept, z, u * SS, w * SS, W, H, f)
+    if SHARPLAYERS:
+        # SHARP's own two layers: the .ply holds layer 0 for every output pixel, then layer 1. For a hybrid's
+        # subset, recover each splat's index by matching its position in the full file.
+        N = len(fv) // 2
+        if NOMESH:
+            idx = np.arange(len(fv))
+        else:
+            key = lambda d: np.ascontiguousarray(np.stack([d["x"], d["y"], d["z"]], -1).astype(np.float32)).view("V12").ravel()
+            lut = {k.tobytes(): i for i, k in enumerate(key(fv))}
+            idx = np.array([lut[k.tobytes()] for k in key(kv)])
+        layer = (idx >= N).astype(int)
+    else:
+        layer = s1.peel_layers(kept, z, u * SS, w * SS, W, H, f)
     zero = (0.0, 0.0, 0.0)
 
-    mesh = trimesh.load(scene.with_name(scene.stem + SUFFIX + ".glb")).to_geometry()
-    Tm = torch.tensor(mesh.vertices, device=dev, dtype=torch.float32)[torch.tensor(mesh.faces, device=dev)]
+    if NOMESH:                                  # no hybrid mesh: one triangle behind the camera (never hit)
+        Tm = torch.tensor([[[0.0, 0.0, -10.0], [1.0, 0.0, -10.0], [0.0, 1.0, -10.0]]], device=dev)
+    else:
+        mesh = trimesh.load(scene.with_name(scene.stem + SUFFIX + ".glb")).to_geometry()
+        Tm = torch.tensor(mesh.vertices, device=dev, dtype=torch.float32)[torch.tensor(mesh.faces, device=dev)]
     rgbM, aM = raster([full], zero, W, H, f)
     M = s1.TriMesh(Tm, torch.cat([rgbM, aM[..., None]], -1), W, H, 0, f, W, H)
 
@@ -293,7 +311,7 @@ def run(scene: Path):
         for name, eye in eyes.items():
             R, _ = raster([full], eye, W, H, f)
             ms = M.samples(eye, W, H, f, opaque=True)
-            Hy, _ = raster([kept, ms], eye, W, H, f)
+            Hy = R if NOMESH else raster([kept, ms], eye, W, H, f)[0]
             mrgb, per = prep_view(surfs, M, eye, W, H, f)
             with torch.no_grad():
                 S = composite(texs, mrgb, per, W * H).reshape(H, W, 3)
@@ -302,7 +320,7 @@ def run(scene: Path):
                 OUT.mkdir(parents=True, exist_ok=True)
                 row = torch.cat([R, Hy, S], 1).clamp(0, 1)
                 Image.fromarray((row.cpu().numpy() * 255).astype(np.uint8)).resize((3 * GW, Hg)).save(
-                    OUT / f"{scene.stem}{SUFFIX}_{tag}_{name}.jpg", quality=92)
+                    OUT / f"{scene.stem}{SUFFIX}{'_sharp2' if SHARPLAYERS else ''}{'_nomesh' if NOMESH else ''}_{tag}_{name}.jpg", quality=92)
             del per, ms
             torch.cuda.empty_cache()
         return res

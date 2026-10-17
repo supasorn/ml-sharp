@@ -15,7 +15,7 @@ reported: exact per-pixel depth order.
 
 Usage: python scripts/eval_alpha_patches.py <scene>.ply [...]
   env: SUFFIX (hybrid bake), TILE, PX, MOVE, FITFLAT (default 1), EXPORT (=_patches writes
-  <scene>_patches.glb), EXPORT_DIR, TEXDS, TEXFULL_THR, MAXPAGES, BINS, MPI, EXTEND, EVAL, DEBUG0, FLAT
+  <scene>_patches.glb), EXPORT_DIR, TEXDS, TEXFULL_THR, MAXPAGES, BINS, MPI, BINMODE, REFINE, EXTEND, EVAL, DEBUG0, FLAT
 """
 import json
 import os
@@ -49,6 +49,8 @@ TEXFULL_THR = float(os.environ.get("TEXFULL_THR", 0.003))   # MPI export: cells 
 MAXPAGES = int(os.environ.get("MAXPAGES", 4))              # ... within this many 4096^2 atlas pages
 BINS = int(os.environ.get("BINS", 0))
 MPI = bool(os.environ.get("MPI"))
+BINMODE = os.environ.get("BINMODE", "uniform")   # MPI bins: uniform in disparity, or kmeans (where the content is)
+REFINE = bool(os.environ.get("REFINE"))          # MPI: per-cell depth (shared corners) instead of the bin's centre
 EXTEND = int(os.environ.get("EXTEND", 0))
 BG = float(os.environ.get("BG", 0))           # eval: background grey level shown through gaps (viewer: page/passthrough)     # MPI: px each layer is continued underneath opaque content in front             # with BINS: sparse MPI (one joint render per bin, cut into cells)         # >0: patches on this many global depth bins instead of per-tile fits       # export texture downsampling      # fronto-parallel patches only (no tilted planes)
 MARGIN = s1.MARGIN
@@ -172,11 +174,40 @@ def run(scene: Path):
         # no gaps when moving); bins are disjoint in depth, drawn back to front.
         d = 1 / z
         lo, hi = np.percentile(d, [0.1, 99.9])
-        b = np.clip(((d - lo) / (hi - lo) * BINS).astype(int), 0, BINS - 1)
+        if BINMODE == "kmeans":
+            # Bins where the content is: 1-D k-means (Lloyd) of the splats' disparities, i.e. least squared
+            # snapping parallax over all splats, instead of equal widths over the whole range.
+            dc = np.clip(d, lo, hi)
+            centers = np.quantile(dc, (np.arange(BINS) + 0.5) / BINS)
+            for _ in range(40):
+                edges = (centers[1:] + centers[:-1]) / 2
+                lab = np.searchsorted(edges, dc)
+                sums, cnt = np.bincount(lab, dc, BINS), np.bincount(lab, minlength=BINS)
+                centers = np.where(cnt > 0, sums / np.maximum(cnt, 1), centers)
+                centers = np.maximum.accumulate(centers)
+            edges = (centers[1:] + centers[:-1]) / 2
+        else:
+            edges = lo + np.arange(1, BINS) / BINS * (hi - lo)
+            centers = lo + (np.arange(BINS) + 0.5) / BINS * (hi - lo)
+        binof = lambda x: np.searchsorted(edges, x)
+        b = binof(d)
+        # Snapping a splat to its bin's centre depth must not move it across the mesh (at its centre pixel):
+        # splats just behind the mesh (kept for disocclusions; the depth test hides them in the hybrid)
+        # would otherwise be drawn over it, e.g. SHARP's blurry fill behind grass smudging the grass.
+        _, mdep0 = s2.mesh_layer(M, (0.0, 0.0, 0.0), W, H, f)
+        mdisp0 = (1 / mdep0).reshape(H, W).cpu().numpy()                  # 0 where no mesh
+        ci = np.clip(np.round(u * SS - 0.5).astype(int), 0, W - 1)
+        ri = np.clip(np.round(w * SS - 0.5).astype(int), 0, H - 1)
+        inside_f = (u * SS >= 0) & (u * SS < W) & (w * SS >= 0) & (w * SS < H)
+        md = np.where(inside_f, mdisp0[ri, ci], 0)
+        mb = binof(md)
+        same = (md > 0) & (b == mb)
+        b = np.where(same & (d < md), b - 1, np.where(same & (d >= md), b + 1, b)).clip(0, BINS - 1)
+        print(f"  {same.mean():.1%} of splats moved one bin to stay on their side of the mesh", flush=True)
         cell = TILE * SS
         ny, nx = -(-Hc // cell), -(-Wc // cell)
         b_t = torch.tensor(b, device=dev)
-        crops, crops_b, rect_l, cen_l = [], [], [], []
+        crops, crops_b, rect_l, cen_l, cd_l = [], [], [], [], []
         gb = 2 * TEXDS                                     # border (render px) of real neighbour texels, export only
         cb = cell + 2 * gb
         # Layer extension (EXTEND render px): each bin's content is continued, opaque, underneath what is
@@ -207,10 +238,10 @@ def run(scene: Path):
                 continue
             sub = {kk: v[m] for kk, v in kept.items()}
             out, alpha, _ = ev.gs.rendering.rasterization(**sub, viewmats=torch.eye(4, device=dev)[None], Ks=Kc,
-                                                          width=Wc, height=Hc, eps2d=ev.EPS)
-            rgb, a = out[0], alpha[0, ..., 0]
+                                                          width=Wc, height=Hc, eps2d=ev.EPS, render_mode="RGB+D")
+            rgb, a, dacc = out[0, ..., :3], alpha[0, ..., 0], out[0, ..., 3]
             if EXTEND:
-                dk = lo + (k + 0.5) / BINS * (hi - lo)
+                dk = centers[k]
                 hidden = ((Tfront < 0.02) | (mdisp > dk * 1.01)) & (Tback.pop(k).float() > 0.5 * 255)
                 filled = a > 0.5
                 col = torch.where(filled[..., None], rgb / a.clamp(min=1e-3)[..., None], 0)
@@ -238,18 +269,36 @@ def run(scene: Path):
                 crops_b.append(sel.half().reshape(-1, 4))
             cyn, cxn = cy.cpu().numpy(), cx.cpu().numpy()
             rect_l.append(np.stack([cxn * cell, cyn * cell, (cxn + 1) * cell, (cyn + 1) * cell], 1))
-            cen_l.append(np.full(len(cyn), lo + (k + 0.5) / BINS * (hi - lo)))
+            cen_l.append(np.full(len(cyn), centers[k]))
+            if REFINE:
+                # Per-cell depth: alpha-weighted mean disparity of this bin's splats in the cell; corners shared
+                # by neighbouring cells take the mean of those cells, so the bin stays one crack-free surface.
+                pd = torch.where(a > 1e-3, a / dacc.clamp(min=1e-6), 0)
+                pad_ = lambda t: torch.nn.functional.pad(t, (0, nx * cell - Wc, 0, ny * cell - Hc))
+                aw = pad_(a).reshape(ny, cell, nx, cell).sum((1, 3))
+                dw = pad_(a * pd).reshape(ny, cell, nx, cell).sum((1, 3))
+                dcell = torch.where(occ, dw / aw.clamp(min=1e-9), 0).double()
+                o = occ.double()
+                G = torch.zeros(ny + 1, nx + 1, device=dev, dtype=torch.float64); Gn = torch.zeros_like(G)
+                for oy in (0, 1):
+                    for ox in (0, 1):
+                        G[oy:oy + ny, ox:ox + nx] += dcell * o; Gn[oy:oy + ny, ox:ox + nx] += o
+                G = (G / Gn.clamp(min=1)).cpu().numpy()
+                cd_l.append(np.stack([G[cyn, cxn], G[cyn, cxn + 1], G[cyn + 1, cxn], G[cyn + 1, cxn + 1]], 1))
+            else:
+                cd_l.append(np.full((len(cyn), 4), centers[k]))
         rects = np.concatenate(rect_l).astype(np.int64)
         cen = np.concatenate(cen_l)
         planes = np.stack([np.zeros_like(cen), np.zeros_like(cen), cen], 1)
+        cdisp = np.concatenate(cd_l)                      # corner disparities (x0y0, x1y0, x0y1, x1y1) per cell
         P = len(rects)
         area = np.full(P, cell * cell, np.int64)
         off = np.r_[0, np.cumsum(area)[:-1]]
         atlas = torch.cat(crops)
         border = (torch.cat(crops_b), gb) if EXPORT else None
         del crops, crops_b
-        print(f"{scene.stem}{SUFFIX}: {len(kv)} splats -> sparse MPI, {BINS} bins (max snap "
-              f"{(hi - lo) / BINS / 2:.4f} 1/m), {P} cells of {TILE} px ({2 * P} tris), "
+        print(f"{scene.stem}{SUFFIX}: {len(kv)} splats -> sparse MPI, {BINS} {BINMODE} bins (max snap "
+              f"{np.diff(np.r_[lo, edges, hi]).max() / 2:.4f} 1/m{', refined cells' if REFINE else ''}), {P} cells of {TILE} px ({2 * P} tris), "
               f"overdraw {area.sum() / (W * H):.1f}x, {time.time() - t0:.0f}s", flush=True)
     else:
         if BINS:
@@ -295,6 +344,9 @@ def run(scene: Path):
     dmin = torch.tensor(1 / z.max() / 2, device=dev, dtype=torch.float32)
     dc = (a_[:, None] * cu + b_[:, None] * cv + c_[:, None]).clamp(min=dmin)
     corners = torch.stack([(cu - GW / 2) / fg, (cv - Hg / 2) / fg, torch.ones_like(cu)], -1) / dc[..., None]
+    if MPI:   # per-cell corner disparities: each cell is two triangles (diagonal x0y0-x1y1, as exported)
+        cdt = torch.tensor(cdisp, device=dev, dtype=torch.float32).clamp(min=dmin)
+        corners = torch.stack([(cu - GW / 2) / fg, (cv - Hg / 2) / fg, torch.ones_like(cu)], -1) / cdt[..., None]
     centre = corners.mean(1)
     rx0, ry0, rw, rh = R_[:, 0], R_[:, 1], R_[:, 2] - R_[:, 0], R_[:, 3] - R_[:, 1]
     off_t, rw_i = torch.tensor(off, device=dev), (R_[:, 2] - R_[:, 0]).long()
@@ -303,9 +355,24 @@ def run(scene: Path):
         lx, ly = ui + MARGIN - 0.5 - rx0[prim], vi + MARGIN - 0.5 - ry0[prim]
         return (lx >= -0.5) & (lx < rw[prim] - 0.5) & (ly >= -0.5) & (ly < rh[prim] - 0.5)
 
+    if MPI:
+        tri = torch.stack([corners[:, [0, 1, 3]], corners[:, [0, 3, 2]]], 1).reshape(-1, 3, 3)   # prim = 2*cell + half
+        geomN, geomC = torch.linalg.solve(tri, torch.ones(len(tri), 3, device=dev)), tri
+        to_cell = lambda prim: prim // 2
+
+        def geom_inside(prim, ui, vi):
+            c = prim // 2
+            lx, ly = ui + MARGIN - rx0[c], vi + MARGIN - ry0[c]                # from the rect's corner (px)
+            sx, ty = lx / rw[c], ly / rh[c]
+            upper = ty <= sx                                                   # triangle (x0y0, x1y0, x1y1)
+            return inside(c, ui, vi) & torch.where(prim % 2 == 0, upper, ~upper)
+    else:
+        geomN, geomC, geom_inside, to_cell = nP, corners, inside, (lambda prim: prim)
+
     def patch_samples(eye):
         V, PIX, T, PR = [], [], [], []
-        for prim, pix, p, ui, vi, t in cast(nP, corners, inside, eye, W, H, f):
+        for prim, pix, p, ui, vi, t in cast(geomN, geomC, geom_inside, eye, W, H, f):
+            prim = to_cell(prim)
             lx = (ui + MARGIN - 0.5 - rx0[prim]).clamp(0, None)
             ly = (vi + MARGIN - 0.5 - ry0[prim]).clamp(0, None)
             wi, hi = rw_i[prim], rh[prim].long()
@@ -357,7 +424,8 @@ def run(scene: Path):
             (2 * GW, Hg)).save(OUT / "debug0.jpg")
         return
     if EXPORT:
-        export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, border=border if MPI else None)
+        export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, border=border if MPI else None,
+                   cdisp=cdisp if MPI else None)
         if not EVAL:
             return
 
@@ -386,14 +454,14 @@ def run(scene: Path):
             OUT.mkdir(parents=True, exist_ok=True)
             row = torch.cat([R, Hy, so], 1).clamp(0, 1)
             Image.fromarray((row.cpu().numpy() * 255).astype(np.uint8)).resize((3 * GW, Hg)).save(
-                OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}_e{EXTEND}_bg{BG}_{name}.jpg", quality=92)
+                OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_e{EXTEND}_bg{BG}_{name}.jpg", quality=92)
         del vals, pix, t, prim, ms
         torch.cuda.empty_cache()
-    (OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}.json").write_text(json.dumps(
+    (OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}.json").write_text(json.dumps(
         {"patches": P, "overdraw": float(area.sum() / (W * H)), "psnr": res}, indent=1))
 
 
-def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096, border=None):
+def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096, border=None, cdisp=None):
     """Patches as quads in one mesh per atlas page (premultiplied RGBA PNGs), back to front as seen from the
     input view (static order; fine for small head moves): pages hold consecutive runs of the far-to-near
     order and each page's triangles follow it, while texels are placed by height (shelf packing). Textures
@@ -445,9 +513,17 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         if not m.any():
             continue
         if border is not None:
-            texs[i] = atb[i] if full[i] else down(atb[i])
-            pad[i] = gb if full[i] else gb // ds
-            geo[i] = (x0, y0, x1, y1)
+            # Shrink the quad to the texels with alpha (the rest is fill the GPU would blend for nothing),
+            # keeping `g` texels of real data around it for filtering, so the result is unchanged.
+            tb = atb[i] if full[i] else down(atb[i])
+            g, sp = (gb, 1) if full[i] else (gb // ds, ds)               # border texels, render px per texel
+            inner = tb[g:tb.shape[0] - g, g:tb.shape[1] - g, 3] >= 0.5 / 255
+            if not inner.any():
+                continue
+            ys, xs = np.nonzero(inner.any(1))[0], np.nonzero(inner.any(0))[0]
+            texs[i] = tb[ys[0]:ys[-1] + 1 + 2 * g, xs[0]:xs[-1] + 1 + 2 * g]
+            pad[i] = g
+            geo[i] = (x0 + xs[0] * sp, y0 + ys[0] * sp, x0 + (xs[-1] + 1) * sp, y0 + (ys[-1] + 1) * sp)
             continue
         ys, xs = np.nonzero(m.any(1))[0], np.nonzero(m.any(0))[0]
         texs[i] = np.pad(t[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1], ((1, 1), (1, 1), (0, 0)), mode="edge")
@@ -489,8 +565,16 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         r = np.array([geo[i] for i in ids], np.float64)
         cu = (np.stack([r[:, 0], r[:, 2], r[:, 2], r[:, 0]], 1) - MARGIN) / SS
         cv = (np.stack([r[:, 1], r[:, 1], r[:, 3], r[:, 3]], 1) - MARGIN) / SS
-        plq = planes[ids]
-        d = np.maximum(plq[:, :1] * cu + plq[:, 1:2] * cv + plq[:, 2:3], 1e-3)
+        if cdisp is None:
+            plq = planes[ids]
+            d = np.maximum(plq[:, :1] * cu + plq[:, 1:2] * cv + plq[:, 2:3], 1e-3)
+        else:   # corner disparities of the full cell, on its two triangles (diagonal x0y0-x1y1)
+            fr = rects[ids].astype(np.float64)
+            sx = (np.stack([r[:, 0], r[:, 2], r[:, 2], r[:, 0]], 1) - fr[:, :1]) / (fr[:, 2:3] - fr[:, :1])
+            ty = (np.stack([r[:, 1], r[:, 1], r[:, 3], r[:, 3]], 1) - fr[:, 1:2]) / (fr[:, 3:4] - fr[:, 1:2])
+            c00, c10, c01, c11 = (cdisp[ids, j][:, None] for j in range(4))
+            d = np.where(ty <= sx, c00 + sx * (c10 - c00) + ty * (c11 - c10), c00 + ty * (c01 - c00) + sx * (c11 - c01))
+            d = np.maximum(d, 1e-3)
         V = np.stack([(cu - GW / 2) / fg, (cv - Hg / 2) / fg, np.ones_like(cu)], -1) / d[..., None]
         px = np.array([pl[i][0] for i in ids]); py = np.array([pl[i][1] for i in ids])
         tw = np.array([texs[i].shape[1] - 2 * pad[i] for i in ids]); th = np.array([texs[i].shape[0] - 2 * pad[i] for i in ids])
@@ -505,6 +589,8 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
             vertices=V.reshape(-1, 3).astype(np.float32), faces=faces, process=False, visual=vis)
     path = (Path(EXPORT_DIR) if EXPORT_DIR else scene.parent) / f"{scene.stem}{EXPORT}.glb"
     trimesh.Scene(meshes).export(path)
+    quad_px = sum((geo[i][2] - geo[i][0]) * (geo[i][3] - geo[i][1]) for i in texs)
+    print(f"  quads cover {quad_px / (GW * SS * Hg * SS):.1f}x the frame (fill before blending/depth test)", flush=True)
     print(f"  wrote {path} ({path.stat().st_size / 2**20:.0f} MB, {len(pages)} atlas pages of {page}^2, "
           f"{len(texs)} patches, {texels / 1e6:.0f}M texels = {texels / (len(pages) * page * page):.0%} of the pages)",
           flush=True)

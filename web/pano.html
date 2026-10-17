@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>360 Splat Viewer</title>
+  <style>
+    :root {
+      --panel-bg: rgba(16, 18, 24, 0.78);
+      --panel-fg: #e8eaf0;
+      --muted: #9aa3b2;
+      --accent: #4f8cff;
+    }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: var(--panel-fg);
+      font: 13px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; }
+    canvas { display: block; touch-action: none; cursor: grab; }
+    canvas.dragging { cursor: grabbing; }
+    #panel { position: fixed; top: 12px; left: 12px; background: var(--panel-bg); padding: 10px 12px;
+      border-radius: 10px; max-width: min(360px, calc(100vw - 48px)); backdrop-filter: blur(6px); }
+    #panel select { width: 100%; margin: 2px 0 8px; background: #222631; color: var(--panel-fg);
+      border: 1px solid #3a4152; border-radius: 6px; padding: 4px; }
+    #panel label { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+    #panel input[type=range] { flex: 1; accent-color: var(--accent); }
+    #status { color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+    #help { color: var(--muted); margin-top: 8px; border-top: 1px solid #333a48; padding-top: 6px; }
+    #help b { color: var(--panel-fg); font-weight: 600; }
+    #toggle { position: absolute; top: 6px; right: 8px; background: none; border: 0; color: var(--muted);
+      cursor: pointer; font-size: 14px; }
+    #panel.collapsed > :not(#toggle):not(#title) { display: none; }
+    #title { font-weight: 600; margin-bottom: 4px; padding-right: 20px; }
+    .modes { display: flex; gap: 6px; margin-bottom: 8px; }
+    .modes button, button.small { background: #222631; color: var(--panel-fg); border: 1px solid #3a4152;
+      border-radius: 6px; padding: 3px 8px; cursor: pointer; }
+    .modes button { flex: 1; }
+    .modes button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .modes button:disabled { opacity: 0.4; cursor: default; }
+    #xr-buttons { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; }
+    #xr-buttons button { position: static !important; transform: none !important; left: auto !important;
+      bottom: auto !important; width: auto !important; padding: 12px 20px !important; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="panel">
+    <button id="toggle" title="Collapse">–</button>
+    <div id="title">360 splats</div>
+    <select id="scene"></select>
+    <div class="modes">
+      <button id="mode-msi" title="Multi-sphere image (compressed textures)">MSI</button>
+      <button id="mode-splats" title="Original Gaussian splats">Splats</button>
+    </div>
+    <label>Move limit <input id="maxMove" type="range" min="0.1" max="2" step="0.05" value="0.5"><span id="maxMoveV"></span></label>
+    <label>FOV <input id="fov" type="range" min="30" max="110" step="1" value="75"><span id="fovV"></span></label>
+    <label><input id="wiggle" type="checkbox"> Wiggle (auto parallax)</label>
+    <button class="small" id="reset">Reset position (R)</button>
+    <div id="status">…</div>
+    <div id="help">
+      <b>Drag</b> look around · <b>WASD / arrows</b> move · <b>Q / E</b> down / up<br>
+      <b>Right-drag / Shift-drag</b> slide sideways &amp; up · <b>Wheel</b> zoom<br>
+      Touch: <b>1 finger</b> look · <b>2 fingers</b> slide · <b>pinch</b> zoom<br>
+      XR: <b>trigger</b> re-centre · <b>stick ←/→</b> turn · <b>A / B</b> next / previous scene
+    </div>
+  </div>
+  <div id="xr-buttons"></div>
+  <script type="module">
+    import * as THREE from "three";
+    import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+    import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
+    import { ARButton } from "three/addons/webxr/ARButton.js";
+    import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+    const $ = (id) => document.getElementById(id);
+    const params = new URLSearchParams(location.search);
+    let mode = params.get("mode") === "splats" ? "splats" : "msi";
+
+    const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.01, 5000);
+    camera.rotation.order = "YXZ";
+    // Radial sort: rotating in place never changes the order, only moving does.
+    const spark = new SparkRenderer({ renderer, view: { sortRadial: true } });
+    scene.add(spark);
+    // Everything that moves with re-centring / turning in XR (desktop: stays at the origin).
+    const content = new THREE.Group();
+    scene.add(content);
+
+    // ---- WebXR (Quest 3). MSI anti-aliasing setup from docs/quest-xr-findings.md §4b.14: eye buffer 1.4x
+    // (?xrscale), no foveation, trilinear mips with LOD bias -0.5 (?lodbias). Splats: 1.0 (splat-count bound).
+    // The eye-buffer scale is fixed per session; it's set when the session starts, from the current mode.
+    renderer.xr.enabled = true;
+    renderer.xr.setReferenceSpaceType("local");
+    renderer.xr.setFoveation(parseFloat(params.get("foveation") ?? "0"));
+    const xrScaleFor = (m) => parseFloat(params.get("xrscale") ?? (m === "msi" ? "1.4" : "1"));
+    const lodBias = parseFloat(params.get("lodbias") ?? "-0.5");
+    // Stock ARButton (dom-overlay): a custom request made the Quest switch to its roomscale boundary.
+    const arButton = ARButton.createButton(renderer);
+    const vrButton = document.createElement("button");
+    vrButton.textContent = "ENTER VR";
+    vrButton.style.cssText = "padding:12px 20px;border:1px solid #fff;border-radius:4px;background:rgba(0,0,0,0.1);" +
+      "color:#fff;font:normal 13px sans-serif;cursor:pointer;opacity:0.5;display:none";
+    navigator.xr?.isSessionSupported("immersive-vr").then((ok) => { if (ok) vrButton.style.display = ""; });
+    vrButton.addEventListener("click", async () => {
+      if (renderer.xr.isPresenting) { renderer.xr.getSession().end(); return; }
+      const session = await navigator.xr.requestSession("immersive-vr", { optionalFeatures: ["local"] });
+      renderer.xr.setFramebufferScaleFactor(xrScaleFor(mode));
+      await renderer.xr.setSession(session);
+      vrButton.textContent = "EXIT VR";
+      session.addEventListener("end", () => { vrButton.textContent = "ENTER VR"; });
+    });
+    // ARButton requests its own session: set the scale just before (on press).
+    arButton.addEventListener("click", () => {
+      if (!renderer.xr.isPresenting) renderer.xr.setFramebufferScaleFactor(xrScaleFor(mode));
+    }, { capture: true });
+    $("xr-buttons").append(arButton, vrButton);
+
+    // ---- desktop view state: look direction + small offset from the capture point
+    // ?yaw=&pitch= (degrees, yaw > 0 turns left), ?fov=, ?pos=x,y,z (metres, three.js axes): initial view.
+    const state = {
+      yaw: THREE.MathUtils.degToRad(parseFloat(params.get("yaw") ?? "0")),
+      pitch: THREE.MathUtils.degToRad(parseFloat(params.get("pitch") ?? "0")),
+      pos: new THREE.Vector3(...(params.get("pos") ?? "0,0,0").split(",").map(Number)),
+      fov: parseFloat(params.get("fov") ?? "75"),
+      maxMove: 0.5,
+    };
+    // For scripted captures (scripts/pano_eval_viewer.py): set the view (degrees, metres) without reloading.
+    window.panoSetView = (yaw, pitch, fov, x, y, z) => {
+      state.yaw = THREE.MathUtils.degToRad(yaw);
+      state.pitch = THREE.MathUtils.degToRad(pitch);
+      state.fov = fov;
+      state.pos.set(x, y, z);
+      state.maxMove = Math.max(state.maxMove, state.pos.length());
+    };
+    function clampPos() {
+      const r = state.pos.length();
+      if (r > state.maxMove) state.pos.multiplyScalar(state.maxMove / r);
+    }
+    function applyCamera(extra) {
+      camera.rotation.set(state.pitch, state.yaw, 0);
+      camera.position.copy(state.pos);
+      if (extra) camera.position.add(extra);
+      if (camera.fov !== state.fov) { camera.fov = state.fov; camera.updateProjectionMatrix(); }
+    }
+    function axes() {
+      const fwd = new THREE.Vector3(-Math.sin(state.yaw), 0, -Math.cos(state.yaw));
+      const right = new THREE.Vector3(Math.cos(state.yaw), 0, -Math.sin(state.yaw));
+      return { fwd, right, up: new THREE.Vector3(0, 1, 0) };
+    }
+
+    // ---- pointer: drag = look, right/shift drag or 2 fingers = slide, wheel/pinch = zoom
+    const el = renderer.domElement;
+    el.addEventListener("contextmenu", (e) => e.preventDefault());
+    const pointers = new Map();
+    let pinch = null;
+    el.addEventListener("pointerdown", (e) => {
+      el.setPointerCapture(e.pointerId);
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, slide: e.button === 2 || e.shiftKey });
+      el.classList.add("dragging");
+      if (pointers.size === 2) pinch = null;
+    });
+    const endPointer = (e) => {
+      pointers.delete(e.pointerId);
+      if (!pointers.size) el.classList.remove("dragging");
+      pinch = null;
+    };
+    el.addEventListener("pointerup", endPointer);
+    el.addEventListener("pointercancel", endPointer);
+    el.addEventListener("pointermove", (e) => {
+      const p = pointers.get(e.pointerId);
+      if (!p) return;
+      const dx = e.clientX - p.x, dy = e.clientY - p.y;
+      p.x = e.clientX; p.y = e.clientY;
+      if (pointers.size === 2) {
+        const [a, b] = [...pointers.values()];
+        const d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (pinch) state.fov = THREE.MathUtils.clamp(state.fov * pinch / d, 30, 110);
+        pinch = d;
+        slide(dx / 2, dy / 2);
+        return;
+      }
+      if (p.slide) { slide(dx, dy); return; }
+      // Grab-the-world look: rad per px scales with the vertical FOV.
+      const k = THREE.MathUtils.degToRad(state.fov) / innerHeight;
+      state.yaw += dx * k;
+      state.pitch = THREE.MathUtils.clamp(state.pitch + dy * k, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
+    });
+    function slide(dx, dy) {
+      const { right, up } = axes();
+      state.pos.addScaledVector(right, -dx * 0.002).addScaledVector(up, dy * 0.002);
+      clampPos();
+    }
+    el.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      state.fov = THREE.MathUtils.clamp(state.fov * Math.exp(e.deltaY * 0.001), 30, 110);
+    }, { passive: false });
+
+    const keys = new Set();
+    addEventListener("keydown", (e) => {
+      if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+      keys.add(e.code);
+      if (e.code === "KeyR") resetPos();
+    });
+    addEventListener("keyup", (e) => keys.delete(e.code));
+    addEventListener("blur", () => keys.clear());
+    function resetPos() { state.pos.set(0, 0, 0); }
+
+    // ---- UI
+    const sync = () => {
+      $("maxMoveV").textContent = state.maxMove.toFixed(2) + " m";
+      $("fovV").textContent = Math.round(state.fov) + "°";
+      $("fov").value = state.fov;
+    };
+    $("maxMove").addEventListener("input", (e) => { state.maxMove = +e.target.value; clampPos(); });
+    $("fov").addEventListener("input", (e) => { state.fov = +e.target.value; });
+    $("reset").addEventListener("click", resetPos);
+    $("toggle").addEventListener("click", () => {
+      const c = $("panel").classList.toggle("collapsed");
+      $("toggle").textContent = c ? "+" : "–";
+    });
+
+    // ---- loading
+    let ktx2Loader = null;
+    function gltfLoader() {
+      ktx2Loader ??= new KTX2Loader()
+        .setTranscoderPath("https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/libs/basis/")
+        .detectSupport(renderer);
+      return new GLTFLoader().setKTX2Loader(ktx2Loader);
+    }
+
+    // MSI pages (scripts/pano_msi.py): premultiplied display-space RGBA sampled raw (no sRGB decode, which
+    // would brighten soft edges), blended (1, 1 - srcAlpha), larger surface_<k> first. KTX2 files carry 3
+    // box mip levels: trilinear + LOD bias (Quest shrinks the cells; the bias keeps them sharp).
+    function msiMaterial(map) {
+      const hasMips = !!(map.mipmaps && map.mipmaps.length > 1);
+      map.colorSpace = THREE.NoColorSpace;
+      map.generateMipmaps = false;
+      map.minFilter = hasMips ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+      map.needsUpdate = true;
+      return new THREE.ShaderMaterial({
+        uniforms: { map: { value: map }, lodBias: { value: hasMips ? lodBias : 0.0 } },
+        vertexShader: "varying vec2 vUv; void main() { vUv = uv; " +
+                      "gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+        fragmentShader: "uniform sampler2D map; uniform float lodBias; varying vec2 vUv; " +
+                        "void main() { gl_FragColor = texture2D(map, vUv, lodBias); }",
+        side: THREE.DoubleSide, transparent: true, depthWrite: false, depthTest: false,
+        blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+        blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+      });
+    }
+
+    async function loadMsi(url) {
+      const gltf = await gltfLoader().loadAsync(url);
+      let tris = 0, pages = 0;
+      gltf.scene.traverse((child) => {
+        if (!child.isMesh) return;
+        const k = /surface_(\d+)/.exec(child.name + " " + (child.parent?.name ?? ""));
+        const map = child.material.map;
+        child.material.dispose();
+        child.material = msiMaterial(map);
+        child.renderOrder = -Number(k ? k[1] : 0);   // larger k (farther) first
+        child.frustumCulled = false;
+        tris += child.geometry.index ? child.geometry.index.count / 3 : 0;
+        pages++;
+      });
+      return { obj: gltf.scene, label: `${(tris / 2 / 1e3).toFixed(0)}k cells · ${pages} pages` };
+    }
+
+    async function loadSplats(url) {
+      const m = new SplatMesh({ url });
+      await m.initialized;
+      return { obj: m, label: `${((m.numSplats ?? 0) / 1e6).toFixed(2)}M splats` };
+    }
+
+    let current = null, loadToken = 0, scenes = [], sceneIdx = 0;
+    function updateModeButtons() {
+      const s = scenes[sceneIdx];
+      $("mode-msi").disabled = !s?.msi && !s?.msiPng;
+      $("mode-splats").disabled = !s?.spz;
+      $("mode-msi").classList.toggle("on", mode === "msi");
+      $("mode-splats").classList.toggle("on", mode === "splats");
+    }
+    async function load() {
+      const s = scenes[sceneIdx];
+      if (!s) return;
+      if (mode === "msi" && !s.msi && !s.msiPng) mode = "splats";
+      if (mode === "splats" && !s.spz) mode = "msi";
+      updateModeButtons();
+      $("scene").value = s.id;
+      const token = ++loadToken;
+      const url = mode === "msi" ? (params.get("tex") === "png" ? s.msiPng : s.msi) || s.msiPng || s.msi : s.spz;
+      if (current) { content.remove(current); current.traverse?.((o) => o.material?.dispose?.()); current = null; }
+      $("status").dataset.base = "";
+      $("status").textContent = `Loading ${s.name} (${mode})…`;
+      const t0 = performance.now();
+      let res;
+      try {
+        res = mode === "msi" ? await loadMsi(url) : await loadSplats(url);
+      } catch (err) {
+        if (token === loadToken) $("status").textContent = `Failed to load ${url}: ${err}`;
+        return;
+      }
+      if (token !== loadToken) return;
+      res.obj.quaternion.set(1, 0, 0, 0);   // OpenCV (y down, z forward) -> three.js
+      content.add(res.obj);
+      current = res.obj;
+      $("status").dataset.base = `${mode.toUpperCase()} · ${res.label} · ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+      const u = new URL(location);
+      u.searchParams.set("scene", s.id);
+      u.searchParams.set("mode", mode);
+      history.replaceState(null, "", u);
+    }
+
+    scenes = await (await fetch("/scenes")).json();
+    for (const s of scenes) {
+      const o = document.createElement("option");
+      o.value = s.id;
+      const what = [s.msi || s.msiPng ? `MSI ${s.msiMB ?? "?"} MB` : null, s.spz ? `splats ${s.spzMB} MB` : null]
+        .filter(Boolean).join(", ");
+      o.textContent = `${s.name} (${s.dir}${s.layout ? ", " + s.layout : ""}) · ${what}`;
+      $("scene").appendChild(o);
+    }
+    sceneIdx = Math.max(0, scenes.findIndex((s) => s.id === (params.get("scene") ?? "out_ico2/hotel_room")));
+    if (scenes.length) load(); else $("status").textContent = "No scenes under pano/.";
+    $("scene").addEventListener("change", (e) => { sceneIdx = scenes.findIndex((s) => s.id === e.target.value); load(); });
+    $("mode-msi").addEventListener("click", () => { mode = "msi"; load(); });
+    $("mode-splats").addEventListener("click", () => { mode = "splats"; load(); });
+
+    addEventListener("resize", () => {
+      renderer.setSize(innerWidth, innerHeight);
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+    });
+
+    // ---- XR controllers: trigger re-centres the scene on the head, stick left/right snap-turns 30°
+    // around the head, A / B next / previous scene.
+    const headPos = new THREE.Vector3();
+    function recentre() {
+      renderer.xr.getCamera().getWorldPosition(headPos);
+      content.position.copy(headPos);
+    }
+    function turn(angle) {
+      renderer.xr.getCamera().getWorldPosition(headPos);
+      const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+      content.position.sub(headPos).applyQuaternion(q).add(headPos);
+      content.quaternion.premultiply(q);
+    }
+    for (let i = 0; i < 2; i++) renderer.xr.getController(i).addEventListener("select", recentre);
+    const prevButtons = new Map();
+    let stickArmed = true;
+    function pollGamepads() {
+      const session = renderer.xr.getSession();
+      if (!session) return;
+      for (const src of session.inputSources) {
+        const gp = src.gamepad;
+        if (!gp) continue;
+        const prev = prevButtons.get(src) ?? [];
+        const pressed = (i) => gp.buttons[i]?.pressed && !prev[i];
+        if (src.handedness === "right" && pressed(4)) { sceneIdx = (sceneIdx + 1) % scenes.length; load(); }
+        if (src.handedness === "right" && pressed(5)) { sceneIdx = (sceneIdx + scenes.length - 1) % scenes.length; load(); }
+        prevButtons.set(src, gp.buttons.map((b) => b.pressed));
+        const x = gp.axes[2] ?? 0;
+        if (Math.abs(x) > 0.7 && stickArmed) { turn(x > 0 ? -Math.PI / 6 : Math.PI / 6); stickArmed = false; }
+        if (Math.abs(x) < 0.3 && src.handedness === "right") stickArmed = true;
+      }
+    }
+    renderer.xr.addEventListener("sessionstart", () => {
+      content.position.set(0, 0, 0);
+      content.quaternion.identity();
+      // The 'local' origin is the head pose at session start; re-centre once tracking has settled.
+      setTimeout(recentre, 500);
+    });
+    renderer.xr.addEventListener("sessionend", () => {
+      content.position.set(0, 0, 0);
+      content.quaternion.identity();
+    });
+
+    // ---- loop
+    let last = performance.now(), frames = 0, fpsT = last, fps = 0;
+    renderer.setAnimationLoop((now) => {
+      const dt = Math.min((now - last) / 1000, 0.1);
+      last = now;
+      if (renderer.xr.isPresenting) {
+        pollGamepads();
+      } else {
+        const { fwd, right, up } = axes();
+        const v = new THREE.Vector3();
+        if (keys.has("KeyW") || keys.has("ArrowUp")) v.add(fwd);
+        if (keys.has("KeyS") || keys.has("ArrowDown")) v.sub(fwd);
+        if (keys.has("KeyD") || keys.has("ArrowRight")) v.add(right);
+        if (keys.has("KeyA") || keys.has("ArrowLeft")) v.sub(right);
+        if (keys.has("KeyE")) v.add(up);
+        if (keys.has("KeyQ")) v.sub(up);
+        if (v.lengthSq()) { state.pos.addScaledVector(v.normalize(), 0.6 * dt); clampPos(); }
+        let wig = null;
+        if ($("wiggle").checked) {
+          const t = now / 1000, r = Math.min(0.15, state.maxMove);
+          wig = right.clone().multiplyScalar(r * Math.sin(t * 1.6)).addScaledVector(up, 0.4 * r * Math.sin(t * 3.2));
+        }
+        applyCamera(wig);
+      }
+      renderer.render(scene, camera);
+
+      frames++;
+      if (now - fpsT > 500) { fps = frames * 1000 / (now - fpsT); frames = 0; fpsT = now; }
+      const base = $("status").dataset.base;
+      if (base) {
+        const p = camera.position;
+        $("status").textContent = `${base} · ${fps.toFixed(0)} fps · pos ${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)} m`;
+      }
+      sync();
+    });
+  </script>
+</body>
+</html>

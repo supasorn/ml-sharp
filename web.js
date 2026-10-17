@@ -34,8 +34,9 @@ const PANO_DIR = path.join(__dirname, 'pano');
 const PANO_PREFIX = 'pano:';
 // MSI variants, best first: the viewer shows the first one a pano has (the others are selectable).
 const PANO_VARIANTS = [
-  { id: 'out_ico2_photo2', label: 'Photo detail' },
-  { id: 'out_ico2_photo3', label: 'Photo detail v3 (sharper, dark specks)' },
+  { id: 'out_ico2_photo4', label: 'Photo detail v4' },
+  { id: 'out_ico2_photo2', label: 'Photo detail v2' },
+  { id: 'out_ico2_photo3', label: 'Photo detail v3 (dark specks)' },
   { id: 'out_ico2_hires', label: 'High-res' },
   { id: 'out_ico2', label: 'Standard' },
 ];

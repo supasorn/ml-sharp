@@ -70,7 +70,7 @@ def cube_lookup(dirs: torch.Tensor):
 
 @torch.no_grad()
 def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centres, edge_jump, edge_px,
-                 edge_darken):
+                 edge_darken, alpha_thr=None, erode_px=2, surface_band=0.05):
     """Per render pixel: the bin that dominates it from the centre and the colour to add to that bin so the
     composite from the centre equals the panorama (splats are ~2x softer than the photo).
 
@@ -84,7 +84,13 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     disparity by more than edge_jump (relative) get no detail; it fades in over the next edge_px.
     With edge_darken, corrections that darken are kept there too: the halos came from brightening
     (photo edges are sharper than the splats', so a dark front object needs its blurred rim brightened).
-    Returns (best bin (6,S,S) int16, delta (6,S,S,3)).
+    With alpha_thr (v4), the mask is the opacity of the dominant *surface* instead of disparity jumps: the
+    bins within surface_band (relative disparity, >= 1.5 bins) of the dominant bin, since a surface is sliced
+    over neighbouring spheres and rarely one of them is opaque alone. Detail only where that surface's
+    alpha >= alpha_thr at every pixel within erode_px (inside opaque surfaces, away from rims whose painted
+    colour would slide when the eye moves), spread over the surface's bins in proportion to their alpha,
+    i.e. the surface's own colour shifts by D / (its weight from the centre).
+    Returns apply(k, rgb, alpha) -> bin k's premultiplied rgb with the detail added (caller clamps).
     """
     import cv2
 
@@ -96,6 +102,7 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     T = torch.ones(6, S, S, device=dev)
     best_w = torch.zeros(6, S, S, device=dev)
     best_T = torch.ones(6, S, S, device=dev)
+    best_a = torch.zeros(6, S, S, device=dev)
     best_k = torch.full((6, S, S), -1, device=dev, dtype=torch.int16)
     for k in range(B - 1, -1, -1):         # near first
         if not (b == k).any():
@@ -106,6 +113,7 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
         better = w > best_w
         best_w = torch.where(better, w, best_w)
         best_T = torch.where(better, T, best_T)
+        best_a = torch.where(better, alpha, best_a)
         best_k = torch.where(better, torch.full_like(best_k, k), best_k)
         C += T[..., None] * rgb.clamp(0, 1)
         T = T * (1 - alpha)
@@ -116,16 +124,49 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     jump = (F.max_pool2d(disp, k, 1, edge_px) + F.max_pool2d(-disp, k, 1, edge_px)) > edge_jump * disp
     jump = F.max_pool2d(jump.float(), k, 1, edge_px)                        # no detail within edge_px
     weight = (1 - F.avg_pool2d(jump, k, 1, edge_px, count_include_pad=False))[:, 0]   # fade back in
+    inner = (slice(None), slice(S // 64, -S // 64), slice(S // 64, -S // 64))
+    if alpha_thr is not None:
+        cen = torch.tensor(centres, device=dev, dtype=torch.float32)
+        bin_w = float(cen[1] - cen[0]) if len(centres) > 1 else 0.0
+        d_best = cen[best_k.long().clamp(min=0)]
+        band = torch.maximum(surface_band * d_best, torch.full_like(d_best, 1.5 * bin_w))
+        # Second pass, near first: the dominant surface's opacity and its weight seen from the centre.
+        T2 = torch.ones(6, S, S, device=dev)
+        surf_T = torch.ones(6, S, S, device=dev)
+        surf_w = torch.zeros(6, S, S, device=dev)
+        for kb in range(B - 1, -1, -1):
+            if not (b == kb).any():
+                continue
+            _, alpha, _ = render_bin(kb)
+            alpha = alpha.clamp(0, 1)
+            inb = (cen[kb] - d_best).abs() <= band
+            surf_T = torch.where(inb, surf_T * (1 - alpha), surf_T)
+            surf_w = surf_w + torch.where(inb, T2 * alpha, 0)
+            T2 = T2 * (1 - alpha)
+        opaque = (((1 - surf_T) >= alpha_thr) & (best_k >= 0)).float()[:, None]
+        kw = 2 * erode_px + 1
+        weight = (-F.max_pool2d(-opaque, kw, 1, erode_px))[:, 0]              # erosion: whole window opaque
+        shift = weight[..., None] * D / surf_w[..., None].clamp(min=0.3)      # surface colour change (straight)
+        print(f"  photo detail (surface opacity >= {alpha_thr}, band {surface_band}, erode {erode_px} px): "
+              f"residual |D| mean {D[inner].abs().mean():.4f}, applied on {weight[inner].mean():.1%} of pixels, "
+              f"residual left {(D * (1 - weight[..., None]))[inner].abs().mean():.4f}", flush=True)
+
+        def apply_surface(kb, rgb, alpha):
+            inb = (cen[kb] - d_best).abs() <= band
+            return rgb + torch.where(inb[..., None], alpha[..., None] * shift, 0)
+        return apply_surface
     w3 = weight[..., None]
     if edge_darken:
         w3 = torch.where(D < 0, 1.0, w3)
     delta = torch.where(ok[..., None], w3 * D / best_T[..., None].clamp(min=1e-3), 0)
     best_k = torch.where(ok, best_k, torch.full_like(best_k, -1))
-    inner = (slice(None), slice(S // 64, -S // 64), slice(S // 64, -S // 64))
     print(f"  photo detail: residual |D| mean {D[inner].abs().mean():.4f}, applied on {ok.float().mean():.1%} "
           f"of pixels (dominant weight >= {min_w}), {(weight == 0).float().mean():.1%} masked as depth edges, "
           f"{(weight < 1).float().mean():.1%} faded", flush=True)
-    return best_k, delta
+
+    def apply_dominant(kb, rgb, alpha):
+        return torch.where((best_k == kb)[..., None], rgb + delta, rgb)
+    return apply_dominant
 
 
 def run(args):
@@ -166,7 +207,8 @@ def run(args):
     detail = None
     if args.photo_detail:
         detail = photo_detail(args.photo_detail, render_bin, b, B, rots_np, S, fr, dev, args.detail_min_w,
-                              centres, args.edge_jump, args.edge_px, args.edge_darken)
+                              centres, args.edge_jump, args.edge_px, args.edge_darken,
+                              args.detail_alpha, args.detail_erode, args.surface_band)
 
     cells = []        # (bin, face, cy, cx)
     half_tex, full_tex, errs, wsum, rmean = [], {}, [], [], []
@@ -176,8 +218,7 @@ def run(args):
             continue
         rgb, alpha, ed = render_bin(k)
         if detail is not None:
-            best_k, delta = detail
-            rgb = torch.where((best_k == k)[..., None], rgb + delta, rgb)
+            rgb = detail(k, rgb, alpha)
             rgb = torch.minimum(rgb.clamp(min=0), alpha[..., None])               # valid premultiplied colour
         rgba = torch.cat([rgb, alpha[..., None]], -1).clamp(0, 1)                 # (6,S,S,4) premultiplied
         dist = ed * ray_norm
@@ -403,6 +444,12 @@ def main():
                    help="Photo detail: relative disparity jump that counts as a depth edge.")
     p.add_argument("--edge-px", type=int, default=6,
                    help="Photo detail: render px around depth edges without detail (and to fade back in).")
+    p.add_argument("--detail-alpha", type=float, default=None,
+                   help="Photo detail v4: only where the dominant layer's alpha >= this (eroded); replaces the "
+                        "disparity-jump edge mask.")
+    p.add_argument("--detail-erode", type=int, default=2, help="Photo detail v4: erosion radius (render px).")
+    p.add_argument("--surface-band", type=float, default=0.05,
+                   help="Photo detail v4: bins within this relative disparity of the dominant one form its surface.")
     p.add_argument("--edge-darken", action="store_true",
                    help="Photo detail: keep darkening corrections at depth edges (mask only brightening).")
     p.add_argument("--no-refine", dest="refine", action="store_false")

@@ -111,12 +111,21 @@ view's right vs gsplat renders of the splats):
 | Photo v1 (halos) | **34.8** | 32.6 / 32.6 / 32.5 / 31.8 | **39.9** | 37.3 / 37.5 / 37.4 / 34.9 |
 | Photo v2 (edge mask) | 30.5 | 35.7 / 35.7 / 35.5 / 34.1 | 35.5 | 40.5 / 40.3 / 39.6 / 35.8 |
 | Photo v3 (narrow mask, darkening kept) | 32.0 | 34.3 / 34.2 / 34.1 / 33.1 | 36.9 | 39.2 / 39.2 / 38.7 / 35.5 |
+| **Photo v4 (opaque surfaces)** | **32.9** | 33.7 / 33.7 / 33.6 / 32.7 | **37.0** | 38.9 / 38.9 / 38.5 / 35.4 |
 
 v3 (`--edge-px 3 --edge-jump 0.05 --edge-darken`, 13% / 3% of pixels masked) keeps ~1.4 of v1's 4.8 dB
 and has no bright halos, but the darkening it keeps at edges shows as **dark specks** along edges from
 3 cm off-centre (the mirror image of v1's halos: a bright front object's blurred rim darkened). The real
 fix is probably a matting step (the splats' edges are too wide: lower the front layer's alpha there
 instead of recolouring it). Default stays v2; v3 is selectable in the viewer.
+
+**v4** (`--detail-alpha 0.95 --detail-erode 2`, default variant): detail only where the pixel's
+dominant *surface* is opaque: the bins within ±5% disparity (≥ 1.5 bins) of the dominant bin, since a
+surface is sliced over neighbouring spheres and a single bin is rarely opaque (a per-bin alpha mask left
+54–67% of pixels without detail). Erode that mask by 2 px; spread the residual over the surface's bins in
+proportion to their alpha (the surface's own colour shifts by D / its weight from the centre). Applied on
+96–97% of pixels, 87% of the residual used, no halos or specks at the traffic light from 3 and 15 cm.
+Costs more texture (more cells need full resolution: 15–16 pages, 320–341 MB ASTC).
 
 The "vs splats" columns penalise photo detail by design (it adds what the splats lack) and can't show
 halos well (the reference has no such edges either); judge those in the headset. The eval harness needs
@@ -140,7 +149,7 @@ Panoramas appear in the main gallery (`/list`) next to the photo scenes, sorted 
 **360°** badge; the options bar has a separate **360°: MSI / Splats** switch (photo view modes don't
 grey them out; they can't be deleted from the gallery). Scene id `pano:<name>` for
 `pano/inputs/<name>.jpg`; `/scenes` and `/scene-modes` include them, `/pano-info/<name>` lists the
-MSI variants (server priority list `PANO_VARIANTS`: photo detail v2, v3, high-res, standard) and the
+MSI variants (server priority list `PANO_VARIANTS`: photo detail v4, v2, v3, high-res, standard) and the
 `.spz`; `/pano/...` serves the files; `/thumb/pano:<name>` thumbnails the equirect.
 
 The viewer (`web/js/panoView.js`) switches by scene kind:

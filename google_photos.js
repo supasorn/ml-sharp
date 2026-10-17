@@ -31,7 +31,9 @@ const crypto = require('crypto');
 const SCOPE = 'https://www.googleapis.com/auth/photospicker.mediaitems.readonly';
 const PICKER = 'https://photospicker.googleapis.com/v1';
 
+// imagesDir: a folder, or a function (req) -> folder for an import started by that request (null: refused).
 module.exports = function googlePhotos(app, { imagesDir, secretsDir }) {
+  const importDir = typeof imagesDir === 'function' ? imagesDir : () => imagesDir;
   const credFile = path.join(secretsDir, 'google_oauth.json');
   const tokenFile = path.join(secretsDir, 'google_token.json');
   const sessions = new Map();   // id -> { state, total, done, files, error, pickerUri }
@@ -126,7 +128,7 @@ module.exports = function googlePhotos(app, { imagesDir, secretsDir }) {
         const r = await fetch(`${m.mediaFile.baseUrl}=d`, { headers: { Authorization: `Bearer ${await accessToken()}` } });
         if (!r.ok) { s.failed = (s.failed || 0) + 1; continue; }
         const name = targetName(m.mediaFile.filename, m.mediaFile.mimeType);
-        fs.writeFileSync(path.join(imagesDir, name), Buffer.from(await r.arrayBuffer()));
+        fs.writeFileSync(path.join(s.dir, name), Buffer.from(await r.arrayBuffer()));
         s.files.push(name);
         s.done++;
         console.log(`[google] imported ${name} (${s.done}/${s.total})`);
@@ -179,9 +181,11 @@ module.exports = function googlePhotos(app, { imagesDir, secretsDir }) {
   });
 
   app.post('/google/session', async (req, res) => {
+    const dir = importDir(req);
+    if (!dir) return res.status(403).json({ error: 'not allowed to import there (log in for the private collection)' });
     try {
       const j = await api('POST', `${PICKER}/sessions`, {});
-      sessions.set(j.id, { state: 'picking', total: 0, done: 0, files: [], error: null, pickerUri: j.pickerUri });
+      sessions.set(j.id, { state: 'picking', total: 0, done: 0, files: [], error: null, pickerUri: j.pickerUri, dir });
       runSession(j.id);
       res.json({ id: j.id, pickerUri: j.pickerUri });
     } catch (e) {

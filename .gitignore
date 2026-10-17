@@ -176,3 +176,12 @@ node_modules/
 
 # 360 panorama inputs and outputs (large; some inputs are third-party imagery)
 pano/
+
+# Public / private (gocryptfs) data collections; the old top-level data paths are symlinks into data/public
+data/public/
+data/private/
+data/private.cipher/
+/images
+/output2
+/renderings
+/pano

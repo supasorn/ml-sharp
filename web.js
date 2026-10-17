@@ -1,13 +1,34 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
+const { COLLECTIONS, mounted, parseId, makeId, dir } = require('./collections');
 
 const app = express();
-// Password protection with --pw (asks for the ZIP password at start; visitors log in): see basic_auth.js.
-app.use(require('./basic_auth')());
 const PORT = 3000;
-const imgdir = 'images';
+
+// Data collections (collections.js): data/public is open to everyone; data/private (a gocryptfs mount) is
+// served only when the server was started with --pw (asks for the ZIP password; see basic_auth.js), only
+// while mounted, and only to visitors who logged in (/login). Without --pw no private data is served.
+const PUB = COLLECTIONS.public, PRIV = COLLECTIONS.private;
+const login = require('./basic_auth').createLogin();
+console.log(login ? 'Private collection on: visitors log in (/login) to see it.'
+                  : 'Private collection off (start with --pw to serve it).');
+const privateReady = () => !!login && mounted(PRIV);
+const canSeePrivate = (req) => privateReady() && login.check(req);
+/** Collections this request may see. */
+const visible = (req) => (canSeePrivate(req) ? [PUB, PRIV] : [PUB]);
+/** Access check for a collection: true, or answers the request (404 / 401 asking for the login). */
+function allow(req, res, coll) {
+  if (!coll.private) return true;
+  if (!privateReady()) { res.sendStatus(404); return false; }
+  if (!login.check(req)) { login.challenge(req, res); return false; }
+  res.set('Cache-Control', 'no-store');   // keep private files out of browser caches
+  return true;
+}
+const collOf = (req) => (req.query.c === 'private' ? PRIV : PUB);
 
 
 // Bare root goes to the gallery; with query params (?scene=..., etc.) it's the viewer.
@@ -16,24 +37,30 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'web', 'index.html'));
 });
 
-// List all .json files in output2 as links
-const fs = require('fs');
+// Log in for the private collection: the browser asks for the login, then keeps sending it.
+app.get('/login', (req, res) => {
+  if (!privateReady()) {
+    return res.status(404).send(login ? 'The private collection is not mounted (data/private).'
+                                      : 'The private collection is off (server started without --pw).');
+  }
+  if (!login.check(req)) return login.challenge(req, res);
+  res.redirect('/list');
+});
 
-// Scene names (json basenames in output2), most recently modified first.
-function sortedSceneNames(dir) {
-  return fs.readdirSync(dir)
+// Scene names (json basenames in an output2 dir), most recently modified first.
+function sortedSceneNames(outDir) {
+  if (!fs.existsSync(outDir)) return [];
+  return fs.readdirSync(outDir)
     .filter(f => f.endsWith('.json'))
-    .map(f => ({ name: f.replace(/\.json$/, ''), mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
+    .map(f => ({ name: f.replace(/\.json$/, ''), mtime: fs.statSync(path.join(outDir, f)).mtimeMs }))
     .sort((a, b) => b.mtime - a.mtime)
     .map(s => s.name)
     .filter(name => name != "rgb" && name != "rgb2");
 }
 
 // --- 360 panoramas (docs/pano-360.md) ---
-// Scene id "pano:<name>" for pano/inputs/<name>.jpg. Content: multi-sphere images (scripts/pano_msi.py) in
-// pano/<variant dir>/<name>_msi[_ktx2].glb and splats pano/out_ico2/<name>.spz (scripts/pano_spz.py).
-const PANO_DIR = path.join(__dirname, 'pano');
-const PANO_PREFIX = 'pano:';
+// Scene id "[private:]pano:<name>" for <collection>/pano/inputs/<name>.jpg. Content: multi-sphere images
+// (scripts/pano_msi.py) in pano/<variant dir>/<name>_msi[_ktx2].glb and splats pano/out_ico2/<name>.spz.
 // MSI variants, best first: the viewer shows the first one a pano has (the others are selectable).
 const PANO_VARIANTS = [
   { id: 'out_ico2_photo4', label: 'Photo detail v4' },
@@ -42,54 +69,77 @@ const PANO_VARIANTS = [
   { id: 'out_ico2_hires', label: 'High-res' },
   { id: 'out_ico2', label: 'Standard' },
 ];
-const isPanoScene = (scene) => typeof scene === 'string' && scene.startsWith(PANO_PREFIX);
-function panoInfo(name) {
+function panoInfo(coll, name) {
   if (!/^[\w.-]+$/.test(name)) return null;
-  const input = ['.jpg', '.jpeg', '.png'].map((e) => path.join(PANO_DIR, 'inputs', name + e)).find((p) => fs.existsSync(p));
+  const panoDir = dir(coll, 'pano');
+  const input = ['.jpg', '.jpeg', '.png'].map((e) => path.join(panoDir, 'inputs', name + e)).find((p) => fs.existsSync(p));
   if (!input) return null;
+  const url = (rel) => `/c/${coll.id}/pano/${rel}`;
   let mtime = fs.statSync(input).mtimeMs;
   const variants = [];
   for (const v of PANO_VARIANTS) {
-    const ktx2 = path.join(PANO_DIR, v.id, `${name}_msi_ktx2.glb`), png = path.join(PANO_DIR, v.id, `${name}_msi.glb`);
+    const ktx2 = path.join(panoDir, v.id, `${name}_msi_ktx2.glb`), png = path.join(panoDir, v.id, `${name}_msi.glb`);
     if (!fs.existsSync(ktx2) && !fs.existsSync(png)) continue;
-    variants.push({ ...v, msi: fs.existsSync(ktx2) ? `/pano/${v.id}/${name}_msi_ktx2.glb` : null,
-                    msiPng: fs.existsSync(png) ? `/pano/${v.id}/${name}_msi.glb` : null });
+    variants.push({ ...v, msi: fs.existsSync(ktx2) ? url(`${v.id}/${name}_msi_ktx2.glb`) : null,
+                    msiPng: fs.existsSync(png) ? url(`${v.id}/${name}_msi.glb`) : null });
     mtime = Math.max(mtime, fs.statSync(fs.existsSync(ktx2) ? ktx2 : png).mtimeMs);
   }
-  const spz = fs.existsSync(path.join(PANO_DIR, 'out_ico2', `${name}.spz`)) ? `/pano/out_ico2/${name}.spz` : null;
+  const spz = fs.existsSync(path.join(panoDir, 'out_ico2', `${name}.spz`)) ? url(`out_ico2/${name}.spz`) : null;
   if (!variants.length && !spz) return null;
-  return { id: PANO_PREFIX + name, name, input, mtime, variants, spz };
+  return { id: makeId(coll, name, true), name, input, mtime, variants, spz };
 }
-function panoScenes() {
-  const dir = path.join(PANO_DIR, 'inputs');
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).filter((f) => /\.(jpe?g|png)$/i.test(f))
-    .map((f) => panoInfo(f.replace(/\.[^.]+$/, ''))).filter(Boolean);
+function panoScenes(coll) {
+  const inputs = path.join(dir(coll, 'pano'), 'inputs');
+  if (!fs.existsSync(inputs)) return [];
+  return fs.readdirSync(inputs).filter((f) => /\.(jpe?g|png)$/i.test(f))
+    .map((f) => panoInfo(coll, f.replace(/\.[^.]+$/, ''))).filter(Boolean);
 }
 function panoModes(p) {
   return [...(p.variants.length ? ['msi'] : []), ...(p.spz ? ['splats'] : [])];
 }
-// Photo scenes and panoramas in one list, most recently modified first.
-function allSceneEntries() {
-  const dir = path.join(__dirname, 'output2');
-  const photos = sortedSceneNames(dir).map((name) => ({ id: name, mtime: fs.statSync(path.join(dir, name + '.json')).mtimeMs }));
-  return [...photos, ...panoScenes().map((p) => ({ id: p.id, mtime: p.mtime, pano: p }))].sort((a, b) => b.mtime - a.mtime);
+// Photo scenes and panoramas of the given collections in one list, most recently modified first.
+function allSceneEntries(colls) {
+  const out = [];
+  for (const coll of colls) {
+    const outDir = dir(coll, 'output2');
+    for (const name of sortedSceneNames(outDir)) {
+      out.push({ id: makeId(coll, name), coll, name, mtime: fs.statSync(path.join(outDir, name + '.json')).mtimeMs });
+    }
+    for (const p of panoScenes(coll)) out.push({ id: p.id, coll, name: p.name, mtime: p.mtime, pano: p });
+  }
+  return out.sort((a, b) => b.mtime - a.mtime);
 }
-app.get('/pano-info/:name', (req, res) => {
-  const p = panoInfo(req.params.name);
+// Info of a panorama by scene id ("[private:]pano:<name>"; a bare name means a public panorama).
+app.get('/pano-info/:id', (req, res) => {
+  let s = parseId(req.params.id);
+  if (s && !s.pano) s = parseId(makeId(s.coll, s.name, true));
+  if (!s) return res.sendStatus(404);
+  if (!allow(req, res, s.coll)) return;
+  const p = panoInfo(s.coll, s.name);
   if (!p) return res.sendStatus(404);
   const { input, ...info } = p;
   res.json({ ...info, modes: panoModes(p) });
 });
-app.use('/pano', express.static(PANO_DIR));
+
+// Collection files: /c/public/... for everyone, /c/private/... only with the login. The old public paths
+// (/output2, /images, /pano) stay for existing links.
+app.use('/c/public', express.static(PUB.root));
+app.use('/c/private', (req, res, next) => { if (allow(req, res, PRIV)) next(); }, express.static(PRIV.root));
+app.use('/output2', express.static(dir(PUB, 'output2')));
+app.use('/images', express.static(dir(PUB, 'images')));
+app.use('/pano', express.static(dir(PUB, 'pano')));
 
 // FPS reports from the viewer while in XR: printed, and appended to
-// logs/xr_perf.jsonl (one JSON object per line) for later analysis.
+// logs/xr_perf.jsonl (one JSON object per line) for later analysis. Private scene names are hashed.
 const PERF_LOG = path.join(__dirname, 'logs', 'xr_perf.jsonl');
 app.post('/fps', express.json(), (req, res) => {
-  console.log('[xr fps]', JSON.stringify(req.body));
+  const body = { ...req.body };
+  if (typeof body.scene === 'string' && body.scene.startsWith('private:')) {
+    body.scene = 'private:' + crypto.createHash('sha256').update(body.scene).digest('hex').slice(0, 12);
+  }
+  console.log('[xr fps]', JSON.stringify(body));
   // The browser's user agent identifies the device (Quest / phone / desktop) beyond the client's own guess.
-  const entry = { time: new Date().toISOString(), ...req.body, ua: (req.headers['user-agent'] || '').slice(0, 200) };
+  const entry = { time: new Date().toISOString(), ...body, ua: (req.headers['user-agent'] || '').slice(0, 200) };
   fs.mkdir(path.dirname(PERF_LOG), { recursive: true }, () => {
     fs.appendFile(PERF_LOG, JSON.stringify(entry) + '\n', (err) => {
       if (err) console.error('Could not write', PERF_LOG, err.message);
@@ -99,12 +149,13 @@ app.post('/fps', express.json(), (req, res) => {
 });
 
 // Small JPEG thumbnails (in-XR gallery, pending items), made once with the sharp conda env's Pillow
-// (EXIF orientation applied, HEIC via pillow_heif) and cached.
-const THUMB_DIR = path.join(__dirname, 'renderings', 'thumbs');
+// (EXIF orientation applied, HEIC via pillow_heif) and cached in the collection's renderings/thumbs.
 const THUMB_PX = 512;   // gallery cards are 250 css px (500 device px on high-DPI screens)
-function sendThumb(src, out, res, what) {
+const thumbDir = (coll) => path.join(dir(coll, 'renderings'), 'thumbs');
+function sendThumb(coll, src, outName, res, what) {
+  const out = path.join(thumbDir(coll), outName);
   if (fs.existsSync(out) && fs.statSync(out).mtimeMs >= fs.statSync(src).mtimeMs) return res.sendFile(out);
-  fs.mkdirSync(THUMB_DIR, { recursive: true });
+  fs.mkdirSync(thumbDir(coll), { recursive: true });
   const py = 'import sys\nfrom PIL import Image, ImageOps\ntry:\n import pillow_heif; pillow_heif.register_heif_opener()\n' +
              'except ImportError:\n pass\nim = ImageOps.exif_transpose(Image.open(sys.argv[1])).convert("RGB")\n' +
              `im.thumbnail((${THUMB_PX}, ${THUMB_PX}))\nim.save(sys.argv[2], quality=85)`;
@@ -114,142 +165,158 @@ function sendThumb(src, out, res, what) {
   });
 }
 app.get('/thumb/:scene', (req, res) => {
-  const scene = req.params.scene;
-  if (isPanoScene(scene)) {
-    const p = panoInfo(scene.slice(PANO_PREFIX.length));
+  const s = parseId(req.params.scene);
+  if (!s) return res.sendStatus(404);
+  if (!allow(req, res, s.coll)) return;
+  if (s.pano) {
+    const p = panoInfo(s.coll, s.name);
     if (!p) return res.sendStatus(404);
-    return sendThumb(p.input, path.join(THUMB_DIR, `_pano_${p.name}_${THUMB_PX}.jpg`), res, scene);
+    return sendThumb(s.coll, p.input, `_pano_${p.name}_${THUMB_PX}.jpg`, res, req.params.scene);
   }
-  const jsonPath = path.join(__dirname, 'output2', scene + '.json');
-  if (scene.includes('/') || scene.includes('..') || !fs.existsSync(jsonPath)) return res.sendStatus(404);
+  const jsonPath = path.join(dir(s.coll, 'output2'), s.name + '.json');
+  if (!fs.existsSync(jsonPath)) return res.sendStatus(404);
   let image;
   try { image = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).image; } catch (e) { return res.sendStatus(404); }
-  const src = path.join(__dirname, 'images', image || '');
-  if (!image || !fs.existsSync(src)) return res.sendStatus(404);
-  sendThumb(src, path.join(THUMB_DIR, `${scene}_${THUMB_PX}.jpg`), res, scene);
+  const src = path.join(dir(s.coll, 'images'), image || '');
+  if (!image || image.includes('/') || !fs.existsSync(src)) return res.sendStatus(404);
+  sendThumb(s.coll, src, `${s.name}_${THUMB_PX}.jpg`, res, req.params.scene);
 });
-// Thumbnail of a photo in images/ by file name (pending items have no scene yet).
-app.get('/thumb-img/:file', (req, res) => {
-  const file = req.params.file;
-  const src = path.join(__dirname, imgdir, file);
+// Thumbnail of a photo in a collection's images/ by file name (pending items have no scene yet).
+function thumbImg(req, res, coll, file) {
+  if (!allow(req, res, coll)) return;
+  const src = path.join(dir(coll, 'images'), file);
   if (file.includes('/') || file.includes('..') || !fs.existsSync(src)) return res.sendStatus(404);
-  sendThumb(src, path.join(THUMB_DIR, `_img_${file}_${THUMB_PX}.jpg`), res, file);
+  sendThumb(coll, src, `_img_${file}_${THUMB_PX}.jpg`, res, file);
+}
+app.get('/thumb-img/:file', (req, res) => thumbImg(req, res, PUB, req.params.file));
+app.get('/thumb-img/:coll/:file', (req, res) => {
+  const coll = COLLECTIONS[req.params.coll];
+  if (!coll) return res.sendStatus(404);
+  thumbImg(req, res, coll, req.params.file);
 });
 
-// Photos in images/ that have no scene yet (being predicted, or waiting for it), newest first.
+// Photos in a collection's images/ that have no scene yet (being predicted, or waiting for it), newest first.
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp', '.avif', '.tif', '.tiff', '.bmp']);
-function pendingImages() {
-  const outDir = path.join(__dirname, 'output2');
+function pendingImages(coll) {
+  const outDir = dir(coll, 'output2'), imgDir = dir(coll, 'images');
+  if (!fs.existsSync(imgDir)) return [];
   const used = new Set();
-  for (const f of fs.readdirSync(outDir)) {
+  for (const f of fs.existsSync(outDir) ? fs.readdirSync(outDir) : []) {
     if (!f.endsWith('.json')) continue;
     used.add(f.slice(0, -5));
     try { const im = JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8')).image; if (im) used.add(im); } catch (e) {}
   }
-  return fs.readdirSync(path.join(__dirname, imgdir))
+  return fs.readdirSync(imgDir)
     .filter((f) => IMAGE_EXTS.has(path.extname(f).toLowerCase()))
     .filter((f) => !used.has(f) && !used.has(path.basename(f, path.extname(f))))
-    .map((f) => ({ file: f, mtime: fs.statSync(path.join(__dirname, imgdir, f)).mtimeMs }))
+    .map((f) => ({ file: f, coll: coll.id, mtime: fs.statSync(path.join(imgDir, f)).mtimeMs }))
     .sort((a, b) => b.mtime - a.mtime);
 }
+const allPending = (req) => visible(req).flatMap(pendingImages).sort((a, b) => b.mtime - a.mtime);
 app.get('/pending', (req, res) => {
-  try { res.json(pendingImages()); } catch (e) { res.status(500).send('Cannot read directory'); }
+  try { res.json(allPending(req)); } catch (e) { res.status(500).send('Cannot read directory'); }
 });
 
 // Import from Google Photos (Picker API): see google_photos.js for setup; credentials in secrets/.
-require('./google_photos')(app, { imagesDir: path.join(__dirname, imgdir), secretsDir: path.join(__dirname, 'secrets') });
+// Photos go to the public collection, or the private one (?c=private, logged in).
+require('./google_photos')(app, {
+  imagesDir: (req) => {
+    const coll = collOf(req);
+    return coll.private && !canSeePrivate(req) ? null : dir(coll, 'images');
+  },
+  secretsDir: path.join(__dirname, 'secrets'),
+});
 
 // View modes a scene can be shown in (gallery page and in-XR gallery grey out the rest).
-function sceneModes(dir, name) {
-  const has = (suffix) => fs.existsSync(path.join(dir, name + suffix));
+function sceneModes(outDir, name) {
+  const has = (suffix) => fs.existsSync(path.join(outDir, name + suffix));
   const modes = ['full'];
   if (has('_hybrid.glb') && has('_hybrid.ply')) modes.push('hybrid');
   if (has('_mpi.glb')) modes.push('mpi');
   if (has('_mpionly.glb')) modes.push('mpionly');
   return modes;
 }
+const entryModes = (s) => (s.pano ? panoModes(s.pano) : sceneModes(dir(s.coll, 'output2'), s.name));
 app.get('/scene-modes', (req, res) => {
-  const dir = path.join(__dirname, 'output2');
   try {
-    res.json(Object.fromEntries(allSceneEntries().map((s) => [s.id, s.pano ? panoModes(s.pano) : sceneModes(dir, s.id)])));
+    res.json(Object.fromEntries(allSceneEntries(visible(req)).map((s) => [s.id, entryModes(s)])));
   } catch (e) {
     res.status(500).send('Cannot read directory');
   }
 });
 
-// Same order as /list, as JSON (used by the viewer to step through scenes); panoramas are "pano:<name>".
+// Same order as /list, as JSON (used by the viewer to step through scenes); panoramas are "pano:<name>",
+// private scenes "private:..." (only for logged-in visitors).
 app.get('/scenes', (req, res) => {
   try {
-    res.json(allSceneEntries().map((s) => s.id));
+    res.json(allSceneEntries(visible(req)).map((s) => s.id));
   } catch (e) {
     res.status(500).send('Cannot read directory');
   }
 });
 app.get('/list', (req, res) => {
-  const dir = path.join(__dirname, 'output2');
   // get "ui" get parameter
   const ui = req.query.ui || 'true';
-
-  {
-    let entries;
-    try { entries = allSceneEntries(); } catch (e) { res.status(500).send('Cannot read directory'); return; }
-    // Photo scenes and 360 panoramas (badge, own view modes), most recently modified first.
-    const items = entries.map(({ id: name, pano }) => {
-      // Cached thumbnail (fast) instead of the full photo; made on first request.
-      const imgSrc = `/thumb/${encodeURIComponent(name)}`;
-      if (pano) {
-        return `
-        <div class="scene-item pano" data-kind="pano" data-modes="${panoModes(pano).join(' ')}" title="360° panorama: ${pano.name}">
-          <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
-            <div class="pano-wrap"><img src='${imgSrc}' alt='${pano.name}' loading='lazy' /><span class="pano-badge">360°</span></div>
-          </a>
-        </div>
-      `;
-      }
+  let entries;
+  try { entries = allSceneEntries(visible(req)); } catch (e) { res.status(500).send('Cannot read directory'); return; }
+  if (canSeePrivate(req)) res.set('Cache-Control', 'no-store');
+  // Photo scenes and 360 panoramas (badge, own view modes), most recently modified first; private ones
+  // with a lock badge.
+  const items = entries.map((s) => {
+    const name = s.id;
+    // Cached thumbnail (fast) instead of the full photo; made on first request.
+    const imgSrc = `/thumb/${encodeURIComponent(name)}`;
+    const priv = s.coll.private;
+    const cls = `scene-item${s.pano ? ' pano' : ''}${priv ? ' private' : ''}`;
+    const lock = priv ? '<span class="private-badge" title="Private collection">🔒</span>' : '';
+    if (s.pano) {
       return `
-        <div class="scene-item" data-modes="${sceneModes(dir, name).join(' ')}">
+        <div class="${cls}" data-kind="pano" data-modes="${entryModes(s).join(' ')}" title="360° panorama: ${s.name}">
           <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
-            <img src='${imgSrc}' alt='${name}' loading='lazy' />
+            <div class="pano-wrap"><img src='${imgSrc}' alt='${s.name}' loading='lazy' /><span class="pano-badge">360°</span>${lock}</div>
           </a>
         </div>
       `;
-    }).join('\n');
-    // Read the template and inject the items
-    const templatePath = path.join(__dirname, 'web', 'list.html');
-    let template = fs.readFileSync(templatePath, 'utf8');
-    // Photos still being processed: dimmed thumbnail with a spinner (not clickable), newest first.
-    let pending = '';
-    try {
-      pending = pendingImages().map(({ file, mtime }) => {
-        const stale = Date.now() - mtime > 30 * 60 * 1000;
-        return `
-        <div class="scene-item pending" data-file="${encodeURIComponent(file)}" title="${file}">
+    }
+    return `
+        <div class="${cls}" data-modes="${entryModes(s).join(' ')}">
+          <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
+            <div class="pano-wrap"><img src='${imgSrc}' alt='${s.name}' loading='lazy' />${lock}</div>
+          </a>
+        </div>
+      `;
+  }).join('\n');
+  // Read the template and inject the items
+  let template = fs.readFileSync(path.join(__dirname, 'web', 'list.html'), 'utf8');
+  // Photos still being processed: dimmed thumbnail with a spinner (not clickable), newest first.
+  let pending = '';
+  try {
+    pending = allPending(req).map(({ file, coll, mtime }) => {
+      const stale = Date.now() - mtime > 30 * 60 * 1000;
+      return `
+        <div class="scene-item pending" data-file="${encodeURIComponent(coll + '/' + file)}" title="${file}">
           <div class="pending-wrap">
-            <img src='/thumb-img/${encodeURIComponent(file)}' alt='${file}' loading='lazy' />
+            <img src='/thumb-img/${coll}/${encodeURIComponent(file)}' alt='${file}' loading='lazy' />
             ${stale ? '' : '<div class="pending-spinner"></div>'}
             <div class="pending-label">${stale ? 'Still not processed — check logs/predict.log' : 'Processing…'}</div>
           </div>
         </div>`;
-      }).join('\n');
-    } catch (e) {}
-    template = template.replace('<!-- SCENE_ITEMS_PLACEHOLDER -->', pending + items);
-    res.send(template);
-  }
+    }).join('\n');
+  } catch (e) {}
+  const state = { enabled: privateReady(), loggedIn: canSeePrivate(req) };
+  template = template.replace('<!-- PRIVATE_STATE -->', `<script>window.PRIVATE_STATE = ${JSON.stringify(state)};</script>`);
+  template = template.replace('<!-- SCENE_ITEMS_PLACEHOLDER -->', pending + items);
+  res.send(template);
 });
 
-
-// Optionally serve static files from 'web' directory
-app.use('/output2', express.static(path.join(__dirname, 'output2')));
-
-// Optionally serve static files from 'web' directory
-app.use('/images', express.static(path.join(__dirname, 'images')));
 
 // Viewer modules (e.g. web/js/XRSceneController.js)
 app.use('/js', express.static(path.join(__dirname, 'web', 'js')));
 
+// Uploads go to the public collection, or the private one (?c=private, logged in).
 const storage = multer.diskStorage({
   destination: function(req, file, cb) {
-    cb(null, path.join(__dirname, imgdir));
+    cb(null, dir(collOf(req), 'images'));
   },
   filename: function(req, file, cb) {
     let base = path.basename(file.originalname, path.extname(file.originalname));
@@ -263,7 +330,7 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage: storage });
-app.post('/upload', upload.array('files[]'), async (req, res) => {
+app.post('/upload', (req, res, next) => { if (allow(req, res, collOf(req))) next(); }, upload.array('files[]'), async (req, res) => {
   try {
     await Promise.all(req.files.map(async (file) => {
       const ext = path.extname(file.originalname).toLowerCase();
@@ -275,7 +342,7 @@ app.post('/upload', upload.array('files[]'), async (req, res) => {
         // fs.unlinkSync(file.path); // Delete original file
 
         // no resize anymore, just rotate with exif
-        console.log("process image ", file.path);
+        console.log("process image ", collOf(req).private ? '(private)' : file.path);
         // fs.unlinkSync(file.path);
         // const newFileName = file.path.replace(/\.[^/.]+$/, '_tmp.jpg');
         // await sharp(file.path).rotate().resize({ height: 1400 }).toFile(newFileName);
@@ -291,23 +358,25 @@ app.post('/upload', upload.array('files[]'), async (req, res) => {
   }
 });
 
-// Delete scene and associated files
+// Delete scene and associated files (within its collection)
 app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
-  const scene = req.body.scene;
-  if (!scene) return res.status(400).send('No scene specified');
+  const s = parseId(req.body.scene);
+  if (!s) return res.status(400).send('No scene specified');
+  if (!allow(req, res, s.coll)) return;
   // Panoramas live in pano/ with several baked variants: not deleted from the gallery.
-  if (isPanoScene(scene)) return res.status(400).send({ success: false, error: 'Panoramas are not deleted here' });
+  if (s.pano) return res.status(400).send({ success: false, error: 'Panoramas are not deleted here' });
+  const scene = s.name;
 
-  // Delete image from /images
-  const outputDir = path.join(__dirname, 'output2');
+  // Delete image from images/
+  const outputDir = dir(s.coll, 'output2');
   let imageName = '';
   try {
     const jsonPath = path.join(outputDir, scene + '.json');
     if (fs.existsSync(jsonPath)) {
       const jsonData = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
       imageName = jsonData.image || '';
-      if (imageName) {
-        const imgPath = path.join(__dirname, 'images', imageName);
+      if (imageName && !imageName.includes('/')) {
+        const imgPath = path.join(dir(s.coll, 'images'), imageName);
         if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
       }
     }
@@ -325,6 +394,8 @@ app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
       fs.unlinkSync(path.join(outputDir, f));
     }
   });
+  // Cached thumbnail too (a private one must not outlive its scene).
+  try { fs.unlinkSync(path.join(thumbDir(s.coll), `${scene}_${THUMB_PX}.jpg`)); } catch (e) {}
 
   res.send({ success: true });
 });

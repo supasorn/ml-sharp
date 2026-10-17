@@ -1,7 +1,8 @@
-// Password protection (HTTP Basic Auth) for web.js and scripts/pano_server.js, on when the server is
-// started with --pw (e.g. `node web.js --pw`); without it the site is open.
-// With --pw the server asks for the ZIP password on its terminal (hidden; or takes $PASSWORD, e.g. for
-// detached starts) and decrypts the login stored below (AES-256-CBC, key = SHA-256 of the ZIP password,
+// Password protection (HTTP Basic Auth), on when the server is started with --pw. web.js uses it for the
+// private collection only (collections.js; the public one stays open); scripts/pano_server.js locks the
+// whole site with it. Without --pw nothing is protected and web.js serves no private data.
+// With --pw the server asks for the ZIP password on its terminal (hidden; or takes $PASSWORD, or a first
+// line piped to stdin as scripts/start_server.sh --pw does) and decrypts the login stored below (AES-256-CBC, key = SHA-256 of the ZIP password,
 // same scheme as img3dviewer). Visitors then log in with that user name and password. Nothing secret is
 // stored on disk or logged; a wrong ZIP password stops the server instead of serving unprotected.
 // Use the HTTPS ports from other devices: Basic Auth over plain HTTP is readable on the network.
@@ -44,6 +45,13 @@ function zipPassword() {
   const fromEnv = process.env.PASSWORD;
   delete process.env.PASSWORD;                    // not inherited by anything this server starts
   if (fromEnv) return fromEnv;
+  // Piped in (scripts/start_server.sh --pw asks for it and passes it on stdin).
+  if (!process.stdin.isTTY) {
+    try {
+      const piped = fs.readFileSync(0, 'utf8').split(/\r?\n/)[0];
+      if (piped) return piped;
+    } catch (e) {}
+  }
   try {
     return askHidden('ZIP Pass: ');
   } catch (e) {
@@ -58,12 +66,12 @@ function sameText(a, b) {
   return crypto.timingSafeEqual(x, y);
 }
 
-/** Express middleware: a pass-through without --pw, else Basic Auth with the decrypted login. */
-module.exports = function basicAuth(realm = 'ml-sharp') {
-  if (!process.argv.includes('--pw')) {
-    console.log('Password protection off (start with --pw to require a login).');
-    return (req, res, next) => next();
-  }
+/**
+ * The login, when started with --pw (asks for the ZIP password, decrypts the login); null without --pw.
+ * Returns { check(req): whether the request carries the login, challenge(res): 401 asking for it }.
+ */
+function createLogin(realm = 'ml-sharp') {
+  if (!process.argv.includes('--pw')) return null;
   const dec = decrypt(ENCRYPTED_LOGIN, zipPassword());
   const i = dec ? dec.indexOf(':') : -1;
   if (i <= 0) {
@@ -71,16 +79,32 @@ module.exports = function basicAuth(realm = 'ml-sharp') {
     process.exit(1);
   }
   const user = dec.slice(0, i), password = dec.slice(i + 1);
-  console.log('Password protection on: visitors log in.');
-  return (req, res, next) => {
-    const m = /^Basic (.+)$/.exec(req.headers.authorization || '');
-    if (m) {
+  return {
+    check(req) {
+      const m = /^Basic (.+)$/.exec(req.headers.authorization || '');
+      if (!m) return false;
       const text = Buffer.from(m[1], 'base64').toString('utf8');
       const j = text.indexOf(':');
-      if (j >= 0 && sameText(text.slice(0, j), user) & sameText(text.slice(j + 1), password)) return next();
-    }
-    res.set('WWW-Authenticate', `Basic realm="${realm}", charset="UTF-8"`);
-    // Failed attempts answer after a short delay (slows guessing).
-    setTimeout(() => res.status(401).send('Password required'), m ? 500 : 0);
+      return j >= 0 && Boolean(sameText(text.slice(0, j), user) & sameText(text.slice(j + 1), password));
+    },
+    challenge(req, res) {
+      res.set('WWW-Authenticate', `Basic realm="${realm}", charset="UTF-8"`);
+      // Failed attempts answer after a short delay (slows guessing).
+      setTimeout(() => res.status(401).send('Password required'), req.headers.authorization ? 500 : 0);
+    },
   };
-};
+}
+
+/** Express middleware locking a whole site: a pass-through without --pw, else Basic Auth. */
+function basicAuth(realm = 'ml-sharp') {
+  const login = createLogin(realm);
+  if (!login) {
+    console.log('Password protection off (start with --pw to require a login).');
+    return (req, res, next) => next();
+  }
+  console.log('Password protection on: visitors log in.');
+  return (req, res, next) => (login.check(req) ? next() : login.challenge(req, res));
+}
+
+module.exports = basicAuth;
+module.exports.createLogin = createLogin;

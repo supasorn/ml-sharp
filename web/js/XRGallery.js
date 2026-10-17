@@ -55,7 +55,8 @@ export class XRGallery {
    *   lods: [{ id, label }] view modes, or a function returning them (they may depend on the current scene);
    *   available(name, modes): optional, whether a scene can be picked (modes: its view modes or null;
    *     default: they include lod());
-   *   isPano(name): optional, badge the cell "360°";  onSelectScene(name);  onSelectLod(id).
+   *   isPano(name): optional, badge the cell "360°";  isPrivate(name): optional, badge it with a lock;
+   *   onSelectScene(name);  onSelectLod(id).
    */
   constructor(renderer, scene, o) {
     this.renderer = renderer;
@@ -98,8 +99,11 @@ export class XRGallery {
         const badge = label(0.05, 0.022, "360°", { bg: "rgba(79,140,255,0.95)", px: 40 });
         badge.position.set(x - CELL_W / 2 + 0.031, y + CELL_H / 2 - 0.017, 0.001);
         badge.renderOrder = 1003;
-        this.group.add(frame, img, badge);
-        const cell = { img, frame, badge, name: null };
+        const lock = label(0.03, 0.022, "🔒", { bg: "rgba(20,22,28,0.85)", px: 34 });
+        lock.position.set(x + CELL_W / 2 - 0.021, y + CELL_H / 2 - 0.017, 0.001);
+        lock.renderOrder = 1003;
+        this.group.add(frame, img, badge, lock);
+        const cell = { img, frame, badge, lock, name: null };
         this.targets.push({ mesh: img, action: () => cell.name && cell.available && o.onSelectScene(cell.name), cell });
         this.cells.push(cell);
       }
@@ -199,6 +203,7 @@ export class XRGallery {
         (this.o.available ? this.o.available(name, modes) : (modes ?? ["full"]).includes(lod));
       cell.img.visible = !!name;
       cell.badge.visible = !!name && !!this.o.isPano?.(name);
+      cell.lock.visible = !!name && !!this.o.isPrivate?.(name);
       cell.frame.visible = !!name && (name === cur || (this.hover?.cell === cell && cell.available));
       cell.frame.material.color.set(this.hover?.cell === cell ? 0xffd000 : 0xffffff);
       if (!name) return;

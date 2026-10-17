@@ -36,3 +36,10 @@ Quick facts:
 - 360 panoramas (equirect -> splats -> multi-sphere image; in the main gallery/viewer as
   `pano:<name>`, also a separate comparison viewer
   `node scripts/pano_server.js` on 3100/3543, data in git-ignored `pano/`): `docs/pano-360.md`.
+- Data lives in collections (`collections.js`): `data/public/{images,output2,pano,renderings}`
+  (the old top-level `images/`, `output2/`, `pano/`, `renderings/` are symlinks into it) and
+  `data/private/` = gocryptfs mount of `data/private.cipher` (mounted by the user outside the
+  container; never run gocryptfs here). Private scene ids are `private:<name>` /
+  `private:pano:<name>`, served under `/c/private/...` only when web.js runs with `--pw` (asks for
+  the ZIP password, `basic_auth.js`) and only to visitors who logged in (`/login`). Anything derived
+  from a private scene (thumbnails, bake work files, logs) must stay inside `data/private`.

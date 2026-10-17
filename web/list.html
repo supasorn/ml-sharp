@@ -3,6 +3,7 @@
 
 <head>
   <title>Scene List</title>
+  <!-- PRIVATE_STATE -->
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"
     integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
 
@@ -53,6 +54,19 @@
       background: rgba(79, 140, 255, 0.92); color: #fff; font-size: 13px; font-weight: 700;
       letter-spacing: 0.03em; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); pointer-events: none;
     }
+    /* Private collection (logged in): lock badge, upload target, login button. */
+    .private-badge {
+      position: absolute; top: 8px; right: 8px; padding: 2px 7px; border-radius: 999px; font-size: 14px;
+      background: rgba(20, 22, 28, 0.8); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); pointer-events: none;
+    }
+    .scene-item.private { outline: 2px solid rgba(255, 196, 0, 0.55); outline-offset: -2px; }
+    #privateBar { display: none; align-items: center; gap: 10px; margin: 8px; vertical-align: middle; }
+    #privateBar .seg button.active { background: #b8860b; }
+    #loginBtn {
+      display: none; background: #3a414b; color: #fff; border: none; border-radius: 4px; padding: 12px 14px;
+      margin: 8px; font-size: 16px; cursor: pointer; vertical-align: middle;
+    }
+    #loginBtn:hover { background: #4a525e; }
     .scene-item.unavailable {
       opacity: 0.3;
       filter: grayscale(1);
@@ -383,6 +397,14 @@
     Import from Google
   </button>
   <div id="gModal"><div class="box" id="gBox"></div></div>
+  <button id="loginBtn" type="button" title="Log in to see and add to the private collection">🔒 Log in for private</button>
+  <span id="privateBar" title="Where new photos (dropped, selected or imported from Google) go">
+    <span class="opt-label">Add to</span>
+    <span class="seg" id="targetSeg">
+      <button type="button" data-target="public">Public</button>
+      <button type="button" data-target="private">🔒 Private</button>
+    </span>
+  </span>
   <label class="toggle-switch">
     <input type="checkbox" id="toggleDelete">
     <span class="slider"></span>
@@ -461,6 +483,15 @@
   </div>
   <script>
     let dragTimeout;
+    // Private collection (server started with --pw, data/private mounted): log in, then choose where new
+    // photos go. The choice is remembered on this device.
+    const PRIV = window.PRIVATE_STATE || { enabled: false, loggedIn: false };
+    let uploadTarget = 'public';
+    try { if (PRIV.loggedIn && localStorage.getItem('uploadTarget') === 'private') uploadTarget = 'private'; } catch (e) {}
+    function targetQuery() { return uploadTarget === 'private' ? '?c=private' : ''; }
+    function showTarget() {
+      $('#targetSeg button').each(function () { $(this).toggleClass('active', $(this).data('target') === uploadTarget); });
+    }
     function uploadFiles(files) {
       let formData = new FormData();
       for (let i = 0; i < files.length; i++) {
@@ -468,7 +499,7 @@
       }
 
       $.ajax({
-        url: 'upload',
+        url: 'upload' + targetQuery(),
         type: 'POST',
         data: formData,
         contentType: false,
@@ -634,7 +665,7 @@
       }
       let j;
       try {
-        const r = await fetch('/google/session', { method: 'POST' });
+        const r = await fetch('/google/session' + targetQuery(), { method: 'POST' });
         j = await r.json();
         if (!r.ok) throw new Error(j.error || r.status);
       } catch (e) { return fail(`<h3>Import from Google</h3><p>Could not start: ${e.message}</p>`); }
@@ -680,16 +711,25 @@
     // Reload when the set of photos being processed changes (a photo arrived, e.g. from a Google import,
     // or finished and became a scene), unless a dialog is open.
     const pendingShown = $('.scene-item.pending').map(function () { return decodeURIComponent($(this).data('file')); }).get().sort().join('|');
+    const pendingKey = (p) => `${p.coll}/${p.file}`;
     setInterval(async () => {
       if ($('#gModal').is(':visible')) return;
       try {
-        const now = (await (await fetch('/pending')).json()).map((p) => p.file).sort().join('|');
+        const now = (await (await fetch('/pending')).json()).map(pendingKey).sort().join('|');
         if (now !== pendingShown) location.reload();
       } catch (e) {}
     }, 4000);
 
     $(document).ready(function () {
       $('#google_import').on('click', gOpen);
+      $('#loginBtn').toggle(PRIV.enabled && !PRIV.loggedIn).on('click', () => { location.href = '/login'; });
+      $('#privateBar').css('display', PRIV.loggedIn ? 'inline-flex' : 'none');
+      showTarget();
+      $('#targetSeg').on('click', 'button', function () {
+        uploadTarget = $(this).data('target');
+        try { localStorage.setItem('uploadTarget', uploadTarget); } catch (e) {}
+        showTarget();
+      });
       $('#gModal').on('click', '#gClose', gClose)
         .on('click', function (e) { if (e.target === this) gClose(); });
       applyOpts();

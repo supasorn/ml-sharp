@@ -157,19 +157,24 @@
       const params = new URLSearchParams(window.location.search);
       return params.get(name);
     }
+    // Files of a scene: public scenes under /output2/, private ones ("private:<name>", served only after
+    // logging in) under /c/private/output2/ (collections.js, web.js).
+    function sceneBase(scene) {
+      return scene.startsWith('private:') ? `/c/private/output2/${scene.slice('private:'.length)}`
+                                          : `../output2/${scene}`;
+    }
     // Default scene when ?scene= is missing; hybrid mode needs one with _pruned.ply + _mesh.glb.
     let file = getQueryParam('scene') ||
       (getQueryParam('hybrid') === "true" ? "20241215_194034" : "20251023_155037");
-    let plyURL = `../output2/${file}.ply`;
-    let jsonURL = `../output2/${file}.json`;
+    let plyURL = `${sceneBase(file)}.ply`;
+    let jsonURL = `${sceneBase(file)}.json`;
 
     // plyURL = 'http://localhost:8000/data/moth/moth.ply';
 
     // 360 panoramas (docs/pano-360.md): scene "pano:<name>", shown as a multi-sphere image (?pmode=msi, default)
     // or splats (?pmode=splats); ?pvariant=<dir> picks an MSI variant (default: the server's first).
     // Desktop: look-around controls instead of orbiting; XR: centred on the head, snap turn, no scaling.
-    const PANO_PREFIX = 'pano:';
-    const isPanoScene = (s) => typeof s === 'string' && s.startsWith(PANO_PREFIX);
+    const isPanoScene = (s) => typeof s === 'string' && /^(private:)?pano:/.test(s);
     const isPano = isPanoScene(file);   // the page's own scene; XR can step to other kinds without a reload
     let panoMode = getQueryParam('pmode') === 'splats' ? 'splats' : 'msi';
     let panoVariant = getQueryParam('pvariant') || null;
@@ -628,9 +633,9 @@
     const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
                         { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'mpionly', label: 'MPI-only' }];
     async function splatUrlFor(scene) {
-      const full = `../output2/${scene}.ply`;
+      const full = `${sceneBase(scene)}.ply`;
       if (lodMode !== 'quest') return full;
-      const lite = `../output2/${scene}_quest.ply`;
+      const lite = `${sceneBase(scene)}_quest.ply`;
       try {
         if ((await fetch(lite, { method: 'HEAD' })).ok) return lite;
       } catch (e) {}
@@ -648,7 +653,7 @@
     // A 360 panorama: its MSI (variant panoVariant, else the first) or its splats (panoMode).
     let panoInfo = null;   // /pano-info of the shown panorama (desktop GUI: variants)
     async function loadPano(scene) {
-      const info = await (await fetch(`/pano-info/${encodeURIComponent(scene.slice(PANO_PREFIX.length))}`)).json();
+      const info = await (await fetch(`/pano-info/${encodeURIComponent(scene)}`)).json();
       panoInfo = info;
       setSortPano(true);
       const mode = info.modes.includes(panoMode) ? panoMode : info.modes[0];
@@ -712,7 +717,7 @@
     // (the texture already contains them) while border splats still draw
     // where they extend past it.
     async function loadHybrid(scene) {
-      const gltf = await new GLTFLoader().loadAsync(`../output2/${scene}${hybridName}.glb`);
+      const gltf = await new GLTFLoader().loadAsync(`${sceneBase(scene)}${hybridName}.glb`);
       const mesh = gltf.scene;
       mesh.quaternion.set(1, 0, 0, 0);
       mesh.position.set(offset[0], offset[1], offset[2]);
@@ -723,7 +728,7 @@
         child.material.dispose();
         child.material = new THREE.MeshBasicMaterial({ map, side: THREE.DoubleSide });
       });
-      const s = createSplat(`../output2/${scene}${hybridName}.ply`);
+      const s = createSplat(`${sceneBase(scene)}${hybridName}.ply`);
       await s.initialized;
       const group = new THREE.Group();
       group.add(mesh, s);
@@ -761,15 +766,15 @@
     async function loadSurfaces(scene, suffix = '_surfaces', withMesh = true) {
       // The opaque mesh these layers were built with: <scene><suffix>_mesh.glb if present, else the hybrid's.
       // MPI-only (?lod=mpionly) has no mesh.
-      let meshURL = `../output2/${scene}${suffix}_mesh.glb`;
+      let meshURL = `${sceneBase(scene)}${suffix}_mesh.glb`;
       if (withMesh) {
         try {
-          if (!(await fetch(meshURL, { method: 'HEAD' })).ok) meshURL = `../output2/${scene}_hybrid.glb`;
-        } catch (e) { meshURL = `../output2/${scene}_hybrid.glb`; }
+          if (!(await fetch(meshURL, { method: 'HEAD' })).ok) meshURL = `${sceneBase(scene)}_hybrid.glb`;
+        } catch (e) { meshURL = `${sceneBase(scene)}_hybrid.glb`; }
       }
-      let layerURL = `../output2/${scene}${suffix}.glb`;
+      let layerURL = `${sceneBase(scene)}${suffix}.glb`;
       if (texKtx2) {
-        const k = `../output2/${scene}${suffix}_ktx2.glb`;
+        const k = `${sceneBase(scene)}${suffix}_ktx2.glb`;
         try { if ((await fetch(k, { method: 'HEAD' })).ok) layerURL = k; } catch (e) {}
       }
       const gltfs = await Promise.all([
@@ -837,7 +842,7 @@
       if (isPanoScene(scene)) return loadPano(scene);
       setSortPano(false);
       if (lodMode === 'hybrid') {
-        const url = `../output2/${scene}${hybridName}.glb`;
+        const url = `${sceneBase(scene)}${hybridName}.glb`;
         try {
           if ((await fetch(url, { method: 'HEAD' })).ok) return await loadHybrid(scene);
         } catch (e) {
@@ -847,7 +852,7 @@
       }
       if (['surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode)) {
         const suffix = `_${lodMode}`;
-        const url = `../output2/${scene}${suffix}.glb`;
+        const url = `${sceneBase(scene)}${suffix}.glb`;
         try {
           if ((await fetch(url, { method: 'HEAD' })).ok) return await loadSurfaces(scene, suffix, lodMode !== 'mpionly');
         } catch (e) {
@@ -856,7 +861,7 @@
         console.warn(`No ${url}; using full splats.`);
       }
       if (lodMode === 'layers') {
-        const url = `../output2/${scene}_layers.glb`;
+        const url = `${sceneBase(scene)}_layers.glb`;
         try {
           if ((await fetch(url, { method: 'HEAD' })).ok) return await loadLayers(url);
         } catch (e) {
@@ -961,6 +966,7 @@
       available: (name, modes) => isPanoScene(name) ? (modes ?? []).includes(panoMode)
                                                     : (modes ?? ['full']).includes(lodMode),
       isPano: isPanoScene,
+      isPrivate: (name) => name.startsWith('private:'),
       onSelectScene: async (name) => {
         xrGallery.close();
         if (name !== file) await stepScene(0, name);

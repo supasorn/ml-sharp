@@ -349,3 +349,37 @@ The harness renders splats with gsplat and meshes with pyvista/VTK:
 - Photo-textured hybrid meshes (`--texture photo`): sharper than the splats.
 - Holes revealed beyond SHARP's own second layer could be filled with a
   blurred far backdrop.
+
+## 9. Operations (stack, batches, machine)
+
+- **Stack**: `scripts/start_server.sh` runs exactly three services, each in
+  its own process group (setsid): `node web.js`, the SHARP prediction watcher
+  (`predict-with-info --loop`, GPU 0) and `bake_mpi.py --watch --mpionly`
+  (GPU 1). pids are in `logs/stack.pids`; `scripts/stop_server.sh` stops them;
+  starting again stops an old stack first. New photos get MPI-only only (not
+  Hybrid / Hybrid-MPI). Logs: `logs/{web,predict,mpi}.log`.
+- **Batch MPI bakes**: `python scripts/bake_mpi.py -i output2 --mpionly
+  --gpus auto --jobs 2` (`--reexport` re-exports from cached bins,
+  `--overwrite` redoes everything, `--no-ktx2`). The KTX2 step
+  (`scripts/glb_ktx2.py`, KTX-Software 4.4.2 under `KTX_HOME`) encodes pages in
+  parallel; export itself downsamples/trims on the GPU (~2× faster than the
+  first version). Verify a file's mip levels by reading its KTX2 headers.
+- **Shared GPUs**: other users hold ~7–11 GB per GPU, so bakes can run out of
+  memory. `--gpus auto` picks the GPUs with the most free memory and each job
+  retries OOM 3×; re-run leftovers with `--jobs 1`. Don't run experiments on
+  the GPUs while a batch runs (several earlier OOMs were self-inflicted).
+- **Shell (zsh)**: unquoted `$VAR` is not word-split (use `${=VAR}` or
+  `xargs`); scene names can contain spaces, so quote lists (`xargs -d '\n'`);
+  `pkill -f <pattern>` can match the zsh wrapper's own command line (kill
+  exact pids instead); `bc` isn't installed.
+- **Google Photos import** (`google_photos.js`, Photos Picker API): OAuth
+  client in `secrets/google_oauth.json`, refresh token in
+  `secrets/google_token.json` (both git-ignored; never commit or print).
+  Redirect URI `http://localhost:3000/google/callback` must be registered and
+  the user must be a test user of the OAuth app (else `403 access_denied`).
+  Downloads land in `images/` written in one go, so the prediction watcher
+  picks them up; `/pending` drives the gallery's spinner cards.
+- **Thumbnails**: `/thumb/<scene>` serves cached 512-px JPEGs
+  (`renderings/thumbs/`, Pillow + pillow_heif), used by both galleries.
+- **Hybrid-MPI files** are only partly refreshed with mipmaps (~23 scenes);
+  MPI-only (all 85 scenes as of 2026-10-17) is the maintained mode.

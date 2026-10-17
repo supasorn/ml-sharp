@@ -215,6 +215,18 @@ hybrid 32.5 / 26.4):
     **K-means bins** (`BINMODE=kmeans`, bins where the disparities are) did not
     help: same quality as uniform + refine at 2.2× the overdraw (content split
     over more layers).
+11. **Fewer bins don't come free with per-cell depth**: 96 / 64 bins cut
+    overdraw ~20% / ~40% but cost 0.2–0.9 / 0.8–1.8 dB at 10–30 cm (worst on
+    the heavy `20200927_161631`). Keep 128.
+12. **Cell culling** (`CULL=0.05`, default in `bake_mpi.py`): render the MPI +
+    mesh from 18 viewpoints spanning ±0.3 m, composite in depth order, and drop
+    cells whose alpha × transmittance in front stays < 0.05 everywhere.
+    Drops 35% of cells (triangles, texels) and 11–21% of the input view's layer
+    fragments at no measurable cost (≤ 0.04 dB, held-out viewpoints included;
+    0.1 drops 43% for ≤ 0.2 dB). Most culled cells sit behind the mesh, whose
+    depth test already rejected their pixels, so the fill saving is smaller
+    than the cell count. (The export emulator shows extra single-pixel holes
+    after culling: its triangle edge test cracks the mesh, a GPU's doesn't.)
 9. SHARP's own two layers are not a front/back pair (92% of same-index pairs
    lie within 1% depth, each layer alone is porous), so two full-resolution
    projective textured layers fail (17.8 dB at 10 cm alone, 19.7 with the mesh).

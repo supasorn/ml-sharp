@@ -15,7 +15,7 @@ reported: exact per-pixel depth order.
 
 Usage: python scripts/eval_alpha_patches.py <scene>.ply [...]
   env: SUFFIX (hybrid bake), TILE, PX, MOVE, FITFLAT (default 1), EXPORT (=_patches writes
-  <scene>_patches.glb), EXPORT_DIR, TEXDS, TEXFULL_THR, MAXPAGES, BINS, MPI, BINMODE, REFINE, EXTEND, EVAL, DEBUG0, FLAT
+  <scene>_patches.glb), EXPORT_DIR, TEXDS, TEXFULL_THR, MAXPAGES, BINS, MPI, BINMODE, REFINE, CULL, EXTEND, EVAL, DEBUG0, FLAT
 """
 import json
 import os
@@ -50,7 +50,8 @@ MAXPAGES = int(os.environ.get("MAXPAGES", 4))              # ... within this man
 BINS = int(os.environ.get("BINS", 0))
 MPI = bool(os.environ.get("MPI"))
 BINMODE = os.environ.get("BINMODE", "uniform")   # MPI bins: uniform in disparity, or kmeans (where the content is)
-REFINE = bool(os.environ.get("REFINE"))          # MPI: per-cell depth (shared corners) instead of the bin's centre
+REFINE = bool(os.environ.get("REFINE"))
+CULL = float(os.environ.get("CULL", 0))          # drop cells contributing less than this from every viewpoint          # MPI: per-cell depth (shared corners) instead of the bin's centre
 EXTEND = int(os.environ.get("EXTEND", 0))
 BG = float(os.environ.get("BG", 0))           # eval: background grey level shown through gaps (viewer: page/passthrough)     # MPI: px each layer is continued underneath opaque content in front             # with BINS: sparse MPI (one joint render per bin, cut into cells)         # >0: patches on this many global depth bins instead of per-tile fits       # export texture downsampling      # fronto-parallel patches only (no tilted planes)
 MARGIN = s1.MARGIN
@@ -382,10 +383,41 @@ def run(scene: Path):
             base = off_t[prim]
             g = lambda yy, xx: atlas[base + yy * wi + xx].float()
             c = (g(y0, x0) * (1 - fx) + g(y0, x1) * fx) * (1 - fy) + (g(y1, x0) * (1 - fx) + g(y1, x1) * fx) * fy
-            k = c[:, 3] > 1 / 255
+            k = (c[:, 3] > 1 / 255) & alive[prim]
             V.append(c[k]); PIX.append(pix[k]); T.append(t[k]); PR.append(prim[k])
         return torch.cat(V), torch.cat(PIX), torch.cat(T), torch.cat(PR)
 
+
+    alive = torch.ones(P, dtype=torch.bool, device=dev)
+    if CULL > 0:
+        # Drop cells that are invisible from every viewpoint in the head range: per viewpoint, composite in
+        # depth order (after the mesh depth test) and take each cell's largest visible contribution
+        # alpha * transmittance of everything in front; cells below CULL everywhere are removed.
+        best = torch.zeros(P, device=dev)
+        eyes_c = [(x, y, zz) for x in (-MOVE, 0.0, MOVE) for y in (-MOVE / 2, 0.0, MOVE / 2) for zz in (0.0, 0.4 * MOVE)]
+        for eye in eyes_c:
+            vals, pix, t, prim = patch_samples(eye)
+            _, mdep_c = s2.mesh_layer(M, eye, W, H, f)
+            k = t < mdep_c[pix]
+            vals, pix, t, prim = vals[k], pix[k], t[k], prim[k]
+            o = torch.argsort(pix.double() * 1e7 + t.double())
+            a, pix, prim = vals[o, 3].clamp(0, 0.999), pix[o], prim[o]
+            first = torch.ones(len(o), dtype=torch.bool, device=dev); first[1:] = pix[1:] != pix[:-1]
+            seg = torch.cummax(torch.where(first, torch.arange(len(o), device=dev), 0), 0).values
+            la = torch.log1p(-a).double(); cs = torch.cumsum(la, 0)
+            contrib = (torch.exp(cs - la - (cs[seg] - la[seg])) * a).float()
+            best.scatter_reduce_(0, prim, contrib, "amax")
+            if eye == (0.0, 0.0, 0.0):
+                prim0 = prim.clone()
+            del vals, pix, t, prim, o, a, la, cs, contrib
+            torch.cuda.empty_cache()
+        alive = best >= CULL
+        print(f"  input view: {len(prim0) / (W * H):.2f} -> {alive[prim0].sum().item() / (W * H):.2f} layer fragments "
+              f"per pixel after the mesh depth test", flush=True)
+        fill = area.astype(np.float64)
+        print(f"  culling: {int((~alive).sum())} of {P} cells ({(~alive).float().mean().item():.0%}, "
+              f"{fill[~alive.cpu().numpy()].sum() / fill.sum():.0%} of cell area) never contribute >= {CULL} "
+              f"from {len(eyes_c)} viewpoints within +-{MOVE} m -> dropped", flush=True)
 
     if os.environ.get("DEBUG0"):
         Rk, _ = raster([kept], (0.0, 0.0, 0.0), W, H, f)
@@ -425,7 +457,7 @@ def run(scene: Path):
         return
     if EXPORT:
         export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, border=border if MPI else None,
-                   cdisp=cdisp if MPI else None)
+                   cdisp=cdisp if MPI else None, alive=alive.cpu().numpy())
         if not EVAL:
             return
 
@@ -454,14 +486,15 @@ def run(scene: Path):
             OUT.mkdir(parents=True, exist_ok=True)
             row = torch.cat([R, Hy, so], 1).clamp(0, 1)
             Image.fromarray((row.cpu().numpy() * 255).astype(np.uint8)).resize((3 * GW, Hg)).save(
-                OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_e{EXTEND}_bg{BG}_{name}.jpg", quality=92)
+                OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_c{CULL}_e{EXTEND}_bg{BG}_{name}.jpg", quality=92)
         del vals, pix, t, prim, ms
         torch.cuda.empty_cache()
-    (OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}.json").write_text(json.dumps(
+    (OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_c{CULL}.json").write_text(json.dumps(
         {"patches": P, "overdraw": float(area.sum() / (W * H)), "psnr": res}, indent=1))
 
 
-def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096, border=None, cdisp=None):
+def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096, border=None, cdisp=None,
+               alive=None):
     """Patches as quads in one mesh per atlas page (premultiplied RGBA PNGs), back to front as seen from the
     input view (static order; fine for small head moves): pages hold consecutive runs of the far-to-near
     order and each page's triangles follow it, while texels are placed by height (shelf packing). Textures
@@ -505,8 +538,10 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
             full[cand] = True
             print(f"  adaptive textures: {full.sum()} of {len(rects)} cells at full resolution "
                   f"(error > {TEXFULL_THR}, budget {MAXPAGES} pages)", flush=True)
-        atb = atb.float().clamp(0, 1).cpu().numpy()
+        atb = atb.cpu().float().clamp(0, 1).numpy()                  # on the CPU: a float copy of the whole border atlas can exceed GPU memory
     for i in range(len(rects)):
+        if alive is not None and not alive[i]:
+            continue
         x0, y0, x1, y1 = rects[i]
         t = down(at[off[i]:off[i] + area[i]].reshape(y1 - y0, x1 - x0, 4))
         m = t[..., 3] >= 0.5 / 255

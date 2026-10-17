@@ -2,20 +2,20 @@
 # Start the ml-sharp viewer stack and keep it running until Ctrl+C (or scripts/stop_server.sh):
 #   1. web server (node web.js): gallery + viewer, HTTP 3000 / HTTPS 3443,
 #      uploads dropped on the gallery go to images/;
-#   2. prediction watcher: images/ -> output2/<scene>.ply + .json;
-#   3. hybrid-bake watcher: output2/<scene>.ply + .json -> <scene>_hybrid.glb/.ply;
-#   4. MPI watcher (scripts/bake_mpi.py --watch): output2/<scene>.ply -> MPI-only
-#      (the default view) and Hybrid-MPI, with compressed textures.
-# A dropped photo shows up in the gallery once predicted (original splats); the
-# other view modes become available as their bakes finish.
+#   2. prediction watcher (SHARP): images/ -> output2/<scene>.ply + .json;
+#   3. MPI watcher (scripts/bake_mpi.py --watch --mpionly): output2/<scene>.ply ->
+#      <scene>_mpionly.glb + _mpionly_ktx2.glb (the default view; compressed textures, mipmaps).
+# A dropped photo shows up in the gallery once predicted (original splats) and in
+# MPI-only once baked. Hybrid / Hybrid-MPI are no longer baked automatically
+# (sharp bake-hybrid, scripts/bake_mpi.py by hand).
 #
 # Each service runs in its own process group, so stopping it also stops the
 # processes it started. The stack's pids are kept in logs/stack.pids; starting
 # again while an old stack is running stops the old one first.
 #
-# Logs: logs/web.log, logs/predict.log, logs/bake.log, logs/mpi.log.
+# Logs: logs/web.log, logs/predict.log, logs/mpi.log.
 # Env overrides: SHARP_ENV (conda env, default /conda_envs/sharp),
-#                PREDICT_GPU (default 0), BAKE_GPU (default 1), MPI_GPU (default 2).
+#                PREDICT_GPU (default 0), MPI_GPU (default 1).
 set -u
 cd "$(dirname "$0")/.."
 ENV="${SHARP_ENV:-/conda_envs/sharp}"
@@ -55,12 +55,11 @@ start() {
 }
 start web.log node web.js
 start predict.log env CUDA_VISIBLE_DEVICES="${PREDICT_GPU:-0}" "$ENV/bin/sharp" predict-with-info -i images -o output2 --loop
-start bake.log env CUDA_VISIBLE_DEVICES="${BAKE_GPU:-1}" "$ENV/bin/sharp" bake-hybrid -i output2 --watch
-start mpi.log env CUDA_VISIBLE_DEVICES="${MPI_GPU:-2}" "$ENV/bin/python" scripts/bake_mpi.py -i output2 --watch
+start mpi.log env CUDA_VISIBLE_DEVICES="${MPI_GPU:-1}" "$ENV/bin/python" scripts/bake_mpi.py -i output2 --watch --mpionly
 echo "$$ ${pids[*]}" > "$PIDFILE"
 
-echo "Started web server, prediction watcher, hybrid-bake watcher and MPI watcher (pids ${pids[*]})."
-echo "Gallery: https://$(hostname -I | awk '{print $1}'):3443/   Logs: logs/{web,predict,bake,mpi}.log"
+echo "Started web server, prediction watcher and MPI-only watcher (pids ${pids[*]})."
+echo "Gallery: https://$(hostname -I | awk '{print $1}'):3443/   Logs: logs/{web,predict,mpi}.log"
 echo "Stop with Ctrl+C or scripts/stop_server.sh."
 # Stop everything if any one of them exits.
 wait -n

@@ -18,7 +18,8 @@ them, --reexport redoes only step 3, reusing the bake). Scenes run in parallel,
 one per GPU.
 
 --watch keeps running and bakes new scenes as they appear (MPI-only first, the default view, then
-Hybrid-MPI), on the GPU(s) in CUDA_VISIBLE_DEVICES; scripts/start_server.sh runs it.
+Hybrid-MPI; with --mpionly only MPI-only), on the GPU(s) in CUDA_VISIBLE_DEVICES; scripts/start_server.sh
+runs `--watch --mpionly`.
 
 Usage: python scripts/bake_mpi.py [-i output2] [--gpus 0,1,2,3] [--overwrite] [--watch] [scene names...]
 """
@@ -84,14 +85,16 @@ def compress(glb: Path, args, log):
 
 
 def watch(args):
-    """Bake scenes that lack their MPI outputs, forever: MPI-only first (the default view), then Hybrid-MPI.
+    """Bake scenes that lack their MPI outputs, forever: MPI-only first (the default view), then Hybrid-MPI
+    (not with --mpionly).
     A scene is picked up once its .ply and .json have been unchanged for a few seconds; a failed scene is
     retried only after its .ply changes."""
     gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
     failed = {}
-    print(f"watching {args.input} (GPU {gpu}, every {args.poll:.0f} s)", flush=True)
+    print(f"watching {args.input} for {'MPI-only' if args.mpionly else 'MPI-only + Hybrid-MPI'} "
+          f"(GPU {gpu}, every {args.poll:.0f} s)", flush=True)
     while True:
-        for mpionly in (True, False):
+        for mpionly in ((True,) if args.mpionly else (True, False)):
             for ply in scene_plys(args.input, set()):
                 sfx = "_mpionly" if mpionly else "_mpi"
                 out = args.input / f"{ply.stem}{sfx}.glb"

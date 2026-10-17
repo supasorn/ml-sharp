@@ -27,6 +27,59 @@ function sortedSceneNames(dir) {
     .filter(name => name != "rgb" && name != "rgb2");
 }
 
+// --- 360 panoramas (docs/pano-360.md) ---
+// Scene id "pano:<name>" for pano/inputs/<name>.jpg. Content: multi-sphere images (scripts/pano_msi.py) in
+// pano/<variant dir>/<name>_msi[_ktx2].glb and splats pano/out_ico2/<name>.spz (scripts/pano_spz.py).
+const PANO_DIR = path.join(__dirname, 'pano');
+const PANO_PREFIX = 'pano:';
+// MSI variants, best first: the viewer shows the first one a pano has (the others are selectable).
+const PANO_VARIANTS = [
+  { id: 'out_ico2_photo2', label: 'Photo detail' },
+  { id: 'out_ico2_photo3', label: 'Photo detail v3 (sharper, dark specks)' },
+  { id: 'out_ico2_hires', label: 'High-res' },
+  { id: 'out_ico2', label: 'Standard' },
+];
+const isPanoScene = (scene) => typeof scene === 'string' && scene.startsWith(PANO_PREFIX);
+function panoInfo(name) {
+  if (!/^[\w.-]+$/.test(name)) return null;
+  const input = ['.jpg', '.jpeg', '.png'].map((e) => path.join(PANO_DIR, 'inputs', name + e)).find((p) => fs.existsSync(p));
+  if (!input) return null;
+  let mtime = fs.statSync(input).mtimeMs;
+  const variants = [];
+  for (const v of PANO_VARIANTS) {
+    const ktx2 = path.join(PANO_DIR, v.id, `${name}_msi_ktx2.glb`), png = path.join(PANO_DIR, v.id, `${name}_msi.glb`);
+    if (!fs.existsSync(ktx2) && !fs.existsSync(png)) continue;
+    variants.push({ ...v, msi: fs.existsSync(ktx2) ? `/pano/${v.id}/${name}_msi_ktx2.glb` : null,
+                    msiPng: fs.existsSync(png) ? `/pano/${v.id}/${name}_msi.glb` : null });
+    mtime = Math.max(mtime, fs.statSync(fs.existsSync(ktx2) ? ktx2 : png).mtimeMs);
+  }
+  const spz = fs.existsSync(path.join(PANO_DIR, 'out_ico2', `${name}.spz`)) ? `/pano/out_ico2/${name}.spz` : null;
+  if (!variants.length && !spz) return null;
+  return { id: PANO_PREFIX + name, name, input, mtime, variants, spz };
+}
+function panoScenes() {
+  const dir = path.join(PANO_DIR, 'inputs');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((f) => /\.(jpe?g|png)$/i.test(f))
+    .map((f) => panoInfo(f.replace(/\.[^.]+$/, ''))).filter(Boolean);
+}
+function panoModes(p) {
+  return [...(p.variants.length ? ['msi'] : []), ...(p.spz ? ['splats'] : [])];
+}
+// Photo scenes and panoramas in one list, most recently modified first.
+function allSceneEntries() {
+  const dir = path.join(__dirname, 'output2');
+  const photos = sortedSceneNames(dir).map((name) => ({ id: name, mtime: fs.statSync(path.join(dir, name + '.json')).mtimeMs }));
+  return [...photos, ...panoScenes().map((p) => ({ id: p.id, mtime: p.mtime, pano: p }))].sort((a, b) => b.mtime - a.mtime);
+}
+app.get('/pano-info/:name', (req, res) => {
+  const p = panoInfo(req.params.name);
+  if (!p) return res.sendStatus(404);
+  const { input, ...info } = p;
+  res.json({ ...info, modes: panoModes(p) });
+});
+app.use('/pano', express.static(PANO_DIR));
+
 // FPS reports from the viewer while in XR: printed, and appended to
 // logs/xr_perf.jsonl (one JSON object per line) for later analysis.
 const PERF_LOG = path.join(__dirname, 'logs', 'xr_perf.jsonl');
@@ -59,6 +112,11 @@ function sendThumb(src, out, res, what) {
 }
 app.get('/thumb/:scene', (req, res) => {
   const scene = req.params.scene;
+  if (isPanoScene(scene)) {
+    const p = panoInfo(scene.slice(PANO_PREFIX.length));
+    if (!p) return res.sendStatus(404);
+    return sendThumb(p.input, path.join(THUMB_DIR, `_pano_${p.name}_${THUMB_PX}.jpg`), res, scene);
+  }
   const jsonPath = path.join(__dirname, 'output2', scene + '.json');
   if (scene.includes('/') || scene.includes('..') || !fs.existsSync(jsonPath)) return res.sendStatus(404);
   let image;
@@ -110,16 +168,16 @@ function sceneModes(dir, name) {
 app.get('/scene-modes', (req, res) => {
   const dir = path.join(__dirname, 'output2');
   try {
-    res.json(Object.fromEntries(sortedSceneNames(dir).map((n) => [n, sceneModes(dir, n)])));
+    res.json(Object.fromEntries(allSceneEntries().map((s) => [s.id, s.pano ? panoModes(s.pano) : sceneModes(dir, s.id)])));
   } catch (e) {
     res.status(500).send('Cannot read directory');
   }
 });
 
-// Same order as /list, as JSON (used by the viewer to step through scenes).
+// Same order as /list, as JSON (used by the viewer to step through scenes); panoramas are "pano:<name>".
 app.get('/scenes', (req, res) => {
   try {
-    res.json(sortedSceneNames(path.join(__dirname, 'output2')));
+    res.json(allSceneEntries().map((s) => s.id));
   } catch (e) {
     res.status(500).send('Cannot read directory');
   }
@@ -129,32 +187,22 @@ app.get('/list', (req, res) => {
   // get "ui" get parameter
   const ui = req.query.ui || 'true';
 
-  fs.readdir(dir, (err, files) => {
-    if (err) {
-      res.status(500).send('Cannot read directory');
-      return;
-    }
-    // Sort json files by modified time, recent first
-    const jsonFiles = files.filter(f => f.endsWith('.json'));
-    jsonFiles.sort((a, b) => {
-      const aTime = fs.statSync(path.join(dir, a)).mtimeMs;
-      const bTime = fs.statSync(path.join(dir, b)).mtimeMs;
-      return bTime - aTime;
-    });
-    const items = jsonFiles.map(f => {
-      const name = f.replace(/\.json$/, '');
-      // read the content of the json file to get the image name
-      let imageName = '';
-      if (name == "rgb" || name == "rgb2") return '';
-      try {
-        const jsonPath = path.join(dir, f);
-        const jsonData = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-        imageName = jsonData.image || '';
-      } catch (e) {
-        imageName = '';
-      }
+  {
+    let entries;
+    try { entries = allSceneEntries(); } catch (e) { res.status(500).send('Cannot read directory'); return; }
+    // Photo scenes and 360 panoramas (badge, own view modes), most recently modified first.
+    const items = entries.map(({ id: name, pano }) => {
       // Cached thumbnail (fast) instead of the full photo; made on first request.
       const imgSrc = `/thumb/${encodeURIComponent(name)}`;
+      if (pano) {
+        return `
+        <div class="scene-item pano" data-kind="pano" data-modes="${panoModes(pano).join(' ')}" title="360° panorama: ${pano.name}">
+          <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
+            <div class="pano-wrap"><img src='${imgSrc}' alt='${pano.name}' loading='lazy' /><span class="pano-badge">360°</span></div>
+          </a>
+        </div>
+      `;
+      }
       return `
         <div class="scene-item" data-modes="${sceneModes(dir, name).join(' ')}">
           <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
@@ -162,7 +210,6 @@ app.get('/list', (req, res) => {
           </a>
         </div>
       `;
-            // <div class="scene-filename">${f}</div>
     }).join('\n');
     // Read the template and inject the items
     const templatePath = path.join(__dirname, 'web', 'list.html');
@@ -184,7 +231,7 @@ app.get('/list', (req, res) => {
     } catch (e) {}
     template = template.replace('<!-- SCENE_ITEMS_PLACEHOLDER -->', pending + items);
     res.send(template);
-  });
+  }
 });
 
 
@@ -245,6 +292,8 @@ app.post('/upload', upload.array('files[]'), async (req, res) => {
 app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
   const scene = req.body.scene;
   if (!scene) return res.status(400).send('No scene specified');
+  // Panoramas live in pano/ with several baked variants: not deleted from the gallery.
+  if (isPanoScene(scene)) return res.status(400).send({ success: false, error: 'Panoramas are not deleted here' });
 
   // Delete image from /images
   const outputDir = path.join(__dirname, 'output2');

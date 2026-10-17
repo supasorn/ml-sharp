@@ -110,6 +110,13 @@ view's right vs gsplat renders of the splats):
 | High-res | 30.0 | 36.1 / 36.1 / 35.8 / 34.4 | 34.9 | 40.8 / 40.7 / 39.8 / 35.9 |
 | Photo v1 (halos) | **34.8** | 32.6 / 32.6 / 32.5 / 31.8 | **39.9** | 37.3 / 37.5 / 37.4 / 34.9 |
 | Photo v2 (edge mask) | 30.5 | 35.7 / 35.7 / 35.5 / 34.1 | 35.5 | 40.5 / 40.3 / 39.6 / 35.8 |
+| Photo v3 (narrow mask, darkening kept) | 32.0 | 34.3 / 34.2 / 34.1 / 33.1 | 36.9 | 39.2 / 39.2 / 38.7 / 35.5 |
+
+v3 (`--edge-px 3 --edge-jump 0.05 --edge-darken`, 13% / 3% of pixels masked) keeps ~1.4 of v1's 4.8 dB
+and has no bright halos, but the darkening it keeps at edges shows as **dark specks** along edges from
+3 cm off-centre (the mirror image of v1's halos: a bright front object's blurred rim darkened). The real
+fix is probably a matting step (the splats' edges are too wide: lower the front layer's alpha there
+instead of recolouring it). Default stays v2; v3 is selectable in the viewer.
 
 The "vs splats" columns penalise photo detail by design (it adds what the splats lack) and can't show
 halos well (the reference has no such edges either); judge those in the headset. The eval harness needs
@@ -127,4 +134,24 @@ next / previous scene. `?xrscale` (1.4 MSI / 1.0 splats), `?lodbias` (−0.5),
 `?foveation` (0), `?tex=png`; initial view `?yaw=&pitch=&fov=&pos=x,y,z`; `window.panoSetView()`
 for scripted captures.
 
-Not wired into `output2/`, the main gallery or the watchers.
+## In the main gallery and viewer (`web.js`, `web/index.html`)
+
+Panoramas appear in the main gallery (`/list`) next to the photo scenes, sorted by date, with a
+**360°** badge; the options bar has a separate **360°: MSI / Splats** switch (photo view modes don't
+grey them out; they can't be deleted from the gallery). Scene id `pano:<name>` for
+`pano/inputs/<name>.jpg`; `/scenes` and `/scene-modes` include them, `/pano-info/<name>` lists the
+MSI variants (server priority list `PANO_VARIANTS`: photo detail v2, v3, high-res, standard) and the
+`.spz`; `/pano/...` serves the files; `/thumb/pano:<name>` thumbnails the equirect.
+
+The viewer (`web/js/panoView.js`) switches by scene kind:
+- Desktop: look-around controls (`PanoLook`) instead of orbiting, its own options panel (360 view,
+  MSI variant, move limit, FOV, wiggle, back to centre) and a hint bar; `?pmode=msi|splats`,
+  `?pvariant=<dir>`. Splats of a panorama are sorted 360° by distance (`sort360`).
+- XR: the panorama is centred on your head (no `xrpush`), main thumbstick left/right snap-turns 30°
+  (right = look right), the secondary stick doesn't scale it, eye buffer 1.4× for MSI; the in-XR
+  gallery shows panoramas (badged) and its mode buttons become 360 MSI / 360 splats on a panorama;
+  stepping between photo scenes and panoramas re-centres.
+
+The standalone viewer (`node scripts/pano_server.js`, port 3100/3543) still works for comparisons
+of all variants. Panoramas are not created by the watchers yet: run `pano_predict.py`, `pano_spz.py`
+and `pano_msi.py` by hand.

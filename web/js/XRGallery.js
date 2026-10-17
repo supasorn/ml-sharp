@@ -2,8 +2,9 @@
  * XRGallery: a scene gallery inside the AR/VR session.
  *
  * A floating panel in front of you: a row of view-mode buttons (Original
- * splats / Hybrid / Hybrid-MPI), a grid of scene thumbnails (the current
- * scene outlined in white) and page arrows. Point at an item with either
+ * splats / Hybrid / Hybrid-MPI / MPI-only, or MSI / Splats while a 360
+ * panorama is shown), a grid of scene thumbnails (the current scene outlined
+ * in white, panoramas badged "360°") and page arrows. Point at an item with either
  * controller's ray and pull the trigger to pick it; thumbstick left/right also
  * pages. XRSceneController opens/closes it and routes input to it while open.
  *
@@ -51,7 +52,10 @@ export class XRGallery {
    *   sceneModes(): Promise<{name: string[]}> view modes each scene has (others are greyed out).
    *   thumbUrl(name): thumbnail URL.
    *   current(): current scene name;  lod(): current view mode id.
-   *   lods: [{ id, label }] view modes;  onSelectScene(name);  onSelectLod(id).
+   *   lods: [{ id, label }] view modes, or a function returning them (they may depend on the current scene);
+   *   available(name, modes): optional, whether a scene can be picked (modes: its view modes or null;
+   *     default: they include lod());
+   *   isPano(name): optional, badge the cell "360°";  onSelectScene(name);  onSelectLod(id).
    */
   constructor(renderer, scene, o) {
     this.renderer = renderer;
@@ -76,14 +80,9 @@ export class XRGallery {
     bg.renderOrder = 1000;
     this.group.add(bg);
 
-    // View-mode buttons (top).
-    this.lodButtons = o.lods.map((l, i) => {
-      const w = 0.2, b = label(w, 0.045, l.label, { px: 44 });
-      b.position.set((i - (o.lods.length - 1) / 2) * (w + 0.02), gridH / 2 + 0.05, 0);
-      this.group.add(b);
-      this.targets.push({ mesh: b, action: () => o.onSelectLod(l.id) });
-      return { mesh: b, id: l.id, text: l.label };
-    });
+    // View-mode buttons (top), rebuilt when the set of modes changes (photo scene vs panorama).
+    this.lodButtons = [];
+    this._buildLodButtons();
 
     // Thumbnail cells with a highlight frame behind each.
     this.cells = [];
@@ -96,8 +95,11 @@ export class XRGallery {
         frame.position.set(x, y, -0.001);
         const img = new THREE.Mesh(new THREE.PlaneGeometry(CELL_W, CELL_H), overlayMaterial({ color: 0x333333 }));
         img.position.set(x, y, 0);
-        this.group.add(frame, img);
-        const cell = { img, frame, name: null };
+        const badge = label(0.05, 0.022, "360°", { bg: "rgba(79,140,255,0.95)", px: 40 });
+        badge.position.set(x - CELL_W / 2 + 0.031, y + CELL_H / 2 - 0.017, 0.001);
+        badge.renderOrder = 1003;
+        this.group.add(frame, img, badge);
+        const cell = { img, frame, badge, name: null };
         this.targets.push({ mesh: img, action: () => cell.name && cell.available && o.onSelectScene(cell.name), cell });
         this.cells.push(cell);
       }
@@ -114,7 +116,7 @@ export class XRGallery {
     // Fixed draw order by role. Without depth testing, equal renderOrders would be sorted by distance to the
     // eye, and the big background (centre often nearer than off-centre cells) would cover the thumbnails.
     for (const c of this.cells) { c.frame.renderOrder = 1001; c.img.renderOrder = 1002; }
-    for (const m of [...this.lodButtons.map((b) => b.mesh), this.prev, this.next, this.pageLabel]) m.renderOrder = 1002;
+    for (const m of [this.prev, this.next, this.pageLabel]) m.renderOrder = 1002;
 
     // A ray on each controller, shown while the gallery is open.
     this.rays = [0, 1].map((i) => {
@@ -128,6 +130,26 @@ export class XRGallery {
   }
 
   get visible() { return this.group.visible; }
+
+  _lods() { return typeof this.o.lods === "function" ? this.o.lods() : this.o.lods; }
+
+  _buildLodButtons() {
+    const lods = this._lods();
+    if (this.lodButtons.map((b) => b.id).join() === lods.map((l) => l.id).join()) return;
+    for (const b of this.lodButtons) {
+      this.group.remove(b.mesh);
+      b.mesh.geometry.dispose(); b.mesh.material.map?.dispose(); b.mesh.material.dispose();
+      this.targets = this.targets.filter((t) => t.mesh !== b.mesh);
+    }
+    this.lodButtons = lods.map((l, i) => {
+      const w = 0.2, b = label(w, 0.045, l.label, { px: 44 });
+      b.position.set((i - (lods.length - 1) / 2) * (w + 0.02), this.gridH / 2 + 0.05, 0);
+      b.renderOrder = 1002;
+      this.group.add(b);
+      this.targets.push({ mesh: b, action: () => this.o.onSelectLod(l.id) });
+      return { mesh: b, id: l.id, text: l.label };
+    });
+  }
 
   async open() {
     try { this.names = await this.o.listScenes(); } catch (e) { console.error("gallery: scene list failed", e); }
@@ -166,13 +188,17 @@ export class XRGallery {
   refresh() {
     const pages = Math.max(1, Math.ceil(this.names.length / PER_PAGE));
     this.pageLabel.setText(`${this.page + 1} / ${pages}`);
+    this._buildLodButtons();
     const cur = this.o.current(), lod = this.o.lod();
     this.cells.forEach((cell, i) => {
       const name = this.names[this.page * PER_PAGE + i] ?? null;
       cell.name = name;
       // Scenes without the current view mode are greyed out and can't be picked.
-      cell.available = !name || !this.modes || (this.modes[name] ?? ["full"]).includes(lod);
+      const modes = this.modes?.[name] ?? null;
+      cell.available = !name || !this.modes ||
+        (this.o.available ? this.o.available(name, modes) : (modes ?? ["full"]).includes(lod));
       cell.img.visible = !!name;
+      cell.badge.visible = !!name && !!this.o.isPano?.(name);
       cell.frame.visible = !!name && (name === cur || (this.hover?.cell === cell && cell.available));
       cell.frame.material.color.set(this.hover?.cell === cell ? 0xffd000 : 0xffffff);
       if (!name) return;

@@ -98,6 +98,12 @@
     #gallery-btn:active {
       transform: translateY(0);
     }
+    /* 360 panoramas: control hints (desktop). */
+    #pano-help {
+      position: fixed; left: 12px; bottom: 12px; z-index: 1000; max-width: calc(100vw - 24px);
+      padding: 8px 12px; border-radius: 10px; background: rgba(20, 22, 28, 0.6); color: #cfd6df;
+      font: 13px/1.4 'Segoe UI', system-ui, sans-serif; backdrop-filter: blur(8px); pointer-events: none;
+    }
     #gallery-btn:focus-visible {
       outline: 2px solid #4f8cff;
       outline-offset: 2px;
@@ -134,6 +140,7 @@
     import { XRGallery, XRToast } from "/js/XRGallery.js";
     import { setupBench } from "/js/xrBench.js";
     import { createFlatSplats } from "/js/splatFlat.js";
+    import { PanoLook, setupMsi } from "/js/panoView.js";
     import { ARButton } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/webxr/ARButton.js";
     import { FontLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/FontLoader.js";
     import { TextGeometry } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/geometries/TextGeometry.js";
@@ -158,6 +165,16 @@
 
     // plyURL = 'http://localhost:8000/data/moth/moth.ply';
 
+    // 360 panoramas (docs/pano-360.md): scene "pano:<name>", shown as a multi-sphere image (?pmode=msi, default)
+    // or splats (?pmode=splats); ?pvariant=<dir> picks an MSI variant (default: the server's first).
+    // Desktop: look-around controls instead of orbiting; XR: centred on the head, snap turn, no scaling.
+    const PANO_PREFIX = 'pano:';
+    const isPanoScene = (s) => typeof s === 'string' && s.startsWith(PANO_PREFIX);
+    const isPano = isPanoScene(file);   // the page's own scene; XR can step to other kinds without a reload
+    let panoMode = getQueryParam('pmode') === 'splats' ? 'splats' : 'msi';
+    let panoVariant = getQueryParam('pvariant') || null;
+    const PANO_MODES = [{ id: 'msi', label: '360 MSI' }, { id: 'splats', label: '360 splats' }];
+
     let ui = getQueryParam('ui') || "true";
     let hybrid = getQueryParam('hybrid') || "false";
 
@@ -165,7 +182,12 @@
     // let height = 3000;
     let meta = {};
 
-    await fetch(jsonURL)
+    if (isPano) {
+      // No photo camera: fill the window, 75 deg vertical FOV (depth fields only feed the photo GUI).
+      const c = document.getElementById('container');
+      meta = { width: c.clientWidth, height: c.clientHeight, vertical_fov_degrees: 75, focal_length_px: 500,
+               min_depth: 1, max_depth: 10, percentile_1_depth: 1, percentile_99_depth: 10 };
+    } else await fetch(jsonURL)
       .then(response => {
         if (!response.ok) {
           if (response.status === 404) {
@@ -270,7 +292,7 @@
     // the extra pixels remove texture aliasing without softening), 1.0 for the splat views (splat-count bound).
     // It can't change mid-session. No fixed foveation by default.
     const xrScale = parseFloat(getQueryParam('xrscale')
-      || (['mpi', 'mpionly'].includes(getQueryParam('lod') || 'mpionly') ? '1.4' : '1'));
+      || ((isPano ? panoMode === 'msi' : ['mpi', 'mpionly'].includes(getQueryParam('lod') || 'mpionly')) ? '1.4' : '1'));
     const xrFoveation = parseFloat(getQueryParam('foveation') || '0');
     const xrStdDev = parseFloat(getQueryParam('xrstddev') || String(Math.sqrt(5)));
     // Close-up scenes cost more: their photos are wider-angle (the scene fills
@@ -367,6 +389,12 @@
     scene.add(xrRoot);
     xrContent.add(sortCamera);
     setSortOnce(true);
+    // Panoramas surround the viewer: sort by distance in every direction (sort360), not by depth in front.
+    function setSortPano(on) {
+      spark.defaultView.sort360 = on;
+      spark.defaultView.sortRadial = on;
+    }
+    setSortPano(isPano);
 
     const desktop = { stdDev: spark.maxStdDev, maxPx: spark.maxPixelRadius };
     renderer.xr.addEventListener('sessionstart', () => {
@@ -490,7 +518,8 @@
       fpsFrames = 0; fpsStart = performance.now();
       fetch('/fps', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ test: getQueryParam('test') || null, fps: +fps.toFixed(1), scene: file, lod: lodMode,
+        body: JSON.stringify({ test: getQueryParam('test') || null, fps: +fps.toFixed(1), scene: file,
+                               lod: isPanoScene(file) ? `pano-${panoMode}` : lodMode,
                                variant: lodMode === 'hybrid' ? hybridName : null,
                                splatdraw: flatSplats ? `flat${flatSplats.corners}` : 'instanced',
                                splats: countSplats(splat), xrScale, xrStdDev: +xrStdDev.toFixed(2),
@@ -536,6 +565,16 @@
     console.log(cc);
 
     controls.rotateSpeed = 800 / cc;
+    controls.enabled = !isPano;
+    const panoLook = isPano ? new PanoLook(camera, renderer.domElement, { fov: 75 }) : null;
+    if (isPano) {
+      addEventListener('resize', () => {
+        const c = document.getElementById('container');
+        renderer.setSize(c.clientWidth, c.clientHeight);
+        camera.aspect = c.clientWidth / c.clientHeight;
+        camera.updateProjectionMatrix();
+      });
+    }
     controls.target.copy(center);
     controls.enablePan = true;
     controls.update();
@@ -567,6 +606,7 @@
 
     window.addEventListener("wheel", (e) => {
       e.preventDefault();
+      if (isPano) return;   // PanoLook zooms (FOV)
       dollyZoom(e.deltaY * 0.01);
     }, { passive: false });
 
@@ -603,6 +643,29 @@
       // Outputs of create_mesh.py: splats with the meshed region removed + textured mesh.
       splatURL = plyURL.replace(".ply", "_pruned.ply");
       meshURL = plyURL.replace(".ply", "_mesh.glb");
+    }
+
+    // A 360 panorama: its MSI (variant panoVariant, else the first) or its splats (panoMode).
+    let panoInfo = null;   // /pano-info of the shown panorama (desktop GUI: variants)
+    async function loadPano(scene) {
+      const info = await (await fetch(`/pano-info/${encodeURIComponent(scene.slice(PANO_PREFIX.length))}`)).json();
+      panoInfo = info;
+      setSortPano(true);
+      const mode = info.modes.includes(panoMode) ? panoMode : info.modes[0];
+      if (mode === 'splats') {
+        const s = createSplat(info.spz);
+        await s.initialized;
+        return s;
+      }
+      const v = info.variants.find((x) => x.id === panoVariant) || info.variants[0];
+      const url = (texKtx2 && v.msi) || v.msiPng || v.msi;
+      ktx2Loader ??= new KTX2Loader()
+        .setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/libs/basis/')
+        .detectSupport(renderer);
+      const gltf = await new GLTFLoader().setKTX2Loader(ktx2Loader).loadAsync(url);
+      setupMsi(gltf.scene, layerLodBias);
+      gltf.scene.quaternion.set(1, 0, 0, 0);   // OpenCV (y down, z forward) -> three.js
+      return gltf.scene;
     }
 
     function createSplat(url) {
@@ -771,6 +834,8 @@
     }
 
     async function loadContent(scene) {
+      if (isPanoScene(scene)) return loadPano(scene);
+      setSortPano(false);
       if (lodMode === 'hybrid') {
         const url = `../output2/${scene}${hybridName}.glb`;
         try {
@@ -829,7 +894,7 @@
     let splat;
     if (hybrid === "true") {
       splat = createSplat(splatURL);
-    } else if (['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode)) {
+    } else if (isPano || ['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode)) {
       splat = await loadContent(file);
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading
@@ -856,15 +921,20 @@
           file = sceneList[(idx + delta + sceneList.length) % sceneList.length];
         }
         // Keep the old scene visible until the next one is loaded.
+        const wasPano = isPanoScene(splat?.userData?.scene ?? initialScene);
         const next = await loadContent(file);
+        next.userData.scene = file;
         applyVisibility(next);
         xrContent.add(next);
         xrContent.remove(splat);
         disposeContent(splat);
         splat = next;
+        // A panorama is centred on your head (and a photo scene back in front of you after one).
+        if (renderer.xr.isPresenting && (isPanoScene(file) || wasPano)) xrController.resetPlacement();
         const url = new URL(window.location);
         url.searchParams.set('scene', file);
-        url.searchParams.set('lod', lodMode);
+        if (isPanoScene(file)) url.searchParams.set('pmode', panoMode);
+        else url.searchParams.set('lod', lodMode);
         history.replaceState(null, '', url);
         if (hzAuto && renderer.xr.isPresenting) requestHz(120, false);   // re-check the rate for the new scene
       } catch (e) {
@@ -873,9 +943,9 @@
         switching = false;
       }
     }
-    const initialLod = lodMode;
+    const initialLod = lodMode, initialPanoMode = panoMode;
     renderer.xr.addEventListener('sessionend', () => {
-      if (file !== initialScene || lodMode !== initialLod) window.location.reload();
+      if (file !== initialScene || lodMode !== initialLod || panoMode !== initialPanoMode) window.location.reload();
     });
 
     // In-XR scene gallery (secondary A/X; see web/js/XRGallery.js). Picking a
@@ -885,19 +955,31 @@
       sceneModes: async () => (await fetch('/scene-modes')).json(),
       thumbUrl: (name) => `/thumb/${encodeURIComponent(name)}`,
       current: () => file,
-      lod: () => lodMode,
-      lods: VIEW_MODES,
+      // View modes of the current scene's kind; each cell is greyed by its own kind's mode.
+      lod: () => isPanoScene(file) ? panoMode : lodMode,
+      lods: () => isPanoScene(file) ? PANO_MODES : VIEW_MODES,
+      available: (name, modes) => isPanoScene(name) ? (modes ?? []).includes(panoMode)
+                                                    : (modes ?? ['full']).includes(lodMode),
+      isPano: isPanoScene,
       onSelectScene: async (name) => {
         xrGallery.close();
         if (name !== file) await stepScene(0, name);
       },
-      onSelectLod: (id) => switchLod(id),
+      onSelectLod: (id) => isPanoScene(file) ? switchPanoMode(id) : switchLod(id),
     });
 
     // View-mode switching in XR (gallery buttons, or a flick of the secondary thumbstick left/right):
     // reload the current scene in the new mode and show its name briefly.
     const xrToast = new XRToast(renderer, scene);
-    const modeLabel = (id) => (VIEW_MODES.find((m) => m.id === id) || { label: id }).label;
+    const modeLabel = (id) => ([...VIEW_MODES, ...PANO_MODES].find((m) => m.id === id) || { label: id }).label;
+    async function switchPanoMode(id) {
+      if (id === panoMode || switching) return;
+      panoMode = id;
+      xrGallery.refresh();
+      xrToast.show(`${modeLabel(id)}…`, 30);
+      await stepScene(0);
+      xrToast.show(modeLabel(panoMode));
+    }
     async function switchLod(id) {
       if (id === lodMode || switching) return;
       lodMode = id;
@@ -907,18 +989,21 @@
       xrToast.show(modeLabel(lodMode));
     }
     async function cycleLod(delta) {
-      let have = VIEW_MODES.map((m) => m.id);
-      try { have = (await (await fetch('/scene-modes')).json())[file] || ['full']; } catch (e) {}
-      const order = VIEW_MODES.map((m) => m.id).filter((id) => have.includes(id));
+      const pano = isPanoScene(file), modes = pano ? PANO_MODES : VIEW_MODES;
+      let have = modes.map((m) => m.id);
+      try { have = (await (await fetch('/scene-modes')).json())[file] || (pano ? [] : ['full']); } catch (e) {}
+      const order = modes.map((m) => m.id).filter((id) => have.includes(id));
       if (!order.length) return;
-      const i = order.indexOf(lodMode);
-      await switchLod(order[(i + delta + order.length) % order.length]);
+      const i = order.indexOf(pano ? panoMode : lodMode);
+      const next = order[(i + delta + order.length) % order.length];
+      await (pano ? switchPanoMode(next) : switchLod(next));
     }
 
     // Delete the current scene from the XR menu: switch to the next scene
     // first, then delete the old one's files on the server.
     async function deleteCurrentScene() {
       const victim = file;
+      if (isPanoScene(victim)) { xrToast.show('Panoramas are not deleted here', 2); return; }
       if (!sceneList) sceneList = await (await fetch('/scenes')).json();
       if (sceneList.length <= 1) return;
       await stepScene(1);
@@ -949,6 +1034,7 @@
       homePush: xrPush,
       gallery: xrGallery,
       onCycleLod: (delta) => cycleLod(delta),
+      isPano: () => isPanoScene(file),
     });
     // Centre the scene on the headset shortly after entering XR (like pressing
     // the trigger): the 'local' origin isn't reliably where your head is, and
@@ -1064,6 +1150,35 @@
     }
 
     const gui = new dat.GUI();
+    if (isPano) {
+      // Panorama options: what to show and how far you may move (look around by dragging).
+      const reloadPano = () => stepScene(0);
+      const variants = Object.fromEntries((panoInfo?.variants ?? []).map((v) => [v.label, v.id]));
+      const panoParams = {
+        view: panoMode,
+        variant: panoVariant || panoInfo?.variants?.[0]?.id || '',
+        moveLimit: panoLook.maxMove,
+        fov: panoLook.fov,
+        wiggle: false,
+        reset: () => panoLook.reset(),
+      };
+      gui.add(panoParams, 'view', { 'Multi-sphere image': 'msi', 'Splats': 'splats' }).name('360 view')
+        .onChange((v) => { panoMode = v; reloadPano(); });
+      if (Object.keys(variants).length > 1) {
+        gui.add(panoParams, 'variant', variants).name('MSI variant')
+          .onChange((v) => { panoVariant = v; if (panoMode === 'msi') reloadPano(); });
+      }
+      gui.add(panoParams, 'moveLimit', 0.1, 2, 0.05).name('move limit (m)').onChange((v) => { panoLook.maxMove = v; });
+      gui.add(panoParams, 'fov', 30, 110, 1).name('FOV').listen().onChange((v) => { panoLook.fov = v; });
+      gui.add(panoParams, 'wiggle').name('wiggle (parallax)').onChange((v) => { panoLook.wiggle = v; });
+      gui.add(panoParams, 'reset').name('back to centre (R)');
+      setInterval(() => { panoParams.fov = panoLook.fov; }, 250);
+      const help = document.createElement('div');
+      help.id = 'pano-help';
+      help.innerHTML = '<b>360°</b> Drag: look around · WASD / arrows: move · Q / E: down / up · ' +
+                       'right-drag: slide · wheel: zoom · R: centre';
+      document.body.appendChild(help);
+    } else {
     gui.add(guiParams, 'cameraMotion', ["None", "SpiralXYZ", "SpiralXY", "Dolly"]);
     gui.add(guiParams, 'amplitude', 0, 20, 0.1);
     gui.add(guiParams, 'speed', 0.1, 5, 0.1);
@@ -1079,6 +1194,7 @@
     });
     gui.add(guiParams, 'showSplat').onChange(() => applyVisibility(splat));
     gui.add(guiParams, 'sortOnce').onChange(setSortOnce);
+    }
     if (ui === "false") {
       gui.hide();
     }
@@ -1088,6 +1204,8 @@
         if (guiParams.cameraMotion != "None") {
           guiParams.cameraMotion = "None";
           gui.updateDisplay();
+        } else if (isPano) {
+          panoLook.reset();
         } else {
           resetView();
         }
@@ -1173,12 +1291,15 @@
       setOrbitDepth(d);
     }
 
-    if (getQueryParam('autoorbit') !== 'false') {
+    if (!isPano && getQueryParam('autoorbit') !== 'false') {
       autoOrbitCenter().catch((e) => console.warn('Auto orbit centre failed:', e));
     }
 
+    let lastFrame = performance.now();
     renderer.setAnimationLoop(function animate(time) {
       const frameStart = performance.now();
+      const dt = Math.min((frameStart - lastFrame) / 1000, 0.1);
+      lastFrame = frameStart;
       stats.begin();
       xrController.update();
       xrToast.update();
@@ -1190,8 +1311,10 @@
       // let amplitude = guiParams.amplitude * 0.005 * distance;
       let amplitude = guiParams.amplitude * 0.05;
       let speed = guiParams.speed * 0.001;
-      let cameraMotion = guiParams.cameraMotion;
-      if (cameraMotion === "SpiralXYZ") {
+      let cameraMotion = isPano ? "Pano" : guiParams.cameraMotion;
+      if (cameraMotion === "Pano") {
+        if (!renderer.xr.isPresenting) panoLook.update(dt, frameStart);
+      } else if (cameraMotion === "SpiralXYZ") {
         camera.position.x = amplitude * Math.sin(time * speed) * 1.5;
         camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed) * 1.5;
         camera.position.z = 2 * amplitude * (Math.sin(0.5 * time * speed) - 1);
@@ -1213,7 +1336,7 @@
 
         controls.update();
       }
-      controls.update();
+      if (!isPano) controls.update();
       renderer.render(scene, camera);
       // splat.rotation.y += 0.01;
       stats.end();

@@ -12,9 +12,11 @@
  * - Thumbstick Click (3): Hold to attach the scene to the controller and rotate it.
  * - Button A/X (4): [Short press] Next scene; [Hold 1 s] Exit AR/VR (works anytime).
  * - Button B/Y (5): [Short press] Previous scene; [Hold 1 s] Reload current scene.
+ * - 360 panoramas (`isPano()`): thumbstick Left/Right snap-turns 30 degrees
+ *   (right = look right); the panorama is centred on your head (no homePush).
  *
  * SECONDARY CONTROLLER:
- * - Thumbstick Up/Down: Scale the scene.
+ * - Thumbstick Up/Down: Scale the scene (not for 360 panoramas: they keep their true size).
  * - Thumbstick Left/Right (flick): Previous/next view mode (if `onCycleLod` is given).
  * - Button A/X (4): Open/close the scene gallery (if `gallery` is given).
  * - Button B/Y (5): Open/close the settings menu.
@@ -42,6 +44,7 @@ export class XRSceneController {
    *   onExit(): leave the XR session.
    *   homePush: metres the scene starts (and resets) in front of its default spot.
    *   gallery: optional XRGallery, toggled with the secondary A/X.
+   *   isPano(): optional, whether a 360 panorama is shown (snap turn, centred on the head, no scaling).
    */
   constructor(renderer, camera, scene, options = {}) {
     this.renderer = renderer;
@@ -60,6 +63,8 @@ export class XRSceneController {
     this.gallery = options.gallery || null;
     this.onCycleLod = options.onCycleLod || null;
     this._lodStickMoved = false;
+    this.isPano = options.isPano || (() => false);
+    this._turnStickMoved = false;
 
     this.minScale = 0.05;
     this.maxScale = 20;
@@ -186,7 +191,7 @@ export class XRSceneController {
     this.group.scale.setScalar(1);
     // three resets its custom reference space for each new session, so this is the base.
     this.baseSpace = this.renderer.xr.getReferenceSpace();
-    this.placePos.set(0, 0, -this.homePush);
+    this.placePos.set(0, 0, -this._push());
     this.placeQuat.identity();
     this._applyPlacement();
   }
@@ -203,13 +208,29 @@ export class XRSceneController {
     const headQuat = this.placeQuat.clone().multiply(quat);
     const yaw = new THREE.Euler(0, 0, 0, "YXZ").setFromQuaternion(headQuat).y;
     this.placeQuat.setFromEuler(new THREE.Euler(0, yaw, 0, "YXZ"));
-    this.placePos.copy(headPos).add(new THREE.Vector3(0, 0, -this.homePush).applyQuaternion(this.placeQuat));
+    this.placePos.copy(headPos).add(new THREE.Vector3(0, 0, -this._push()).applyQuaternion(this.placeQuat));
     this._applyPlacement();
     if (this.content && this.content.parent === this.group &&
         (!this.content.position.equals(new THREE.Vector3()) || this.content.quaternion.w !== 1)) {
       this.content.position.set(0, 0, 0);
       this.content.quaternion.identity();
     }
+  }
+
+  /** Metres the scene sits in front of its home spot: none for a panorama (you stand at its centre). */
+  _push() { return this.isPano() ? 0 : this.homePush; }
+
+  /** Turn the scene around your head by `angle` (radians about up; > 0 = you look further right). */
+  turnAroundHead(angle) {
+    const cam = this.renderer.xr.getCamera();
+    const pos = new THREE.Vector3();
+    cam.getWorldPosition(pos);
+    const head = this._toBase(pos);
+    // Rotating the scene by +angle (counter-clockwise from above) brings what was on your right in front.
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+    this.placePos.sub(head).applyQuaternion(q).add(head);
+    this.placeQuat.premultiply(q);
+    this._applyPlacement();
   }
 
   /** Restore everything to the desktop pose (on session end). */
@@ -315,8 +336,8 @@ export class XRSceneController {
       }
     }
 
-    // Secondary: thumbstick scales the scene (around its placement point).
-    if (this.sEnabled && this.group && sUD) {
+    // Secondary: thumbstick scales the scene (around its placement point); panoramas keep their size.
+    if (this.sEnabled && this.group && sUD && !this.isPano()) {
       const s = THREE.MathUtils.clamp(this.group.scale.x * (1 - sUD * 0.02), this.minScale, this.maxScale);
       this.group.scale.setScalar(s);
     }
@@ -329,6 +350,17 @@ export class XRSceneController {
       this.renderer.xr.getCamera().getWorldDirection(dir);
       this.placePos.addScaledVector(dir.applyQuaternion(this.placeQuat), -mUD * 0.01);
       this._applyPlacement();
+    }
+
+    // Main, panoramas: thumbstick flick left/right snap-turns 30 degrees (right = look right).
+    if (this.isPano()) {
+      const lr = motionLR[mInd];
+      if (Math.abs(lr) > 0.7 && !this._turnStickMoved && Math.abs(lr) > Math.abs(mUD) * 1.5) {
+        this._turnStickMoved = true;
+        this.turnAroundHead(lr > 0 ? Math.PI / 6 : -Math.PI / 6);
+      } else if (Math.abs(lr) < 0.3) {
+        this._turnStickMoved = false;
+      }
     }
 
     // Main: trigger resets the scene in front of you.

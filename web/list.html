@@ -46,6 +46,13 @@
       color: #fff; font-size: 14px; font-weight: 600; letter-spacing: 0.02em; text-shadow: 0 1px 3px #000;
       padding: 0 8px;
     }
+    /* 360 panoramas: badge on the thumbnail (2:1). */
+    .pano-wrap { position: relative; }
+    .pano-badge {
+      position: absolute; top: 8px; left: 8px; padding: 3px 9px; border-radius: 999px;
+      background: rgba(79, 140, 255, 0.92); color: #fff; font-size: 13px; font-weight: 700;
+      letter-spacing: 0.03em; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); pointer-events: none;
+    }
     .scene-item.unavailable {
       opacity: 0.3;
       filter: grayscale(1);
@@ -391,6 +398,13 @@
         <button type="button" data-lod="mpionly" title="All splats as a sparse multi-plane image, no mesh (scripts/bake_mpi.py --mpionly)">MPI-only</button>
       </div>
     </div>
+    <div class="opt-group" title="How 360° panoramas are shown: multi-sphere image (fast, for the Quest) or the original splats">
+      <span class="opt-label">360°</span>
+      <div class="seg" id="pmodeSeg">
+        <button type="button" data-pmode="msi">MSI</button>
+        <button type="button" data-pmode="splats">Splats</button>
+      </div>
+    </div>
     <div class="opt-group" title="Eye-buffer resolution in AR/VR (1 = full)">
       <span class="opt-label">xrscale</span>
       <input type="range" id="optXrscale" min="0.5" max="1.5" step="0.05">
@@ -493,7 +507,7 @@
     // Viewer defaults (web/index.html). Presets set every XR option (not the view).
     // xrscale 'auto': the viewer picks 1.4 for the MPI views and 1.0 for the splat views (no xrscale in the link).
     const XR_DEFAULTS = { xrscale: 'auto', foveation: 0, xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: false };
-    const DEFAULT_OPTS = { lod: 'mpionly', optsVersion: 4, ...XR_DEFAULTS };
+    const DEFAULT_OPTS = { lod: 'mpionly', pmode: 'msi', optsVersion: 4, ...XR_DEFAULTS };
     const FULL_QUALITY = { ...XR_DEFAULTS, foveation: 0, xrstddev: 2.83 };
     const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96, adaptive: true };
     let opts = { ...DEFAULT_OPTS };
@@ -520,6 +534,9 @@
       $('#lodSeg button').each(function () {
         $(this).toggleClass('active', $(this).data('lod') === opts.lod);
       });
+      $('#pmodeSeg button').each(function () {
+        $(this).toggleClass('active', $(this).data('pmode') === opts.pmode);
+      });
       const autoScale = opts.xrscale === 'auto';
       $('#optXrscale').val(autoScale ? (['mpi', 'mpionly'].includes(opts.lod) ? 1.4 : 1) : opts.xrscale);
       $('#valXrscale').text(autoScale ? 'auto' : Number(opts.xrscale).toFixed(2));
@@ -532,7 +549,9 @@
       // Rewrite each scene link, keeping scene (first) and ui as they are.
       $('.scene-item a').each(function () {
         const url = new URL($(this).attr('href'), window.location.href);
-        url.searchParams.set('lod', opts.lod);
+        // Photo scenes take the view mode (lod), panoramas their own (pmode); auto xrscale follows either.
+        if ($(this).closest('.scene-item').data('kind') === 'pano') url.searchParams.set('pmode', opts.pmode);
+        else url.searchParams.set('lod', opts.lod);
         if (opts.xrscale === 'auto') url.searchParams.delete('xrscale');
         else url.searchParams.set('xrscale', opts.xrscale);
         url.searchParams.set('foveation', opts.foveation);
@@ -544,8 +563,9 @@
       });
       // Grey out scenes that don't have the selected view mode (not baked yet).
       $('.scene-item').not('.pending').each(function () {
-        const modes = ($(this).data('modes') || 'full').split(' ');
-        $(this).toggleClass('unavailable', !modes.includes(opts.lod));
+        const pano = $(this).data('kind') === 'pano';
+        const modes = ($(this).data('modes') || (pano ? 'msi' : 'full')).split(' ');
+        $(this).toggleClass('unavailable', !modes.includes(pano ? opts.pmode : opts.lod));
       });
     }
 
@@ -676,6 +696,7 @@
       renderPerfLinks();
       $('#perfScene').on('input', renderPerfLinks);
       $('#lodSeg').on('click', 'button', function () { setOpts({ lod: $(this).data('lod') }); });
+      $('#pmodeSeg').on('click', 'button', function () { setOpts({ pmode: $(this).data('pmode') }); });
       $('#optXrscale').on('input', function () { setOpts({ xrscale: parseFloat(this.value) }); });
       $('#xrscaleAuto').on('click', function () { setOpts({ xrscale: 'auto' }); });
       $('#optFoveation').on('input', function () { setOpts({ foveation: parseFloat(this.value) }); });
@@ -691,7 +712,7 @@
       $('#toggleDelete').on('change', function() {
         if ($(this).is(':checked')) {
           $('#toggleDeleteLabel').text('Delete: On');
-          $('.scene-item').addClass('deletable');
+          $('.scene-item').not('.pano').addClass('deletable');   // panoramas are managed in pano/
         } else {
           $('#toggleDeleteLabel').text('Delete: Off');
           $('.scene-item').removeClass('deletable');

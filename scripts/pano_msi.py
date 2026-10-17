@@ -69,7 +69,8 @@ def cube_lookup(dirs: torch.Tensor):
 
 
 @torch.no_grad()
-def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centres, edge_jump, edge_px):
+def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centres, edge_jump, edge_px,
+                 edge_darken):
     """Per render pixel: the bin that dominates it from the centre and the colour to add to that bin so the
     composite from the centre equals the panorama (splats are ~2x softer than the photo).
 
@@ -81,6 +82,8 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     into the bright sky), and the residual (brighten) would land on the front layer as a bright fringe
     that shows as soon as the eye is off-centre. Pixels within edge_px of a jump in the dominant bin's
     disparity by more than edge_jump (relative) get no detail; it fades in over the next edge_px.
+    With edge_darken, corrections that darken are kept there too: the halos came from brightening
+    (photo edges are sharper than the splats', so a dark front object needs its blurred rim brightened).
     Returns (best bin (6,S,S) int16, delta (6,S,S,3)).
     """
     import cv2
@@ -113,7 +116,10 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     jump = (F.max_pool2d(disp, k, 1, edge_px) + F.max_pool2d(-disp, k, 1, edge_px)) > edge_jump * disp
     jump = F.max_pool2d(jump.float(), k, 1, edge_px)                        # no detail within edge_px
     weight = (1 - F.avg_pool2d(jump, k, 1, edge_px, count_include_pad=False))[:, 0]   # fade back in
-    delta = torch.where(ok[..., None], weight[..., None] * D / best_T[..., None].clamp(min=1e-3), 0)
+    w3 = weight[..., None]
+    if edge_darken:
+        w3 = torch.where(D < 0, 1.0, w3)
+    delta = torch.where(ok[..., None], w3 * D / best_T[..., None].clamp(min=1e-3), 0)
     best_k = torch.where(ok, best_k, torch.full_like(best_k, -1))
     inner = (slice(None), slice(S // 64, -S // 64), slice(S // 64, -S // 64))
     print(f"  photo detail: residual |D| mean {D[inner].abs().mean():.4f}, applied on {ok.float().mean():.1%} "
@@ -160,7 +166,7 @@ def run(args):
     detail = None
     if args.photo_detail:
         detail = photo_detail(args.photo_detail, render_bin, b, B, rots_np, S, fr, dev, args.detail_min_w,
-                              centres, args.edge_jump, args.edge_px)
+                              centres, args.edge_jump, args.edge_px, args.edge_darken)
 
     cells = []        # (bin, face, cy, cx)
     half_tex, full_tex, errs, wsum, rmean = [], {}, [], [], []
@@ -397,6 +403,8 @@ def main():
                    help="Photo detail: relative disparity jump that counts as a depth edge.")
     p.add_argument("--edge-px", type=int, default=6,
                    help="Photo detail: render px around depth edges without detail (and to fade back in).")
+    p.add_argument("--edge-darken", action="store_true",
+                   help="Photo detail: keep darkening corrections at depth edges (mask only brightening).")
     p.add_argument("--no-refine", dest="refine", action="store_false")
     p.add_argument("--no-ktx2", action="store_true")
     p.add_argument("--eval", action="store_true")

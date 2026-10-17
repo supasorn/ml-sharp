@@ -370,7 +370,8 @@
         if (src.handedness === "right" && pressed(5)) { sceneIdx = (sceneIdx + scenes.length - 1) % scenes.length; load(); }
         prevButtons.set(src, gp.buttons.map((b) => b.pressed));
         const x = gp.axes[2] ?? 0;
-        if (Math.abs(x) > 0.7 && stickArmed) { turn(x > 0 ? -Math.PI / 6 : Math.PI / 6); stickArmed = false; }
+        // Stick right = look right: turn the content counter-clockwise (+angle), bringing the right side in front.
+        if (Math.abs(x) > 0.7 && stickArmed) { turn(x > 0 ? Math.PI / 6 : -Math.PI / 6); stickArmed = false; }
         if (Math.abs(x) < 0.3 && src.handedness === "right") stickArmed = true;
       }
     }

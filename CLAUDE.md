@@ -33,5 +33,6 @@ Quick facts:
 - Keep AR on three's stock `ARButton` (dom-overlay) or the Quest switches to
   roomscale.
 - Work on `main` (the `quest-xr-hybrid` work was merged into it); commit/push when asked.
-- 360 panoramas (equirect -> splats -> multi-sphere image, separate viewer
+- 360 panoramas (equirect -> splats -> multi-sphere image; in the main gallery/viewer as
+  `pano:<name>`, also a separate comparison viewer
   `node scripts/pano_server.js` on 3100/3543, data in git-ignored `pano/`): `docs/pano-360.md`.

@@ -54,19 +54,16 @@
       background: rgba(79, 140, 255, 0.92); color: #fff; font-size: 13px; font-weight: 700;
       letter-spacing: 0.03em; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); pointer-events: none;
     }
-    /* Private collection (logged in): lock badge, upload target, login button. */
+    /* Private collection (server started with --pw): lock badges and a label. */
     .private-badge {
       position: absolute; top: 8px; right: 8px; padding: 2px 7px; border-radius: 999px; font-size: 14px;
       background: rgba(20, 22, 28, 0.8); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); pointer-events: none;
     }
     .scene-item.private { outline: 2px solid rgba(255, 196, 0, 0.55); outline-offset: -2px; }
-    #privateBar { display: none; align-items: center; gap: 10px; margin: 8px; vertical-align: middle; }
-    #privateBar .seg button.active { background: #b8860b; }
-    #loginBtn {
-      display: none; background: #3a414b; color: #fff; border: none; border-radius: 4px; padding: 12px 14px;
-      margin: 8px; font-size: 16px; cursor: pointer; vertical-align: middle;
+    #privateLabel {
+      display: none; margin: 8px; padding: 10px 14px; border-radius: 4px; background: #b8860b; color: #fff;
+      font-size: 16px; font-weight: 600; vertical-align: middle;
     }
-    #loginBtn:hover { background: #4a525e; }
     .scene-item.unavailable {
       opacity: 0.3;
       filter: grayscale(1);
@@ -397,14 +394,7 @@
     Import from Google
   </button>
   <div id="gModal"><div class="box" id="gBox"></div></div>
-  <button id="loginBtn" type="button" title="Log in to see and add to the private collection">🔒 Log in for private</button>
-  <span id="privateBar" title="Where new photos (dropped, selected or imported from Google) go">
-    <span class="opt-label">Add to</span>
-    <span class="seg" id="targetSeg">
-      <button type="button" data-target="public">Public</button>
-      <button type="button" data-target="private">🔒 Private</button>
-    </span>
-  </span>
+  <span id="privateLabel" title="Server started with --pw: the private collection; new photos are added to it">🔒 Private collection</span>
   <label class="toggle-switch">
     <input type="checkbox" id="toggleDelete">
     <span class="slider"></span>
@@ -483,15 +473,9 @@
   </div>
   <script>
     let dragTimeout;
-    // Private collection (server started with --pw, data/private mounted): log in, then choose where new
-    // photos go. The choice is remembered on this device.
-    const PRIV = window.PRIVATE_STATE || { enabled: false, loggedIn: false };
-    let uploadTarget = 'public';
-    try { if (PRIV.loggedIn && localStorage.getItem('uploadTarget') === 'private') uploadTarget = 'private'; } catch (e) {}
-    function targetQuery() { return uploadTarget === 'private' ? '?c=private' : ''; }
-    function showTarget() {
-      $('#targetSeg button').each(function () { $(this).toggleClass('active', $(this).data('target') === uploadTarget); });
-    }
+    // Which collection the server shows (web.js: private with --pw and data/private mounted, else public);
+    // uploads and Google imports go to it.
+    const PRIV = window.PRIVATE_STATE || { mode: 'public' };
     function uploadFiles(files) {
       let formData = new FormData();
       for (let i = 0; i < files.length; i++) {
@@ -499,7 +483,7 @@
       }
 
       $.ajax({
-        url: 'upload' + targetQuery(),
+        url: 'upload',
         type: 'POST',
         data: formData,
         contentType: false,
@@ -665,7 +649,7 @@
       }
       let j;
       try {
-        const r = await fetch('/google/session' + targetQuery(), { method: 'POST' });
+        const r = await fetch('/google/session', { method: 'POST' });
         j = await r.json();
         if (!r.ok) throw new Error(j.error || r.status);
       } catch (e) { return fail(`<h3>Import from Google</h3><p>Could not start: ${e.message}</p>`); }
@@ -722,14 +706,7 @@
 
     $(document).ready(function () {
       $('#google_import').on('click', gOpen);
-      $('#loginBtn').toggle(PRIV.enabled && !PRIV.loggedIn).on('click', () => { location.href = '/login'; });
-      $('#privateBar').css('display', PRIV.loggedIn ? 'inline-flex' : 'none');
-      showTarget();
-      $('#targetSeg').on('click', 'button', function () {
-        uploadTarget = $(this).data('target');
-        try { localStorage.setItem('uploadTarget', uploadTarget); } catch (e) {}
-        showTarget();
-      });
+      $('#privateLabel').css('display', PRIV.mode === 'private' ? 'inline-block' : 'none');
       $('#gModal').on('click', '#gClose', gClose)
         .on('click', function (e) { if (e.target === this) gClose(); });
       applyOpts();

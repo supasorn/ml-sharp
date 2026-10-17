@@ -9,11 +9,13 @@
  * - Thumbstick Up/Down: Move the scene forward/backward along your gaze.
  * - Index Trigger (0): Reset the scene in front of you, facing you.
  * - Grip (1): Hold to drag the scene in 3D.
- * - Thumbstick Click (3): Hold to attach the scene to the controller and rotate it.
+ * - Thumbstick Click (3): Hold to attach the scene to the controller and rotate it (it returns to the
+ *   scene root whenever the stick isn't held in, and on a trigger reset).
  * - Button A/X (4): [Short press] Next scene; [Hold 1 s] Exit AR/VR (works anytime).
  * - Button B/Y (5): [Short press] Previous scene; [Hold 1 s] Reload current scene.
- * - 360 panoramas (`isPano()`): thumbstick Left/Right snap-turns 30 degrees
- *   (right = look right); the panorama is centred on your head (no homePush).
+ * - 360 panoramas (`isPano()`): thumbstick Left/Right snap-turns 30 degrees (right = look right; any
+ *   push more sideways than up/down), Up/Down moves you (forward = forward; only for a push mostly
+ *   forward/back, not right after a turn); the panorama is centred on your head (no homePush).
  *
  * SECONDARY CONTROLLER:
  * - Thumbstick Up/Down: Scale the scene (not for 360 panoramas: they keep their true size).
@@ -210,6 +212,7 @@ export class XRSceneController {
     this.placeQuat.setFromEuler(new THREE.Euler(0, yaw, 0, "YXZ"));
     this.placePos.copy(headPos).add(new THREE.Vector3(0, 0, -this._push()).applyQuaternion(this.placeQuat));
     this._applyPlacement();
+    if (this.content && this.content.parent !== this.group) this.group.attach(this.content);   // never stay on a hand
     if (this.content && this.content.parent === this.group &&
         (!this.content.position.equals(new THREE.Vector3()) || this.content.quaternion.w !== 1)) {
       this.content.position.set(0, 0, 0);
@@ -231,6 +234,16 @@ export class XRSceneController {
     this.placePos.sub(head).applyQuaternion(q).add(head);
     this.placeQuat.premultiply(q);
     this._applyPlacement();
+  }
+
+  /** Controller state for the periodic XR reports (logs/xr_perf.jsonl): diagnoses "controls stopped working". */
+  debugState() {
+    return {
+      mainHand: this.motionInd === 0 ? "left" : "right", mainOn: this.mEnabled, secondaryOn: this.sEnabled,
+      onHand: !!this.content && this.content.parent !== this.group, scale: +this.group.scale.x.toFixed(3),
+      conts: this.conts.map(Boolean), placed: !!this.baseSpace,
+      menu: this.menuGroup.visible, gallery: !!this.gallery?.visible,
+    };
   }
 
   /** Restore everything to the desktop pose (on session end). */
@@ -273,6 +286,10 @@ export class XRSceneController {
     }
 
     const mInd = this.motionInd, sInd = 1 - mInd;
+    // The scene rides on the main controller only while its thumbstick is held in. Checked every frame (not
+    // just on the release frame): a release missed while the gallery or menu was open left the scene stuck to
+    // the hand, and scaling (the root) and moving (the viewer) then seemed to do nothing.
+    if (this.content && this.content.parent !== this.group && !this.butts[mInd][3].pressed) this.group.attach(this.content);
     // Main A/X and B/Y: tap vs 1 s hold. Holding A/X exits in any state
     // (menu open, main hand disabled), so there's always a way out.
     const aKind = this._pressKind(this.butts[mInd][4]);
@@ -344,23 +361,29 @@ export class XRSceneController {
 
     if (!this.mEnabled || !this.group) return;
 
-    // Main: thumbstick moves the scene along your gaze.
-    if (mUD) {
-      const dir = new THREE.Vector3();
-      this.renderer.xr.getCamera().getWorldDirection(dir);
-      this.placePos.addScaledVector(dir.applyQuaternion(this.placeQuat), -mUD * 0.01);
-      this._applyPlacement();
-    }
-
-    // Main, panoramas: thumbstick flick left/right snap-turns 30 degrees (right = look right).
+    // Main, panoramas: a push more sideways than up/down is a turn (snap 30 degrees, right = look right),
+    // even when slightly diagonal; after a turn the stick must come back to the centre before it moves you.
+    let moveUD = mUD;
     if (this.isPano()) {
       const lr = motionLR[mInd];
-      if (Math.abs(lr) > 0.7 && !this._turnStickMoved && Math.abs(lr) > Math.abs(mUD) * 1.5) {
+      if (!this._turnStickMoved && Math.abs(lr) > 0.6 && Math.abs(lr) > Math.abs(mUD)) {
         this._turnStickMoved = true;
         this.turnAroundHead(lr > 0 ? Math.PI / 6 : -Math.PI / 6);
-      } else if (Math.abs(lr) < 0.3) {
+      } else if (Math.hypot(lr, mUD) < 0.3) {
         this._turnStickMoved = false;
       }
+      // Forward/back only for a push mostly forward or back (within ~33 degrees of straight up/down).
+      if (this._turnStickMoved || Math.abs(mUD) < 1.5 * Math.abs(lr)) moveUD = 0;
+    }
+
+    // Main: thumbstick moves the scene along your gaze (pushed forward = away); in a panorama it moves you
+    // instead (pushed forward = you go forward).
+    if (moveUD) {
+      const dir = new THREE.Vector3();
+      this.renderer.xr.getCamera().getWorldDirection(dir);
+      const sign = this.isPano() ? 1 : -1;
+      this.placePos.addScaledVector(dir.applyQuaternion(this.placeQuat), sign * moveUD * 0.01);
+      this._applyPlacement();
     }
 
     // Main: trigger resets the scene in front of you.
@@ -380,11 +403,8 @@ export class XRSceneController {
       } else {
         this.dragStartPlace = this.dragStartCont = null;
       }
-      // Thumbstick click: hold to rotate the scene with the controller.
-      if (this.content) {
-        if (mButt[3].clicked) mCont.attach(this.content);
-        else if (mButt[3].unclicked) this.group.attach(this.content);
-      }
+      // Thumbstick click: hold to rotate the scene with the controller (released above, every frame).
+      if (this.content && mButt[3].clicked) mCont.attach(this.content);
     }
 
     // A/X tap = next scene; B/Y tap = previous, hold 1 s = reload. (A/X hold exits; see above.)

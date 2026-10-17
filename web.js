@@ -9,26 +9,34 @@ const { COLLECTIONS, mounted, parseId, makeId, dir } = require('./collections');
 const app = express();
 const PORT = 3000;
 
-// Data collections (collections.js): data/public is open to everyone; data/private (a gocryptfs mount) is
-// served only when the server was started with --pw (asks for the ZIP password; see basic_auth.js), only
-// while mounted, and only to visitors who logged in (/login). Without --pw no private data is served.
+// Data collections (collections.js). The server shows one of them, chosen at start:
+//   --pw and data/private mounted (gocryptfs): the private collection only. Asks for the ZIP password
+//     (basic_auth.js); every request needs the login; nothing is cached by browsers.
+//   otherwise: the public collection, open to everyone (--pw without the mount: a warning, no prompt).
+// Uploads and Google imports go to the shown collection.
 const PUB = COLLECTIONS.public, PRIV = COLLECTIONS.private;
-const login = require('./basic_auth').createLogin();
-console.log(login ? 'Private collection on: visitors log in (/login) to see it.'
-                  : 'Private collection off (start with --pw to serve it).');
-const privateReady = () => !!login && mounted(PRIV);
-const canSeePrivate = (req) => privateReady() && login.check(req);
-/** Collections this request may see. */
-const visible = (req) => (canSeePrivate(req) ? [PUB, PRIV] : [PUB]);
-/** Access check for a collection: true, or answers the request (404 / 401 asking for the login). */
-function allow(req, res, coll) {
-  if (!coll.private) return true;
-  if (!privateReady()) { res.sendStatus(404); return false; }
-  if (!login.check(req)) { login.challenge(req, res); return false; }
-  res.set('Cache-Control', 'no-store');   // keep private files out of browser caches
-  return true;
+const wantPrivate = process.argv.includes('--pw');
+const PRIVATE_MODE = wantPrivate && mounted(PRIV);
+if (wantPrivate && !PRIVATE_MODE) console.warn('--pw: data/private is not mounted; showing the public collection.');
+const login = PRIVATE_MODE ? require('./basic_auth').createLogin() : null;
+const ACTIVE = PRIVATE_MODE ? PRIV : PUB;
+console.log(PRIVATE_MODE ? 'Showing the private collection (visitors log in).' : 'Showing the public collection.');
+if (PRIVATE_MODE) {
+  app.use((req, res, next) => {
+    if (!login.check(req)) return login.challenge(req, res);
+    res.set('Cache-Control', 'no-store');   // keep private pages and files out of browser caches
+    next();
+  });
 }
-const collOf = (req) => (req.query.c === 'private' ? PRIV : PUB);
+/** Collections this request may see. */
+const visible = () => [ACTIVE];
+/** Access check for a collection: only the shown one exists (404 otherwise). */
+function allow(req, res, coll) {
+  if (coll === ACTIVE && (!coll.private || mounted(coll))) return true;
+  res.sendStatus(404);
+  return false;
+}
+const collOf = () => ACTIVE;
 
 
 // Bare root goes to the gallery; with query params (?scene=..., etc.) it's the viewer.
@@ -37,15 +45,8 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'web', 'index.html'));
 });
 
-// Log in for the private collection: the browser asks for the login, then keeps sending it.
-app.get('/login', (req, res) => {
-  if (!privateReady()) {
-    return res.status(404).send(login ? 'The private collection is not mounted (data/private).'
-                                      : 'The private collection is off (server started without --pw).');
-  }
-  if (!login.check(req)) return login.challenge(req, res);
-  res.redirect('/list');
-});
+// Old login link: in private mode the login is already required for everything.
+app.get('/login', (req, res) => res.redirect('/list'));
 
 // Scene names (json basenames in an output2 dir), most recently modified first.
 function sortedSceneNames(outDir) {
@@ -121,13 +122,14 @@ app.get('/pano-info/:id', (req, res) => {
   res.json({ ...info, modes: panoModes(p) });
 });
 
-// Collection files: /c/public/... for everyone, /c/private/... only with the login. The old public paths
-// (/output2, /images, /pano) stay for existing links.
-app.use('/c/public', express.static(PUB.root));
-app.use('/c/private', (req, res, next) => { if (allow(req, res, PRIV)) next(); }, express.static(PRIV.root));
-app.use('/output2', express.static(dir(PUB, 'output2')));
-app.use('/images', express.static(dir(PUB, 'images')));
-app.use('/pano', express.static(dir(PUB, 'pano')));
+// Collection files of the shown collection: /c/<id>/...; in public mode also the old paths
+// (/output2, /images, /pano) for existing links.
+app.use(`/c/${ACTIVE.id}`, express.static(ACTIVE.root));
+if (!PRIVATE_MODE) {
+  app.use('/output2', express.static(dir(PUB, 'output2')));
+  app.use('/images', express.static(dir(PUB, 'images')));
+  app.use('/pano', express.static(dir(PUB, 'pano')));
+}
 
 // FPS reports from the viewer while in XR: printed, and appended to
 // logs/xr_perf.jsonl (one JSON object per line) for later analysis. Private scene names are hashed.
@@ -218,14 +220,8 @@ app.get('/pending', (req, res) => {
 });
 
 // Import from Google Photos (Picker API): see google_photos.js for setup; credentials in secrets/.
-// Photos go to the public collection, or the private one (?c=private, logged in).
-require('./google_photos')(app, {
-  imagesDir: (req) => {
-    const coll = collOf(req);
-    return coll.private && !canSeePrivate(req) ? null : dir(coll, 'images');
-  },
-  secretsDir: path.join(__dirname, 'secrets'),
-});
+// Photos go to the shown collection.
+require('./google_photos')(app, { imagesDir: () => dir(ACTIVE, 'images'), secretsDir: path.join(__dirname, 'secrets') });
 
 // View modes a scene can be shown in (gallery page and in-XR gallery grey out the rest).
 function sceneModes(outDir, name) {
@@ -246,7 +242,7 @@ app.get('/scene-modes', (req, res) => {
 });
 
 // Same order as /list, as JSON (used by the viewer to step through scenes); panoramas are "pano:<name>",
-// private scenes "private:..." (only for logged-in visitors).
+// private scenes "private:...".
 app.get('/scenes', (req, res) => {
   try {
     res.json(allSceneEntries(visible(req)).map((s) => s.id));
@@ -259,7 +255,6 @@ app.get('/list', (req, res) => {
   const ui = req.query.ui || 'true';
   let entries;
   try { entries = allSceneEntries(visible(req)); } catch (e) { res.status(500).send('Cannot read directory'); return; }
-  if (canSeePrivate(req)) res.set('Cache-Control', 'no-store');
   // Photo scenes and 360 panoramas (badge, own view modes), most recently modified first; private ones
   // with a lock badge.
   const items = entries.map((s) => {
@@ -303,7 +298,7 @@ app.get('/list', (req, res) => {
         </div>`;
     }).join('\n');
   } catch (e) {}
-  const state = { enabled: privateReady(), loggedIn: canSeePrivate(req) };
+  const state = { mode: ACTIVE.id };
   template = template.replace('<!-- PRIVATE_STATE -->', `<script>window.PRIVATE_STATE = ${JSON.stringify(state)};</script>`);
   template = template.replace('<!-- SCENE_ITEMS_PLACEHOLDER -->', pending + items);
   res.send(template);
@@ -313,7 +308,7 @@ app.get('/list', (req, res) => {
 // Viewer modules (e.g. web/js/XRSceneController.js)
 app.use('/js', express.static(path.join(__dirname, 'web', 'js')));
 
-// Uploads go to the public collection, or the private one (?c=private, logged in).
+// Uploads go to the shown collection.
 const storage = multer.diskStorage({
   destination: function(req, file, cb) {
     cb(null, dir(collOf(req), 'images'));

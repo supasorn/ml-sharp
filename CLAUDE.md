@@ -39,7 +39,9 @@ Quick facts:
 - Data lives in collections (`collections.js`): `data/public/{images,output2,pano,renderings}`
   (the old top-level `images/`, `output2/`, `pano/`, `renderings/` are symlinks into it) and
   `data/private/` = gocryptfs mount of `data/private.cipher` (mounted by the user outside the
-  container; never run gocryptfs here). Private scene ids are `private:<name>` /
-  `private:pano:<name>`, served under `/c/private/...` only when web.js runs with `--pw` (asks for
-  the ZIP password, `basic_auth.js`) and only to visitors who logged in (`/login`). Anything derived
-  from a private scene (thumbnails, bake work files, logs) must stay inside `data/private`.
+  container; never run gocryptfs here). The server shows one collection: `--pw` with
+  `data/private` mounted = private only (asks for the ZIP password, `basic_auth.js`; every request
+  needs the login), otherwise public, open (`scripts/start_server.sh --pw` likewise, watchers for
+  that collection only). Private scene ids are `private:<name>` / `private:pano:<name>` under
+  `/c/private/...`. Anything derived from a private scene (thumbnails, bake work files, logs) must
+  stay inside `data/private`.

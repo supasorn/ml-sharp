@@ -5,11 +5,12 @@
 #   2. prediction watcher (SHARP): images/ -> output2/<scene>.ply + .json;
 #   3. MPI watcher (scripts/bake_mpi.py --watch --mpionly): output2/<scene>.ply ->
 #      <scene>_mpionly.glb + _mpionly_ktx2.glb (the default view; compressed textures, mipmaps).
-# Data collections (collections.js): images/, output2/, ... are symlinks into data/public. When the private
-# collection is mounted (gocryptfs, data/private), 2 and 3 also run for it, entirely inside data/private
-# (their logs too: they contain photo names).
-# Options are passed to web.js: `scripts/start_server.sh --pw` serves the private collection to visitors
-# who log in; this script then asks for the ZIP password and hands it to web.js through a pipe.
+# Data collections (collections.js): the stack serves one of them.
+#   scripts/start_server.sh --pw, with data/private mounted (gocryptfs): the private collection only;
+#     asks for the ZIP password (handed to web.js through a pipe), visitors log in; the watchers work
+#     entirely inside data/private (their logs too: they contain photo names).
+#   otherwise: the public collection (data/public; images/, output2/, ... are symlinks into it), open.
+# Other options are passed on to web.js.
 # A dropped photo shows up in the gallery once predicted (original splats) and in
 # MPI-only once baked. Hybrid / Hybrid-MPI are no longer baked automatically
 # (sharp bake-hybrid, scripts/bake_mpi.py by hand).
@@ -18,7 +19,7 @@
 # processes it started. The stack's host and pids are kept in logs/stack.pids; starting
 # again while an old stack is running on this machine stops the old one first.
 #
-# Logs: logs/web.log, logs/predict.log, logs/mpi.log; data/private/logs/{predict,mpi}.log.
+# Logs: logs/{web,predict,mpi}.log (public) or data/private/logs/{web,predict,mpi}.log (private).
 # Env overrides: SHARP_ENV (conda env, default /conda_envs/sharp),
 #                PREDICT_GPU (default 0), MPI_GPU (default 1).
 set -u
@@ -60,34 +61,44 @@ start() {
   setsid "$@" >> "$log" 2>&1 &
   pids+=($!)
 }
-# Watchers for one collection: prediction (images -> output2) and MPI-only bakes (work files inside it).
+# Watchers for one collection: prediction (images -> output2) and MPI-only bakes. Their work and temp files
+# (TMPDIR: texture compression writes atlas pages there) stay inside the collection, so a private collection's
+# content never lands unencrypted in /tmp.
 start_watchers() {
-  local root="$1" logdir="$2"
-  mkdir -p "$logdir" "$root/renderings"
-  start "$logdir/predict.log" env CUDA_VISIBLE_DEVICES="${PREDICT_GPU:-0}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  local root logdir="$2"
+  mkdir -p "$logdir" "$1/renderings/tmp"
+  root="$(cd "$1" && pwd)"          # absolute: a relative TMPDIR breaks in subprocesses that change directory
+  start "$logdir/predict.log" env TMPDIR="$root/renderings/tmp" CUDA_VISIBLE_DEVICES="${PREDICT_GPU:-0}" \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     "$ENV/bin/sharp" predict-with-info -i "$root/images" -o "$root/output2" --loop
-  start "$logdir/mpi.log" env CUDA_VISIBLE_DEVICES="${MPI_GPU:-1}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  start "$logdir/mpi.log" env TMPDIR="$root/renderings/tmp" CUDA_VISIBLE_DEVICES="${MPI_GPU:-1}" \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     "$ENV/bin/python" scripts/bake_mpi.py -i "$root/output2" --work "$root/renderings/mpi_work" --watch --mpionly
 }
 
+collection="public"
 if [[ " $* " == *" --pw "* ]]; then
-  read -rs -p "ZIP Pass: " zip_pass; echo
-  setsid node web.js "$@" < <(printf '%s\n' "$zip_pass") >> logs/web.log 2>&1 &
-  pids+=($!)
-  unset zip_pass
-else
-  start logs/web.log node web.js "$@"
+  if [ -d data/private/images ] && [ -d data/private/output2 ]; then
+    collection="private (visitors log in; logs in data/private/logs)"
+    read -rs -p "ZIP Pass: " zip_pass; echo
+    mkdir -p data/private/logs data/private/renderings/tmp
+    # Its log can hold photo names (Google imports): kept inside the private collection too.
+    TMPDIR="$PWD/data/private/renderings/tmp" setsid node web.js "$@" < <(printf '%s\n' "$zip_pass") >> data/private/logs/web.log 2>&1 &
+    pids+=($!)
+    unset zip_pass
+    start_watchers data/private data/private/logs
+  else
+    echo "--pw: data/private is not mounted; serving the public collection."
+  fi
 fi
-start_watchers data/public logs
-private="off"
-if [ -d data/private/images ] && [ -d data/private/output2 ]; then
-  start_watchers data/private data/private/logs
-  private="on (watchers log to data/private/logs)"
+if [ "$collection" = "public" ]; then
+  start logs/web.log node web.js "$@"
+  start_watchers data/public logs
 fi
 pidline="$(hostname) $$ ${pids[*]}"      # host first: logs/ may be on a disk shared between machines
 echo "$pidline" > "$PIDFILE"
 
-echo "Started web server, prediction and MPI-only watchers (pids ${pids[*]}). Private collection: $private."
+echo "Started web server, prediction and MPI-only watchers (pids ${pids[*]}). Collection: $collection."
 echo "Gallery: https://$(hostname -I | awk '{print $1}'):3443/   Logs: logs/{web,predict,mpi}.log"
 echo "Stop with Ctrl+C or scripts/stop_server.sh."
 # Stop everything if any one of them exits.

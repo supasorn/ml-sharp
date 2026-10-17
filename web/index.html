@@ -534,6 +534,7 @@
                                // and Spark's per-eye preparation averaged per frame.
                                cpuMs: sparkStats.cpuMs.length ? +sparkStats.cpuMs.sort((x, y) => x - y)[sparkStats.cpuMs.length >> 1].toFixed(2) : null,
                                sparkMs: sparkStats.frames ? +(sparkStats.sparkMs / sparkStats.frames).toFixed(2) : null,
+                               ctrl: xrController.debugState(),
                                ...deviceInfo() }),
       }).catch(() => {});
       sparkStats.rebuilds = 0;

@@ -10,8 +10,8 @@
 # (sharp bake-hybrid, scripts/bake_mpi.py by hand).
 #
 # Each service runs in its own process group, so stopping it also stops the
-# processes it started. The stack's pids are kept in logs/stack.pids; starting
-# again while an old stack is running stops the old one first.
+# processes it started. The stack's host and pids are kept in logs/stack.pids; starting
+# again while an old stack is running on this machine stops the old one first.
 #
 # Logs: logs/web.log, logs/predict.log, logs/mpi.log.
 # Env overrides: SHARP_ENV (conda env, default /conda_envs/sharp),
@@ -29,6 +29,7 @@ if [ -f "$PIDFILE" ]; then
 fi
 
 pids=()
+pidline=
 stopping=0
 cleanup() {
   [ "$stopping" = 1 ] && return
@@ -43,7 +44,8 @@ cleanup() {
     sleep 0.5
   done
   for p in "${pids[@]}"; do kill -KILL -- "-$p" 2>/dev/null; done
-  rm -f "$PIDFILE"
+  # Only our own pid file: a stack started meanwhile (restart) may already have written its own.
+  [ "$(cat "$PIDFILE" 2>/dev/null)" = "$pidline" ] && rm -f "$PIDFILE"
 }
 trap cleanup INT TERM HUP EXIT
 
@@ -56,7 +58,8 @@ start() {
 start web.log node web.js
 start predict.log env CUDA_VISIBLE_DEVICES="${PREDICT_GPU:-0}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "$ENV/bin/sharp" predict-with-info -i images -o output2 --loop
 start mpi.log env CUDA_VISIBLE_DEVICES="${MPI_GPU:-1}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "$ENV/bin/python" scripts/bake_mpi.py -i output2 --watch --mpionly
-echo "$$ ${pids[*]}" > "$PIDFILE"
+pidline="$(hostname) $$ ${pids[*]}"      # host first: logs/ may be on a disk shared between machines
+echo "$pidline" > "$PIDFILE"
 
 echo "Started web server, prediction watcher and MPI-only watcher (pids ${pids[*]})."
 echo "Gallery: https://$(hostname -I | awk '{print $1}'):3443/   Logs: logs/{web,predict,mpi}.log"

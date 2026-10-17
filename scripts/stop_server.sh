@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Stop the stack started by scripts/start_server.sh (pids in logs/stack.pids): ask the start script to stop
+# Stop the stack started by scripts/start_server.sh on this machine (host and pids in logs/stack.pids): ask the start script to stop
 # its services, then make sure every service's process group is gone.
 set -u
 cd "$(dirname "$0")/.."
 PIDFILE=logs/stack.pids
 [ -f "$PIDFILE" ] || { echo "No running stack ($PIDFILE not found)."; exit 0; }
-read -r main services < "$PIDFILE"
+read -r host main services < "$PIDFILE"
+if [[ "$host" =~ ^[0-9]+$ ]]; then                               # old format without the host: "main services..."
+  services="$main${services:+ $services}"; main="$host"; host="$(hostname)"
+fi
+if [ "$host" != "$(hostname)" ]; then                            # logs/ is shared between machines
+  echo "$PIDFILE is from $host, not this machine ($(hostname)); not stopping anything."
+  exit 0
+fi
 kill -TERM "$main" 2>/dev/null                                   # the start script's cleanup stops the services
 for _ in $(seq 1 24); do                                         # wait up to 12 s
   alive=0

@@ -12,8 +12,10 @@ Quick facts:
   runtime preload handled by `load_gsplat()` in `src/sharp/cli/bake_layers.py`.
 - Server: `node web.js` (HTTPS on 3443 for WebXR; `certs/` holds the key —
   never commit it). Gallery at `/list`, viewer at `/?scene=<name>&lod=hybrid`.
-  `scripts/start_server.sh` runs it together with the prediction watcher and
-  the hybrid-bake watcher (`sharp bake-hybrid -i output2 --watch`).
+  `scripts/start_server.sh` runs it together with the prediction watcher, the
+  hybrid-bake watcher (`sharp bake-hybrid -i output2 --watch`) and the MPI
+  watcher (`scripts/bake_mpi.py --watch`); stop it with Ctrl+C or
+  `scripts/stop_server.sh` (pids in `logs/stack.pids`).
 - Bake hybrids: `sharp bake-hybrid -i output2` (outputs next to each scene);
   how-to with options and troubleshooting: `docs/hybrid-baking.md`.
 - Default view is **MPI-only** (`?lod=mpionly`): all splats as a sparse

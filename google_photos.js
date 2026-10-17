@@ -22,6 +22,7 @@
 //   GET  /google/callback      -> OAuth redirect target (stores the token)
 //   POST /google/session       -> { id, pickerUri } (open pickerUri, pick photos)
 //   GET  /google/session/:id   -> { state, total, done, files, error }
+//   POST /google/session/:id/check  (user is back: check the selection now instead of at the next poll)
 //   POST /google/logout        -> forget the stored token
 const fs = require('fs');
 const path = require('path');
@@ -99,7 +100,12 @@ module.exports = function googlePhotos(app, { imagesDir, secretsDir }) {
       const deadline = Date.now() + Math.min(durMs(info.pollingConfig?.timeoutIn, 30 * 60e3), 30 * 60e3);
       while (!info.mediaItemsSet) {
         if (Date.now() > deadline) throw new Error('timed out waiting for a selection');
-        await new Promise((r) => setTimeout(r, Math.max(durMs(info.pollingConfig?.pollInterval, 5000), 2000)));
+        // Sleep until the next poll, or until the gallery reports the user is back (POST .../check).
+        await new Promise((r) => {
+          const timer = setTimeout(r, Math.max(durMs(info.pollingConfig?.pollInterval, 5000), 2000));
+          s.wake = () => { clearTimeout(timer); r(); };
+        });
+        s.wake = null;
         info = await api('GET', `${PICKER}/sessions/${id}`);
       }
       // 2. List the picked items.
@@ -183,10 +189,19 @@ module.exports = function googlePhotos(app, { imagesDir, secretsDir }) {
     }
   });
 
+  // The gallery tab regained focus (user is back from the picker): check the selection now.
+  app.post('/google/session/:id/check', (req, res) => {
+    const s = sessions.get(req.params.id);
+    if (!s) return res.status(404).json({ error: 'unknown session' });
+    if (s.wake) s.wake();
+    res.sendStatus(204);
+  });
+
   app.get('/google/session/:id', (req, res) => {
     const s = sessions.get(req.params.id);
     if (!s) return res.status(404).json({ error: 'unknown session' });
-    res.json(s);
+    const { wake, ...out } = s;
+    res.json(out);
   });
 
   app.post('/google/logout', (req, res) => {

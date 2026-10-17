@@ -204,7 +204,6 @@
       font-size: 15px; cursor: pointer; margin-top: 10px; text-decoration: none; display: inline-block;
     }
     #gModal .gbtn.secondary { background: #3a3f48; }
-    #gModal #gQr { background: #fff; padding: 10px; display: inline-block; margin: 10px 0; border-radius: 6px; }
     #gModal code { background: #15181c; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
     #gModal .gstatus { margin-top: 10px; color: #b2d1ff; }
     .opt-auto { margin-left: 6px; padding: 2px 8px; border-radius: 10px; border: 1px solid #555; background: transparent;
@@ -591,60 +590,72 @@
     let gPoll = null;
     function gShow(html) { $('#gBox').html(html + '<div style="text-align:right"><button class="gbtn secondary" id="gClose">Close</button></div>'); $('#gModal').css('display', 'flex'); }
     function gClose() { clearInterval(gPoll); gPoll = null; $('#gModal').hide(); }
+    // One click: open the picker tab right away (inside the click, so it is not blocked as a popup) and
+    // point it at the Google picker once the session exists; close it again if sign-in/setup is needed.
     async function gOpen() {
+      const win = window.open('about:blank', '_blank');
+      const fail = (html) => { if (win) win.close(); gShow(html); };
       let st;
-      try { st = await (await fetch('/google/status')).json(); } catch (e) { return gShow('<h3>Import from Google</h3><p>Server not reachable.</p>'); }
+      try { st = await (await fetch('/google/status')).json(); } catch (e) { return fail('<h3>Import from Google</h3><p>Server not reachable.</p>'); }
       if (!st.configured) {
-        return gShow('<h3>Import from Google</h3><p>Not set up yet. Create an OAuth client (type <b>Web application</b>) in a '
+        return fail('<h3>Import from Google</h3><p>Not set up yet. Create an OAuth client (type <b>Web application</b>) in a '
           + 'Google Cloud project with the <b>Photos Picker API</b> enabled, then put its credentials in '
           + '<code>secrets/google_oauth.json</code> on the server:</p><p><code>{"client_id": "…", "client_secret": "…", '
           + '"redirect_uri": "http://localhost:3000/google/callback"}</code></p><p>Details: <code>google_photos.js</code>.</p>');
       }
       if (!st.signedIn) {
         const local = ['localhost', '127.0.0.1'].includes(location.hostname);
-        return gShow('<h3>Import from Google</h3><p>Sign in once to allow picking photos. Google only accepts '
+        return fail('<h3>Import from Google</h3><p>Sign in once to allow picking photos. Google only accepts '
           + `<code>${st.redirectUri}</code> as the return address, so open this page via localhost for the sign-in `
           + '(on the server, or through <code>ssh -L 3000:localhost:3000 &lt;server&gt;</code>). After that, imports work '
           + 'from any device.</p>'
           + (local ? '<a class="gbtn" href="/google/login" target="_blank">Sign in with Google</a>'
                    : '<a class="gbtn" href="http://localhost:3000/google/login" target="_blank">Sign in with Google (via localhost)</a>'));
       }
-      gShow('<h3>Import from Google</h3><p>Pick photos in Google Photos; they are downloaded here and processed '
-        + 'automatically (original splats first, then the other view modes).</p>'
-        + '<button class="gbtn" id="gStart">Choose photos</button>');
-    }
-    async function gStart() {
       let j;
       try {
         const r = await fetch('/google/session', { method: 'POST' });
         j = await r.json();
         if (!r.ok) throw new Error(j.error || r.status);
-      } catch (e) { return gShow(`<h3>Import from Google</h3><p>Could not start: ${e.message}</p>`); }
-      gShow('<h3>Pick your photos</h3><p>Open the picker here or scan the code with your phone, select photos, '
-        + 'then tap <b>Done</b>.</p>'
-        + `<p><a class="gbtn" href="${j.pickerUri}" target="_blank" rel="noopener">Open Google Photos picker</a></p>`
-        + '<div id="gQr"></div><div class="gstatus" id="gStatus">Waiting for your selection…</div>');
-      $.getScript('https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js', () => {
-        new QRCode(document.getElementById('gQr'), { text: j.pickerUri, width: 180, height: 180 });
-      });
-      gPoll = setInterval(async () => {
-        let s;
-        try { s = await (await fetch(`/google/session/${j.id}`)).json(); } catch (e) { return; }
-        const el = $('#gStatus');
-        if (s.state === 'picking') el.text('Waiting for your selection…');
-        else if (s.state === 'downloading') el.text(`Downloading ${s.done}/${s.total}…`);
-        else if (s.state === 'done') {
-          clearInterval(gPoll); gPoll = null;
-          el.html(`Imported ${s.done} photo${s.done === 1 ? '' : 's'}`
-            + (s.skipped ? ` (${s.skipped} video${s.skipped === 1 ? '' : 's'} skipped)` : '')
-            + (s.failed ? `, ${s.failed} failed` : '') + '. They appear in the gallery once processed '
-            + '(about a minute each). <a href="#" onclick="location.reload();return false;">Refresh gallery</a>');
-        } else if (s.state === 'error') {
-          clearInterval(gPoll); gPoll = null;
-          el.text(`Import failed: ${s.error}`);
-        }
-      }, 2000);
+      } catch (e) { return fail(`<h3>Import from Google</h3><p>Could not start: ${e.message}</p>`); }
+      const pickerUrl = `${j.pickerUri}/autoclose`;
+      if (win) { win.opener = null; win.location.href = pickerUrl; }
+      // The link stays as a fallback in case the browser blocked the tab.
+      gShow('<h3>Import from Google</h3><p>Select photos in the picker, then tap <b>Done</b>; they are downloaded here and '
+        + 'processed automatically (original splats first, then the other view modes).</p>'
+        + `<p><a class="gbtn secondary" href="${pickerUrl}" target="_blank" rel="noopener">Reopen picker</a></p>`
+        + '<div class="gstatus" id="gStatus">Waiting for your selection…</div>');
+      gSession = j.id;
+      gPoll = setInterval(gRefresh, 1000);
     }
+    let gSession = null;
+    async function gRefresh() {
+      if (!gPoll) return;
+      let s;
+      try { s = await (await fetch(`/google/session/${gSession}`)).json(); } catch (e) { return; }
+      if (!gPoll) return;
+      const el = $('#gStatus');
+      if (s.state === 'picking') el.text('Waiting for your selection…');
+      else if (s.state === 'downloading') el.text(`Downloading ${s.done}/${s.total}…`);
+      else if (s.state === 'done') {
+        clearInterval(gPoll); gPoll = null;
+        el.html(`Imported ${s.done} photo${s.done === 1 ? '' : 's'}`
+          + (s.skipped ? ` (${s.skipped} video${s.skipped === 1 ? '' : 's'} skipped)` : '')
+          + (s.failed ? `, ${s.failed} failed` : '') + '. They appear in the gallery once processed '
+          + '(about a minute each). <a href="#" onclick="location.reload();return false;">Refresh gallery</a>');
+      } else if (s.state === 'error') {
+        clearInterval(gPoll); gPoll = null;
+        el.text(`Import failed: ${s.error}`);
+      }
+    }
+    // Back from the picker tab: have the server check the selection right away instead of at its next poll.
+    async function gBack() {
+      if (!gPoll || document.visibilityState !== 'visible') return;
+      try { await fetch(`/google/session/${gSession}/check`, { method: 'POST' }); } catch (e) {}
+      setTimeout(gRefresh, 300);
+    }
+    document.addEventListener('visibilitychange', gBack);
+    window.addEventListener('focus', gBack);
 
     // Reload when the set of photos being processed changes (a photo arrived, e.g. from a Google import,
     // or finished and became a scene), unless a dialog is open.
@@ -659,7 +670,7 @@
 
     $(document).ready(function () {
       $('#google_import').on('click', gOpen);
-      $('#gModal').on('click', '#gClose', gClose).on('click', '#gStart', gStart)
+      $('#gModal').on('click', '#gClose', gClose)
         .on('click', function (e) { if (e.target === this) gClose(); });
       applyOpts();
       renderPerfLinks();

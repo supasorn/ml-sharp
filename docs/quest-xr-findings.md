@@ -41,7 +41,6 @@ env's `bin/` (ninja) on PATH. Use the conda env `/conda_envs/sharp`.
 | `foveation` | 1 | Quest fixed foveation (0 off … 1 max; blurs the periphery). |
 | `xrstddev` | 2.24 (√5) | Splat extent in sigmas in XR (Spark default √8 = 2.83). |
 | `xrmaxpx` | 512 | Max splat radius on screen (Spark `maxPixelRadius`). |
-| `xrpush` | 0 | Start the scene this many metres further away. |
 | `adaptive` | 0 | Lower splat extent / size cap / foveation when frames drop. |
 | `splatdraw` | (triangles) | `instanced` = Spark's own drawing, `quads` = non-instanced quads. |
 | `bench` | — | Self-running benchmark (see §6). |

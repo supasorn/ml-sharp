@@ -59,6 +59,64 @@ BINS = int(os.environ.get("BINS", 0))
 MPI = bool(os.environ.get("MPI"))
 BINMODE = os.environ.get("BINMODE", "uniform")   # MPI bins: uniform in disparity, or kmeans (where the content is)
 REFINE = bool(os.environ.get("REFINE"))
+# MPI + REFINE, SNAP=1: cell corners near the front surface (seen from the input view, all splats rendered
+# together) take that surface's depth instead of their bin's own, so strips of neighbouring bins on one surface
+# (a face, a receding wall) meet at the same depth instead of separating into a visible stack when the viewer
+# moves closer. A corner may snap only where the surface is covered and smooth around it (its 4 cells agree
+# within SNAP_REL: no depth edge) and the bin's own corner is within min(SNAP_TOL bin widths, SNAP_REL of the
+# disparity) of it. SNAP_WHERE=all snaps every such corner; =seams only corners where >= 2 bins qualify (where
+# strips meet; elsewhere a bin keeps its own relief). SNAP_VALUE=cell: the surface averaged over the 4 cells
+# around the corner; =point: averaged over SNAP_BOX px at the corner (keeps more relief).
+# REFINE_MODE=mean (default): a cell's depth is the alpha-weighted mean disparity of its bin's splats and a
+# corner the mean of the cells around it. =plane: a weighted least-squares plane of disparity per cell (ridge
+# PLANE_REG on the slopes, so tiny or thin patches fall back to the mean), evaluated at the corners (clamped to
+# the bin's range, see PLANE_MARGIN) and averaged over the cells around each corner by alpha. A strip ending
+# inside a cell then gets the depth the surface has at its end, so strips of neighbouring bins meet (no crack
+# when moving) while each cell's content stays at its own depth.
+REFINE_MODE = os.environ.get("REFINE_MODE", "mean")
+# MPI: cell size per bin by distance (parallax): bins nearer than NEAR_M metres use TILE_NEAR px cells (finer
+# geometry where head moves shift things most), bins farther than FAR_M use TILE_FAR (fewer triangles where
+# nothing moves); others TILE. Each bin stays uniform inside (crack-free); 0 = off.
+TILE_NEAR = int(os.environ.get("TILE_NEAR", 0))
+NEAR_M = float(os.environ.get("NEAR_M", 2.0))
+TILE_FAR = int(os.environ.get("TILE_FAR", 0))
+FAR_M = float(os.environ.get("FAR_M", 20.0))
+PLANE_REG = float(os.environ.get("PLANE_REG", 0.01))
+PLANE_MARGIN = float(os.environ.get("PLANE_MARGIN", 0.0))   # clamp corners to the bin's range +- this many bin
+# widths; 0 keeps bins disjoint in depth, so the fixed far-to-near draw order stays exact (layers never cross)
+# MPI + REFINE, SURF=1: surface pieces. Per cell, runs of occupied bins (gaps of at most SURF_GAP empty bins,
+# never across a multiple of SURF_SPAN bins, so neighbouring cells cut a surface at the same depths) become one
+# piece: their bins' textures composited front to back (exact at the input view), one least-squares plane of
+# disparity weighted by visible alpha. Pieces of neighbouring cells share a corner where their planes meet there
+# within SURF_JOIN bin widths (pieces with the same bins first, so a thick shell's sheets aren't sheared; one
+# piece per cell), so a face is one connected sheet and tears only at depth jumps; content within a run (hair
+# over skin) is pressed onto its plane. Found on two scenes (hand, faces): cutting runs from each cell's own
+# nearest bin (SURF_ALIGN=0) chops steep surfaces differently per cell and tears them; one bin per piece
+# (SURF_SPAN=1, SURF_JOIN=0.3) scores best but strips the forehead like plain MPI; cutting where a bin stops
+# adding visible surface (SURF_VIS) tears faces; joins of 1 bin leave tears, of 3 smooth.
+SURF = bool(os.environ.get("SURF"))
+SURF_GAP = int(os.environ.get("SURF_GAP", 1))
+SURF_SPAN = int(os.environ.get("SURF_SPAN", 8))
+SURF_JOIN = float(os.environ.get("SURF_JOIN", 3.0))
+SURF_VIS = float(os.environ.get("SURF_VIS", 0))
+SURF_ALIGN = os.environ.get("SURF_ALIGN", "1") != "0"
+SURF_LINK = float(os.environ.get("SURF_LINK", 0.5))   # > 1: never link
+OVERLAP = float(os.environ.get("OVERLAP", 2 if os.environ.get("SURF") else 0))   # see export_glb
+SURF_GROUP = os.environ.get("SURF_GROUP", "match")   # chain: the first version's corner grouping
+SURF_FILL = int(os.environ.get("SURF_FILL", 0))      # render px of the seam band filled (0 = off)
+SURF_LINK_PLANE = bool(os.environ.get("SURF_LINK_PLANE"))   # linked pieces share one plane (tested: worse)
+SNAP = bool(os.environ.get("SNAP"))
+SNAP_TOL = float(os.environ.get("SNAP_TOL", 2.0))
+SNAP_REL = float(os.environ.get("SNAP_REL", 0.03))
+SNAP_WHERE = os.environ.get("SNAP_WHERE", "all")
+SNAP_VALUE = os.environ.get("SNAP_VALUE", "cell")
+SNAP_BOX = int(os.environ.get("SNAP_BOX", 5))
+SNAP_TAG = ((f"n{TILE_NEAR}-{NEAR_M:g}" if TILE_NEAR else "") + (f"f{TILE_FAR}-{FAR_M:g}" if TILE_FAR else "")
+            + ("p" + (f"m{PLANE_MARGIN:g}" if PLANE_MARGIN else "") if REFINE_MODE == "plane" else "")
+            + (f"s{SNAP_WHERE[0]}{SNAP_VALUE[0]}{SNAP_BOX if SNAP_VALUE == 'point' else ''}" if SNAP else "")
+            + (f"S{SURF_SPAN}g{SURF_GAP}j{SURF_JOIN:g}" + (f"v{SURF_VIS:g}" if SURF_VIS else "") + ("a" if SURF_ALIGN else "") + f"f{SURF_FILL}" + (f"L{SURF_LINK:g}" if SURF_LINK_PLANE else "") + (f"o{OVERLAP:g}" if OVERLAP else "") + ("c" if SURF_GROUP == "chain" else "") if SURF else ""))
+EVAL_EYES = [e for e in os.environ.get("EVAL_EYES", "").split(",") if e]   # eval: only these eyes (default all)
+ZEYE = float(os.environ.get("ZEYE", 0))           # eval: extra eyes this far forward (and forward + sideways)
 CULL = float(os.environ.get("CULL", 0))
 OCC = bool(os.environ.get("OCC"))
 NOMESH = bool(os.environ.get("NOMESH"))          # MPI-only: all splats of the original .ply, no hybrid mesh
@@ -166,6 +224,212 @@ def composite_vals(vals, pix, key, mrgb, npix):
 T0 = time.time()                                   # per-run clock for the timing in log lines
 
 
+def snap_corners(bins, cd_l, surf, binw):
+    """SNAP: replace bins' corner disparities by the front surface's where allowed (see SNAP above).
+
+    bins: per bin with cells, (bin, G (ny+1, nx+1) corner disparities, used (ny+1, nx+1), cyn, cxn);
+    cd_l: per-bin corner lists to fill (None placeholders, same order); surf: (Gs value, Gs_ok).
+    """
+    Gs, ok = surf
+    D = np.stack([g for _, g, _, _, _ in bins])
+    used = np.stack([u for _, _, u, _, _ in bins])
+    tol = np.minimum(SNAP_TOL * binw, SNAP_REL * Gs)
+    near = used & ok[None] & (np.abs(D - Gs[None]) <= tol[None])
+    if SNAP_WHERE == "seams":
+        near &= (near.sum(0) >= 2)[None]
+    D = np.where(near, Gs[None], D)
+    slots = [i for i, c in enumerate(cd_l) if c is None]
+    for slot, (n, (_, _, _, cyn, cxn)) in zip(slots, enumerate(bins)):
+        G = D[n]
+        cd_l[slot] = np.stack([G[cyn, cxn], G[cyn, cxn + 1], G[cyn + 1, cxn], G[cyn + 1, cxn + 1]], 1)
+    print(f"  surface snap ({SNAP_WHERE}, {SNAP_VALUE}): {int(near.sum())} of {int(used.sum())} bin corners "
+          f"({near.sum() / max(1, used.sum()):.1%}) took the front surface's depth", flush=True)
+
+
+def surface_pieces(surf_l, crops, crops_b, rect_l, cen_l, cd_l, cell, nx, lo, hi, edges):
+    """SURF: merge the bins' cells into surface pieces (see SURF); appends to the cell lists like one bin."""
+    ks = np.concatenate([np.full(len(e[1]), e[0]) for e in surf_l])
+    cid = np.concatenate([e[1] for e in surf_l])
+    o = np.lexsort((-ks, cid))                            # by cell, nearest bin first
+    ks, cid = ks[o], cid[o]
+    tex = torch.cat([e[2] for e in surf_l])[torch.tensor(o, device=dev)]
+    texb = torch.cat([e[3] for e in surf_l])[torch.tensor(o)] if surf_l[0][3] is not None else None
+    pdisp = torch.cat([e[4] for e in surf_l])[torch.tensor(o, device=dev)]
+    surf_l.clear()
+    N = len(ks)
+    # Pieces, all cells at once, walking each cell's bins near to far: a bin joins the cell's current piece
+    # while it adds visible surface there (at least SURF_VIS of its alpha lands where the piece is still
+    # transparent: a steep surface reaching other pixels at other depths, skin between hair strands), within
+    # SURF_GAP empty bins and SURF_SPAN bins; else (mostly behind what the piece already covers: the fill SHARP
+    # puts behind surfaces) the piece is closed and the bin starts the next one. Textures: front-to-back "over"
+    # of premultiplied RGBA; plane statistics: each texel's disparity weighted by its visible alpha.
+    ucid, cstart, ccount = np.unique(cid, return_index=True, return_counts=True)
+    nC = len(ucid)
+    tc = (torch.arange(cell, device=dev, dtype=torch.float64) + 0.5) / cell - 0.5
+    Xc, Yc = tc[None, None, :], tc[None, :, None]
+    A = torch.zeros(nC, cell, cell, 4, device=dev); T = torch.ones(nC, cell, cell, 1, device=dev)
+    if texb is not None:
+        cbs = texb.shape[1:3]
+        Ab = torch.zeros((nC,) + tuple(texb.shape[1:]), device=dev); Tb = torch.ones((nC,) + tuple(cbs) + (1,), device=dev)
+    ST = torch.zeros(nC, 9, device=dev, dtype=torch.float64)
+    has = np.zeros(nC, bool); kn = np.zeros(nC, np.int64); kf = np.zeros(nC, np.int64)
+    lk = np.zeros(nC, bool)                               # current piece continues the one before (SURF_LINK)
+    P_tex, P_texb, P_st, P_kn, P_kf, P_c, P_lk = [], [], [], [], [], [], []
+
+    def emit(ci):                                         # close the current pieces of cells ci
+        if len(ci) == 0:
+            return
+        ct = torch.tensor(ci, device=dev)
+        P_tex.append(A[ct].half()); P_st.append(ST[ct].cpu().numpy())
+        if texb is not None:
+            P_texb.append(Ab[ct].half().cpu())
+        P_kn.append(kn[ci].copy()); P_kf.append(kf[ci].copy()); P_c.append(ucid[ci]); P_lk.append(lk[ci].copy())
+        A[ct] = 0; T[ct] = 1; ST[ct] = 0
+        if texb is not None:
+            Ab[ct] = 0; Tb[ct] = 1
+        has[ci] = False
+
+    for r in range(ccount.max()):
+        ci = np.nonzero(ccount > r)[0]
+        e = cstart[ci] + r
+        k = ks[e]
+        et = torch.tensor(e, device=dev); ct = torch.tensor(ci, device=dev)
+        c = tex[et].float()
+        a = c[..., 3]
+        vis = ((T[ct, ..., 0] * a).sum((1, 2)) / a.sum((1, 2)).clamp(min=1e-9)).cpu().numpy()
+        deep = (kn[ci] // SURF_SPAN != k // SURF_SPAN) if SURF_ALIGN else (kn[ci] - k >= SURF_SPAN)
+        gap_ = (vis < SURF_VIS) | (kf[ci] - k > SURF_GAP + 1)
+        split = has[ci] & (gap_ | deep)
+        fresh = ~has[ci]
+        emit(ci[split])
+        lk[ci[fresh]] = False
+        lk[ci[split]] = (~gap_ & (vis >= SURF_LINK))[split]
+        new_ = ~has[ci]
+        kn[ci[new_]] = k[new_]
+        wv = (T[ct, ..., 0] * a).double()
+        pv = pdisp[et].double()
+        Sc = lambda f_: (wv * f_).sum((1, 2))
+        ST[ct] += torch.stack([Sc(1.0), Sc(Xc), Sc(Yc), Sc(Xc * Xc), Sc(Yc * Yc), Sc(Xc * Yc),
+                               Sc(pv), Sc(pv * Xc), Sc(pv * Yc)], 1)
+        A[ct] += T[ct] * c
+        T[ct] *= 1 - c[..., 3:]
+        if texb is not None:
+            cb_ = texb[torch.tensor(e)].to(dev).float()
+            Ab[ct] += Tb[ct] * cb_
+            Tb[ct] *= 1 - cb_[..., 3:]
+        kf[ci] = k; has[ci] = True
+    emit(np.nonzero(has)[0])
+    del A, T, tex
+    pc = np.concatenate(P_c); k_near = np.concatenate(P_kn); k_far = np.concatenate(P_kf)
+    o3 = np.lexsort((-k_near, pc))                        # by cell, nearest first
+    pc, k_near, k_far = pc[o3], k_near[o3], k_far[o3]
+    st = np.concatenate(P_st)[o3]
+    lnk = np.concatenate(P_lk)[o3]
+    out = torch.cat(P_tex)[torch.tensor(o3, device=dev)]
+    outb = torch.cat(P_texb)[torch.tensor(o3)] if texb is not None else None
+    # Seam fill: a piece continuing the visible surface of the one before it in its cell (cut only by an
+    # aligned depth boundary, see SURF_LINK) also carries that piece's colour where it is opaque, underneath
+    # it: hidden at the input view, it fills the seam that opens between the two when the head moves (the
+    # cheek's own colour instead of what is behind it).
+    if SURF_FILL:
+        for i in np.nonzero(lnk)[0]:
+            for t_ in (out, outb):
+                if t_ is None:
+                    continue
+                f_, b_ = t_[i - 1].float(), t_[i].float()
+                near = torch.nn.functional.max_pool2d((b_[None, None, ..., 3] > 0.1).float(), 2 * SURF_FILL + 1, 1,
+                                                      SURF_FILL)[0, 0, ..., None] > 0      # band along the seam
+                t_[i] = torch.where((f_[..., 3:] > 0.9) & near, f_ + (1 - f_[..., 3:]) * b_, b_).half()
+    nS = len(pc)
+    # A piece cut off only by an aligned depth boundary (SURF_ALIGN) while its first bin still adds visible
+    # surface (at least SURF_LINK of its alpha where the piece before is transparent: a cheek curving across
+    # the boundary) continues that surface: linked pieces keep their textures but share one plane and their
+    # corners (else the boundary is a seam inside the cell, as between MPI bins). Geometry and corner sharing
+    # below are per surface (linked pieces together).
+    ent = np.cumsum(~(lnk & SURF_LINK_PLANE)) - 1
+    fE = np.r_[0, np.nonzero(np.diff(ent))[0] + 1]
+    lE = np.r_[fE[1:] - 1, nS - 1]
+    chain = (np.cumsum(~lnk) - 1)[fE]                    # pieces continuing one visible surface in a cell
+    pieces = (pc, k_near, k_far, st, nS)
+    pc, k_near, k_far, st, nS = pc[fE], k_near[fE], k_far[lE], np.add.reduceat(st, fE, axis=0), len(fE)
+    # Geometry: one plane per piece from the summed statistics, corners clamped to its bins' range +- 1 bin.
+    sw, sx, sy, sxx, syy, sxy, sp, spx, spy = st.T
+    lam = PLANE_REG * sw
+    Mp = np.stack([np.stack([sw, sx, sy], -1), np.stack([sx, sxx + lam, sxy], -1),
+                   np.stack([sy, sxy, syy + lam], -1)], -2) + 1e-9 * np.eye(3)
+    c0, cxs, cys = np.linalg.solve(Mp, np.stack([sp, spx, spy], -1)[..., None])[..., 0].T
+    bw = (hi - lo) / BINS
+    e_all = np.r_[lo, edges, hi]
+    d_lo, d_hi = e_all[k_far] - bw, e_all[k_near + 1] + bw
+    pcy, pcx = pc // nx, pc % nx
+    pred = np.stack([np.clip(c0 + cxs * (ox - 0.5) + cys * (oy - 0.5), d_lo, d_hi)
+                     for oy in (0, 1) for ox in (0, 1)], 1)           # x0y0, x1y0, x0y1, x1y1
+    # Shared corners: at each grid corner, groups of the pieces around it whose planes meet within SURF_JOIN
+    # bins there. The most visible pieces anchor groups (faint fuzz in front of a surface must not split it).
+    # Each piece joins, among the groups within SURF_JOIN without a piece of its cell yet (pieces of one cell
+    # are separate surfaces), the one sharing most of its bins (a thick shell is several sheets; pairing its
+    # bins arbitrarily would shear them), else the nearest (a strip ending where its neighbour continues in the
+    # next bin), else starts its own.
+    key = np.stack([(pcy + oy) * (nx + 1) + pcx + ox for oy in (0, 1) for ox in (0, 1)], 1).ravel()
+    pv, wv, cv, chv = pred.ravel(), np.repeat(sw, 4), np.repeat(pc, 4), np.repeat(chain, 4)
+    klo, khi = np.repeat(k_far, 4), np.repeat(k_near, 4)
+    o2 = np.lexsort((-wv, key))                           # per corner, most visible first
+    ko, po, co, lo_, hi_, cho = key[o2], pv[o2], cv[o2], klo[o2], khi[o2], chv[o2]
+    gid = np.empty(len(o2), np.int64)
+    starts = np.r_[0, np.nonzero(np.diff(ko))[0] + 1, len(o2)]
+    ng = 0
+    if SURF_GROUP == "chain":                             # first version: near to far, chained within SURF_JOIN
+        o2 = np.lexsort((pv, key))
+        brk = np.r_[True, (np.diff(key[o2]) != 0) | (np.diff(pv[o2]) > SURF_JOIN * bw)]
+        gid = np.cumsum(brk) - 1
+        starts = starts[:0]
+    for a_, b_ in zip(starts[:-1], starts[1:]):
+        groups = []                                       # [anchor disparity, klo, khi, cells, id, chains]
+        for i in range(a_, b_):
+            best, bs = None, None
+            for g in groups:
+                dd = abs(po[i] - g[0])
+                if dd <= SURF_JOIN * bw and (co[i] not in g[3] or cho[i] in g[5]):
+                    sc_ = (min(hi_[i], g[2]) - max(lo_[i], g[1]), -dd)
+                    if bs is None or sc_ > bs:
+                        best, bs = g, sc_
+            if best is None:
+                best = [po[i], lo_[i], hi_[i], set(), ng, set()]; ng += 1; groups.append(best)
+            best[3].add(co[i]); best[5].add(cho[i]); gid[i] = best[4]
+    cl = gid
+    m = np.bincount(cl, pv[o2] * wv[o2]) / np.maximum(np.bincount(cl, wv[o2]), 1e-12)
+    shared = np.empty_like(pv); shared[o2] = m[cl]
+    cd = shared.reshape(nS, 4)[ent]
+    nE = nS
+    pred = pred[ent]
+    pc, k_near, k_far, st, nS = pieces
+    pcy, pcx = pc // nx, pc % nx
+    sw, sp = st[:, 0], st[:, 6]
+    # Keep each cell's pieces in their depth order at every corner (a back piece pulled in front of the one
+    # before it by its corners would show through it, e.g. a dark strap behind a shirt).
+    if os.environ.get("SURF_ORDER", "1") != "0":
+        for i in np.nonzero(pc[1:] == pc[:-1])[0] + 1:   # pieces are by cell, nearest first
+            cd[i] = np.minimum(cd[i], cd[i - 1] - 1e-3 * bw)
+    nb = np.bincount(cl)
+    if os.environ.get("SURF_DEBUG"):                     # x0,y0,x1,y1 in GW-wide photo px: dump the pieces there
+        x0_, y0_, x1_, y1_ = (float(v) for v in os.environ["SURF_DEBUG"].split(","))
+        gsz = np.empty_like(pv); gsz[o2] = nb[cl]
+        gsz = gsz.reshape(nE, 4)[ent]
+        for i in range(nS):
+            px0, py0 = (pcx[i] * cell - MARGIN) / SS, (pcy[i] * cell - MARGIN) / SS
+            if x0_ <= px0 <= x1_ and y0_ <= py0 <= y1_:
+                print(f"  piece {i} cell ({pcx[i]},{pcy[i]}) px ({px0:.0f},{py0:.0f}) bins {k_far[i]}-{k_near[i]} "
+                      f"w {sw[i]:.0f} pred {np.round(pred[i] / bw, 1)} cd {np.round(cd[i] / bw, 1)} group {gsz[i]}")
+    print(f"  surface pieces: {N} bin cells -> {nS} pieces (mean {N / nS:.1f} bins) on {nE} surfaces, "
+          f"{np.mean(nb[cl] > 1):.0%} of piece corners shared", flush=True)
+    crops.append(out.reshape(-1, 4))
+    if outb is not None:
+        crops_b.append((0, outb))
+    rect_l.append(np.stack([pcx * cell, pcy * cell, (pcx + 1) * cell, (pcy + 1) * cell], 1))
+    cen_l.append(sp / np.maximum(sw, 1e-12))
+    cd_l.append(cd)
+
+
 def run(scene: Path):
     global T0
     t0 = T0 = time.time()
@@ -253,6 +517,39 @@ def run(scene: Path):
                     _, al, _ = ev.gs.rendering.rasterization(**sub, viewmats=torch.eye(4, device=dev)[None], Ks=Kc,
                                                              width=Wc, height=Hc, eps2d=ev.EPS)
                     run_T = run_T * (1 - al[0, ..., 0])
+        snap_bins = []                                    # SNAP: (bin, corner disparities, used corners, cells)
+        surf_l = []                                       # SURF: (bin, cell ids, textures, bordered textures, stats)
+        assert not SURF or (REFINE and not (SNAP or TILE_NEAR or TILE_FAR or EXTEND)), "SURF: REFINE, one cell size"
+        if REFINE and SNAP:
+            # Front surface: all splats rendered together (expected depth where alpha > 0.5).
+            out_s, al_s, _ = ev.gs.rendering.rasterization(**kept, viewmats=torch.eye(4, device=dev)[None], Ks=Kc,
+                                                           width=Wc, height=Hc, eps2d=ev.EPS, render_mode="RGB+ED")
+            w_s = (al_s[0, ..., 0] > 0.5).float()
+            disp_s = torch.where(w_s > 0, 1 / out_s[0, ..., 3].clamp(min=1e-6), 0)
+            del out_s, al_s
+            padc = lambda t: torch.nn.functional.pad(t, (0, nx * cell - Wc, 0, ny * cell - Hc))
+            sw = padc(w_s).reshape(ny, cell, nx, cell).sum((1, 3))
+            sd = padc(w_s * disp_s).reshape(ny, cell, nx, cell).sum((1, 3))
+            covered = (sw > 0.5 * cell * cell).double()
+            dsurf = torch.where(sw > 0, sd / sw.clamp(min=1e-9), 0).double()
+            Gc = torch.zeros(ny + 1, nx + 1, device=dev, dtype=torch.float64); Gn_ = torch.zeros_like(Gc)
+            Gmax = torch.zeros_like(Gc); Gmin = torch.full_like(Gc, float("inf"))
+            for oy in (0, 1):
+                for ox in (0, 1):
+                    sl = (slice(oy, oy + ny), slice(ox, ox + nx))
+                    Gc[sl] += dsurf * covered; Gn_[sl] += covered
+                    Gmax[sl] = torch.maximum(Gmax[sl], torch.where(covered > 0, dsurf, 0))
+                    Gmin[sl] = torch.minimum(Gmin[sl], torch.where(covered > 0, dsurf, float("inf")))
+            snap_ok = ((Gn_ == 4) & (Gmax - Gmin <= SNAP_REL * Gmax)).cpu().numpy()
+            if SNAP_VALUE == "point":
+                box = lambda t: torch.nn.functional.avg_pool2d(t[None, None], SNAP_BOX, 1, SNAP_BOX // 2,
+                                                               count_include_pad=False)[0, 0]
+                dsm = box(w_s * disp_s) / box(w_s).clamp(min=1e-6)
+                gy = (torch.arange(ny + 1, device=dev) * cell).clamp(max=Hc - 1)
+                gx = (torch.arange(nx + 1, device=dev) * cell).clamp(max=Wc - 1)
+                snap_val = dsm[gy][:, gx].double().cpu().numpy()
+            else:
+                snap_val = (Gc / Gn_.clamp(min=1)).cpu().numpy()
         for k in reversed(range(BINS)):                      # nearest bin first
             m = b_t == k
             if not m.any():
@@ -261,6 +558,12 @@ def run(scene: Path):
             out, alpha, _ = ev.gs.rendering.rasterization(**sub, viewmats=torch.eye(4, device=dev)[None], Ks=Kc,
                                                           width=Wc, height=Hc, eps2d=ev.EPS, render_mode="RGB+D")
             rgb, a, dacc = out[0, ..., :3], alpha[0, ..., 0], out[0, ..., 3]
+            if TILE_NEAR or TILE_FAR:                       # this bin's cell size (see TILE_NEAR)
+                zk = 1 / max(centers[k], 1e-6)
+                tile_k = TILE_NEAR if TILE_NEAR and zk < NEAR_M else TILE_FAR if TILE_FAR and zk > FAR_M else TILE
+                cell = tile_k * SS
+                ny, nx = -(-Hc // cell), -(-Wc // cell)
+                cb = cell + 2 * gb
             if EXTEND:
                 dk = centers[k]
                 hidden = ((Tfront < 0.02) | (mdisp > dk * 1.01)) & (Tback.pop(k).float() > 0.5 * 255)
@@ -282,12 +585,23 @@ def run(scene: Path):
             cells = img.reshape(ny, cell, nx, cell, 4).permute(0, 2, 1, 3, 4)
             occ = cells[..., 3].amax((2, 3)) >= 1 / 255
             cy, cx = torch.nonzero(occ, as_tuple=True)
+            if SURF:                                         # keep this bin's cells for the pieces (see SURF)
+                padS = lambda t: torch.nn.functional.pad(t, (0, nx * cell - Wc, 0, ny * cell - Hc))
+                pd = torch.where(a > 1e-3, a / dacc.clamp(min=1e-6), 0)
+                Pc = padS(pd).reshape(ny, cell, nx, cell).permute(0, 2, 1, 3)[cy, cx]      # disparity per px
+                selb = None
+                if EXPORT:
+                    pimg = torch.nn.functional.pad(img.permute(2, 0, 1)[None].float(), (gb, gb, gb, gb))
+                    cols = torch.nn.functional.unfold(pimg, cb, stride=cell)[0]
+                    selb = cols[:, cy * nx + cx].reshape(4, cb, cb, -1).permute(3, 1, 2, 0).half().cpu()
+                surf_l.append((k, (cy * nx + cx).cpu().numpy(), cells[cy, cx], selb, Pc))
+                continue
             crops.append(cells[cy, cx].reshape(-1, 4))
             if EXPORT:
                 pimg = torch.nn.functional.pad(img.permute(2, 0, 1)[None].float(), (gb, gb, gb, gb))
                 cols = torch.nn.functional.unfold(pimg, cb, stride=cell)[0]          # (4*cb*cb, ny*nx)
                 sel = cols[:, cy * nx + cx].reshape(4, cb, cb, -1).permute(3, 1, 2, 0)
-                crops_b.append(sel.half().reshape(-1, 4))
+                crops_b.append((sum(len(r) for r in rect_l), sel.half().cpu()))   # (first cell index, (n, cb, cb, 4)), on the CPU
             cyn, cxn = cy.cpu().numpy(), cx.cpu().numpy()
             rect_l.append(np.stack([cxn * cell, cyn * cell, (cxn + 1) * cell, (cyn + 1) * cell], 1))
             cen_l.append(np.full(len(cyn), centers[k]))
@@ -301,22 +615,54 @@ def run(scene: Path):
                 dcell = torch.where(occ, dw / aw.clamp(min=1e-9), 0).double()
                 o = occ.double()
                 G = torch.zeros(ny + 1, nx + 1, device=dev, dtype=torch.float64); Gn = torch.zeros_like(G)
-                for oy in (0, 1):
-                    for ox in (0, 1):
-                        G[oy:oy + ny, ox:ox + nx] += dcell * o; Gn[oy:oy + ny, ox:ox + nx] += o
-                G = (G / Gn.clamp(min=1)).cpu().numpy()
-                cd_l.append(np.stack([G[cyn, cxn], G[cyn, cxn + 1], G[cyn + 1, cxn], G[cyn + 1, cxn + 1]], 1))
+                if REFINE_MODE == "plane":
+                    tc = (torch.arange(cell, device=dev, dtype=torch.float64) + 0.5) / cell - 0.5   # cell coords
+                    A_ = pad_(a).double().reshape(ny, cell, nx, cell)
+                    P_ = pad_(pd).double().reshape(ny, cell, nx, cell)
+                    Xc, Yc = tc[None, None, None, :], tc[None, :, None, None]
+                    Sc = lambda f_: (A_ * f_).sum((1, 3))
+                    sw, sx, sy = Sc(1.0), Sc(Xc), Sc(Yc)
+                    sxx, syy, sxy = Sc(Xc * Xc), Sc(Yc * Yc), Sc(Xc * Yc)
+                    lam = PLANE_REG * sw
+                    Mp = torch.stack([torch.stack([sw, sx, sy], -1), torch.stack([sx, sxx + lam, sxy], -1),
+                                     torch.stack([sy, sxy, syy + lam], -1)], -2)
+                    Mp = Mp + 1e-9 * torch.eye(3, device=dev, dtype=torch.float64)
+                    rhs = torch.stack([Sc(P_), Sc(P_ * Xc), Sc(P_ * Yc)], -1)
+                    c0, cxs, cys = torch.linalg.solve(Mp, rhs[..., None])[..., 0].unbind(-1)
+                    d_lo = (edges[k - 1] if k > 0 else lo) - PLANE_MARGIN * (hi - lo) / BINS
+                    d_hi = (edges[k] if k < BINS - 1 else hi) + PLANE_MARGIN * (hi - lo) / BINS
+                    wcell = torch.where(occ, sw, 0)
+                    for oy in (0, 1):
+                        for ox in (0, 1):
+                            pred = (c0 + cxs * (ox - 0.5) + cys * (oy - 0.5)).clamp(d_lo, d_hi)
+                            G[oy:oy + ny, ox:ox + nx] += pred * wcell; Gn[oy:oy + ny, ox:ox + nx] += wcell
+                    G = torch.where(Gn > 0, G / Gn.clamp(min=1e-12), 0).cpu().numpy()
+                else:
+                    for oy in (0, 1):
+                        for ox in (0, 1):
+                            G[oy:oy + ny, ox:ox + nx] += dcell * o; Gn[oy:oy + ny, ox:ox + nx] += o
+                    G = (G / Gn.clamp(min=1)).cpu().numpy()
+                if SNAP:                                     # decided after all bins (seams need the others)
+                    snap_bins.append((k, G, (Gn > 0).cpu().numpy(), cyn, cxn))
+                    cd_l.append(None)
+                else:
+                    cd_l.append(np.stack([G[cyn, cxn], G[cyn, cxn + 1], G[cyn + 1, cxn], G[cyn + 1, cxn + 1]], 1))
             else:
                 cd_l.append(np.full((len(cyn), 4), centers[k]))
+        if SURF:
+            surface_pieces(surf_l, crops, crops_b, rect_l, cen_l, cd_l, cell, nx, lo, hi, edges)
+        if REFINE and SNAP:
+            assert not (TILE_NEAR or TILE_FAR), "SNAP needs one cell size"
+            snap_corners(snap_bins, cd_l, (snap_val, snap_ok), (hi - lo) / BINS)
         rects = np.concatenate(rect_l).astype(np.int64)
         cen = np.concatenate(cen_l)
         planes = np.stack([np.zeros_like(cen), np.zeros_like(cen), cen], 1)
         cdisp = np.concatenate(cd_l)                      # corner disparities (x0y0, x1y0, x0y1, x1y1) per cell
         P = len(rects)
-        area = np.full(P, cell * cell, np.int64)
+        area = ((rects[:, 2] - rects[:, 0]) * (rects[:, 3] - rects[:, 1])).astype(np.int64)
         off = np.r_[0, np.cumsum(area)[:-1]]
         atlas = torch.cat(crops)
-        border = (torch.cat(crops_b), gb) if EXPORT else None
+        border = (crops_b, gb) if EXPORT else None
         del crops, crops_b
         print(f"{scene.stem}{SUFFIX}: {len(kv)} splats -> sparse MPI, {BINS} {BINMODE} bins (max snap "
               f"{np.diff(np.r_[lo, edges, hi]).max() / 2:.4f} 1/m{', refined cells' if REFINE else ''}), {P} cells of {TILE} px ({2 * P} tris), "
@@ -372,9 +718,10 @@ def run(scene: Path):
     rx0, ry0, rw, rh = R_[:, 0], R_[:, 1], R_[:, 2] - R_[:, 0], R_[:, 3] - R_[:, 1]
     off_t, rw_i = torch.tensor(off, device=dev), (R_[:, 2] - R_[:, 0]).long()
 
+    ov = OVERLAP                                          # quads reach this many render px past their cell
     def inside(prim, ui, vi):
         lx, ly = ui + MARGIN - 0.5 - rx0[prim], vi + MARGIN - 0.5 - ry0[prim]
-        return (lx >= -0.5) & (lx < rw[prim] - 0.5) & (ly >= -0.5) & (ly < rh[prim] - 0.5)
+        return (lx >= -0.5 - ov) & (lx < rw[prim] - 0.5 + ov) & (ly >= -0.5 - ov) & (ly < rh[prim] - 0.5 + ov)
 
     if MPI:
         tri = torch.stack([corners[:, [0, 1, 3]], corners[:, [0, 3, 2]]], 1).reshape(-1, 3, 3)   # prim = 2*cell + half
@@ -535,6 +882,14 @@ def run(scene: Path):
     for mv in (0.1, 0.2, 0.3):
         eyes |= {f"x+{mv}": (mv, 0, 0), f"x-{mv}": (-mv, 0, 0), f"y+{mv/2}": (0, mv / 2, 0),
                  f"z+{0.4*mv:.2f}": (0, 0, 0.4 * mv)}
+    if ZEYE:                                     # moving closer (forward), and closer + sideways
+        eyes |= {f"z+{ZEYE}": (0, 0, ZEYE), f"x+0.2z+{ZEYE}": (0.2, 0, ZEYE)}
+    for e_ in os.environ.get("EXTRA_EYES", "").split(";"):   # name:x,y,z;...
+        if e_:
+            n_, xyz = e_.split(":")
+            eyes[n_] = tuple(float(v) for v in xyz.split(","))
+    if EVAL_EYES:
+        eyes = {k: v for k, v in eyes.items() if k in EVAL_EYES}
     res = {}
     print(f"  size: {int(alive.sum())} cells kept -> {2 * int(alive.sum())} layer triangles"
           f"{'' if NOMESH else f' + {len(M.T)} mesh triangles'}", flush=True)
@@ -591,14 +946,14 @@ def run(scene: Path):
         so = composite_vals(vals, pix, rank[prim], mrgb, W * H).reshape(H, W, 3)
         res[name] = {"H": psnr(R, Hy), "P_exact": psnr(R, ex), "P_sorted": psnr(R, so)}
         print(f"  {name:8s} " + "  ".join(f"{kk} {v:5.2f}" for kk, v in res[name].items()), flush=True)
-        if name in ("0", "x+0.2", "x+0.3"):
+        if name in ("0", "x+0.2", "x+0.3") or (ZEYE and name.endswith(f"z+{ZEYE}")) or EVAL_EYES:
             OUT.mkdir(parents=True, exist_ok=True)
             row = torch.cat([R, Hy, so], 1).clamp(0, 1)
             Image.fromarray((row.cpu().numpy() * 255).astype(np.uint8)).resize((3 * GW, Hg)).save(
-                OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_c{CULL}{"_occ" if OCC else ""}{"_nomesh" if NOMESH else ""}_e{EXTEND}_bg{BG}_{name}.jpg", quality=92)
+                OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}{SNAP_TAG}_c{CULL}{"_occ" if OCC else ""}{"_nomesh" if NOMESH else ""}_e{EXTEND}_bg{BG}_{name}.jpg", quality=92)
         del vals, pix, t, prim, ms
         torch.cuda.empty_cache()
-    (OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}_c{CULL}{"_occ" if OCC else ""}{"_nomesh" if NOMESH else ""}.json").write_text(json.dumps(
+    (OUT / f"{scene.stem}{SUFFIX}_t{TILE}_b{BINS}{BINMODE[0]}{"r" if REFINE else ""}{SNAP_TAG}_c{CULL}{"_occ" if OCC else ""}{"_nomesh" if NOMESH else ""}.json").write_text(json.dumps(
         {"patches": P, "overdraw": float(area.sum() / (W * H)), "psnr": res}, indent=1))
 
 
@@ -618,42 +973,41 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         t = np.pad(t, ((0, h * ds - t.shape[0]), (0, w * ds - t.shape[1]), (0, 0)))
         return t.reshape(h, ds, w, ds, 4).mean((1, 3))
 
-    texs, geo, pad = {}, {}, {}                    # texs: padded texture block; pad: its margin (texels)
+    texs, geo, pad, eo = {}, {}, {}, {}            # texs: padded texture block; pad: its margin (texels)
     if border is not None:
-        atb, gb = border
-        cb = (rects[0, 2] - rects[0, 0]) + 2 * gb
-        assert gb % ds == 0 and cb % ds == 0
-        atb = atb.reshape(-1, cb, cb, 4)
+        groups, gb = border                                           # [(first cell index, (n, cb, cb, 4))]: cells
+        assert gb % ds == 0 and all(t.shape[1] % ds == 0 for _, t in groups)   # of one size per group (bin)
+        N = len(rects)
+        live = np.ones(N, bool) if alive is None else alive.astype(bool)
         # Adaptive resolution: cells that lose the most detail at 1/ds resolution (mean |premultiplied
         # error| after down- and up-sampling, inner part) keep full resolution, worst first, while
         # their error is above TEXFULL_THR and the atlas stays within MAXPAGES pages.
-        full = np.zeros(len(rects), bool)
+        full = np.zeros(N, bool)
         if ds > 1 and TEXFULL_THR > 0:
-            err = torch.empty(len(rects), device=atb.device)
-            for c0 in range(0, len(rects), 8192):
-                t1 = atb[c0:c0 + 8192].float()
-                t2 = torch.nn.functional.avg_pool2d(t1.permute(0, 3, 1, 2), ds)
-                up = torch.nn.functional.interpolate(t2, scale_factor=ds, mode="bilinear", align_corners=False)
-                d = (up - t1.permute(0, 3, 1, 2))[:, :3, gb:cb - gb, gb:cb - gb].abs().mean((1, 2, 3))
-                err[c0:c0 + 8192] = d
-            err = err.cpu().numpy()
-            live = np.ones(len(rects), bool) if alive is None else alive.astype(bool)
+            err = np.full(N, -1.0)
+            half_px = np.zeros(N); extra = np.zeros(N)
+            for st, atb in groups:
+                cb = atb.shape[1]
+                for c0 in range(0, len(atb), 8192):
+                    t1 = atb[c0:c0 + 8192].to(dev).float()
+                    t2 = torch.nn.functional.avg_pool2d(t1.permute(0, 3, 1, 2), ds)
+                    up = torch.nn.functional.interpolate(t2, scale_factor=ds, mode="bilinear", align_corners=False)
+                    d = (up - t1.permute(0, 3, 1, 2))[:, :3, gb:cb - gb, gb:cb - gb].abs().mean((1, 2, 3))
+                    err[st + c0:st + c0 + len(t1)] = d.cpu().numpy()
+                half_px[st:st + len(atb)] = (cb // ds) ** 2
+                extra[st:st + len(atb)] = cb * cb - (cb // ds) ** 2
             err[~live] = -1                                          # culled cells: never upgraded, not budgeted
-            budget = 0.75 * MAXPAGES * page * page - live.sum() * (cb // ds) ** 2
-            extra = cb * cb - (cb // ds) ** 2
+            budget = 0.75 * MAXPAGES * page * page - half_px[live].sum()
             cand = np.argsort(-err)
-            cand = cand[err[cand] > TEXFULL_THR][:max(0, int(budget // extra))]
+            cand = cand[err[cand] > TEXFULL_THR]
+            cand = cand[np.cumsum(extra[cand]) <= budget]
             full[cand] = True
-            print(f"  adaptive textures: {full.sum()} of {len(rects)} cells at full resolution "
+            print(f"  adaptive textures: {full.sum()} of {N} cells at full resolution "
                   f"(error > {TEXFULL_THR}, budget {MAXPAGES} pages)", flush=True)
-        # Batched (GPU, chunked): every cell's texture at its chosen resolution (full, or box-downsampled by ds;
-        # premultiplied, so averaging is exact), and the bounding box of its texels with alpha inside the cell.
-        # Textures stay 8-bit from here on.
-        live = np.ones(len(rects), bool) if alive is None else alive.astype(bool)
+        # Batched (GPU, chunked) per cell size: every cell's texture at its chosen resolution (full, or
+        # box-downsampled by ds; premultiplied, so averaging is exact), and the bounding box of its texels with
+        # alpha inside the cell. Textures stay 8-bit from here on.
         g2 = gb // ds
-        half_u8 = np.zeros((len(rects), cb // ds, cb // ds, 4), np.uint8)
-        bbox = np.full((len(rects), 4), -1, np.int64)                 # first row, last row, first col, last col
-        full_t = torch.tensor(full, device=atb.device)
 
         def first_last(m):                                            # m: (n, L) bool -> first, last index (or -1)
             anyv = m.any(1)
@@ -662,33 +1016,43 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
             first = torch.where(m, idx, L).amin(1)
             last = torch.where(m, idx, -1).amax(1)
             return torch.where(anyv, first, -1), torch.where(anyv, last, -1)
-        for c0 in range(0, len(rects), 16384):
-            t1 = atb[c0:c0 + 16384].float().clamp(0, 1)                # (n, cb, cb, 4)
-            th = torch.nn.functional.avg_pool2d(t1.permute(0, 3, 1, 2), ds).permute(0, 2, 3, 1) if ds > 1 else t1
-            half_u8[c0:c0 + len(t1)] = (th * 255 + 0.5).byte().cpu().numpy()
-            inner_h = th[:, g2:th.shape[1] - g2, g2:th.shape[2] - g2, 3] >= 0.5 / 255
-            inner_f = t1[:, gb:cb - gb, gb:cb - gb, 3] >= 0.5 / 255
-            fsel = full_t[c0:c0 + len(t1)]
-            for inner, sel in ((inner_h, ~fsel), (inner_f, fsel)):
-                if not sel.any():
-                    continue
-                r0, r1 = first_last(inner[sel].any(2))
-                k0, k1 = first_last(inner[sel].any(1))
-                ids = torch.nonzero(sel)[:, 0].cpu().numpy() + c0
-                bbox[ids] = torch.stack([r0, r1, k0, k1], 1).cpu().numpy()
-        full_ids = np.nonzero(full & live)[0]
-        full_u8 = {}
-        for c0 in range(0, len(full_ids), 16384):                     # full-resolution cells only
-            ids = full_ids[c0:c0 + 16384]
-            full_u8.update(zip(ids, (atb[torch.tensor(ids, device=atb.device)].float().clamp(0, 1) * 255 + 0.5)
-                               .byte().cpu().numpy()))
-        for i in np.nonzero(live & (bbox[:, 0] >= 0))[0]:
-            x0, y0 = rects[i, 0], rects[i, 1]
-            r0, r1, k0, k1 = bbox[i]
-            tb, g, sp = (full_u8[i], gb, 1) if full[i] else (half_u8[i], g2, ds)
-            texs[i] = tb[r0:r1 + 1 + 2 * g, k0:k1 + 1 + 2 * g]
-            pad[i] = g
-            geo[i] = (x0 + k0 * sp, y0 + r0 * sp, x0 + (k1 + 1) * sp, y0 + (r1 + 1) * sp)
+        for st, atb in groups:
+            cb = atb.shape[1]
+            n_g = len(atb)
+            half_u8 = np.zeros((n_g, cb // ds, cb // ds, 4), np.uint8)
+            bbox = np.full((n_g, 4), -1, np.int64)                    # first row, last row, first col, last col
+            full_t = torch.tensor(full[st:st + n_g], device=dev)
+            for c0 in range(0, n_g, 16384):
+                t1 = atb[c0:c0 + 16384].to(dev).float().clamp(0, 1)              # (n, cb, cb, 4)
+                th = torch.nn.functional.avg_pool2d(t1.permute(0, 3, 1, 2), ds).permute(0, 2, 3, 1) if ds > 1 else t1
+                half_u8[c0:c0 + len(t1)] = (th * 255 + 0.5).byte().cpu().numpy()
+                inner_h = th[:, g2:th.shape[1] - g2, g2:th.shape[2] - g2, 3] >= 0.5 / 255
+                inner_f = t1[:, gb:cb - gb, gb:cb - gb, 3] >= 0.5 / 255
+                fsel = full_t[c0:c0 + len(t1)]
+                for inner, sel in ((inner_h, ~fsel), (inner_f, fsel)):
+                    if not sel.any():
+                        continue
+                    r0, r1 = first_last(inner[sel].any(2))
+                    k0, k1 = first_last(inner[sel].any(1))
+                    ids = torch.nonzero(sel)[:, 0].cpu().numpy() + c0
+                    bbox[ids] = torch.stack([r0, r1, k0, k1], 1).cpu().numpy()
+            full_j = np.nonzero(full[st:st + n_g] & live[st:st + n_g])[0]
+            full_u8 = {}
+            for c0 in range(0, len(full_j), 16384):                   # full-resolution cells only, batched
+                ids = full_j[c0:c0 + 16384]
+                full_u8.update(zip(ids, (atb[torch.tensor(ids, device=atb.device)].float().clamp(0, 1) * 255 + 0.5)
+                                   .byte().cpu().numpy()))
+            for j in np.nonzero(live[st:st + n_g] & (bbox[:, 0] >= 0))[0]:
+                i = st + j
+                x0, y0 = rects[i, 0], rects[i, 1]
+                r0, r1, k0, k1 = bbox[j]
+                tb, g, sp = (full_u8[j], gb, 1) if full[i] else (half_u8[j], g2, ds)
+                texs[i] = tb[r0:r1 + 1 + 2 * g, k0:k1 + 1 + 2 * g]
+                pad[i] = g
+                geo[i] = (x0 + k0 * sp, y0 + r0 * sp, x0 + (k1 + 1) * sp, y0 + (r1 + 1) * sp)
+                # OVERLAP: the quad reaches this many render px into its border texels (its neighbours' own
+                # content), covering hairline cracks between pieces whose corners differ slightly.
+                eo[i] = min(g, int(OVERLAP // sp))
     else:
         at = atlas.float().clamp(0, 1).cpu().numpy()
         for i in range(len(rects)):
@@ -737,7 +1101,9 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
             t, g = texs[i], pad[i]
             img[py - g:py - g + t.shape[0], px - g:px - g + t.shape[1]] = t
             texels += t.shape[0] * t.shape[1]
-        r = np.array([geo[i] for i in ids], np.float64)
+        e_ = np.array([eo.get(i, 0) for i in ids], np.float64)
+        sp_ = np.array([pad[i] and (geo[i][2] - geo[i][0]) / max(1, texs[i].shape[1] - 2 * pad[i]) for i in ids])
+        r = np.array([geo[i] for i in ids], np.float64) + (e_ * sp_)[:, None] * [-1, -1, 1, 1]
         cu = (np.stack([r[:, 0], r[:, 2], r[:, 2], r[:, 0]], 1) - MARGIN) / SS
         cv = (np.stack([r[:, 1], r[:, 1], r[:, 3], r[:, 3]], 1) - MARGIN) / SS
         if cdisp is None:
@@ -751,8 +1117,8 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
             d = np.where(ty <= sx, c00 + sx * (c10 - c00) + ty * (c11 - c10), c00 + ty * (c01 - c00) + sx * (c11 - c01))
             d = np.maximum(d, 1e-3)
         V = np.stack([(cu - GW / 2) / fg, (cv - Hg / 2) / fg, np.ones_like(cu)], -1) / d[..., None]
-        px = np.array([pl[i][0] for i in ids]); py = np.array([pl[i][1] for i in ids])
-        tw = np.array([texs[i].shape[1] - 2 * pad[i] for i in ids]); th = np.array([texs[i].shape[0] - 2 * pad[i] for i in ids])
+        px = np.array([pl[i][0] for i in ids]) - e_; py = np.array([pl[i][1] for i in ids]) - e_
+        tw = np.array([texs[i].shape[1] - 2 * pad[i] for i in ids]) + 2 * e_; th = np.array([texs[i].shape[0] - 2 * pad[i] for i in ids]) + 2 * e_
         uu = np.stack([px, px + tw, px + tw, px], 1) / page
         vv = np.stack([py, py, py + th, py + th], 1) / page
         faces = (np.arange(len(ids))[:, None, None] * 4 + np.array([[0, 1, 2], [0, 2, 3]])[None]).reshape(-1, 3)

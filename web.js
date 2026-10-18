@@ -122,6 +122,30 @@ app.get('/pano-info/:id', (req, res) => {
   res.json({ ...info, modes: panoModes(p) });
 });
 
+// Per-scene view settings (scene size in XR, depth scale and offset; set in the viewer and saved as they
+// change): <collection>/output2/<name>.viewcfg, panoramas <collection>/pano/inputs/<name>.viewcfg. Deleting
+// a scene removes it with its other <name>.* files.
+const VIEW_KEYS = ['scale', 'depthScale', 'depthOffset'];
+const viewCfgPath = (s) => path.join(dir(s.coll, s.pano ? path.join('pano', 'inputs') : 'output2'), `${s.name}.viewcfg`);
+app.get('/view-config/:scene', (req, res) => {
+  const s = parseId(req.params.scene);
+  if (!s) return res.sendStatus(404);
+  if (!allow(req, res, s.coll)) return;
+  try { res.json(JSON.parse(fs.readFileSync(viewCfgPath(s), 'utf8'))); } catch (e) { res.json({}); }
+});
+app.post('/view-config/:scene', express.json(), (req, res) => {
+  const s = parseId(req.params.scene);
+  if (!s) return res.sendStatus(404);
+  if (!allow(req, res, s.coll)) return;
+  const cfg = {};
+  for (const k of VIEW_KEYS) {
+    const v = Number(req.body?.[k]);
+    if (Number.isFinite(v)) cfg[k] = v;
+  }
+  if (!fs.existsSync(path.dirname(viewCfgPath(s)))) return res.sendStatus(404);
+  fs.writeFile(viewCfgPath(s), JSON.stringify(cfg), (err) => res.sendStatus(err ? 500 : 204));
+});
+
 // Collection files of the shown collection: /c/<id>/...; in public mode also the old paths
 // (/output2, /images, /pano) for existing links.
 app.use(`/c/${ACTIVE.id}`, express.static(ACTIVE.root));
@@ -224,12 +248,15 @@ app.get('/pending', (req, res) => {
 require('./google_photos')(app, { imagesDir: () => dir(ACTIVE, 'images'), secretsDir: path.join(__dirname, 'secrets') });
 
 // View modes a scene can be shown in (gallery page and in-XR gallery grey out the rest).
+// MPI-surf variants (surface-piece MPI-only bakes, <scene>_mpionly_<variant>.glb; compared in the headset).
+const SURF_VARIANTS = ['surf', 'surf2', 'surf3', 'surf4'];
 function sceneModes(outDir, name) {
   const has = (suffix) => fs.existsSync(path.join(outDir, name + suffix));
   const modes = ['full'];
   if (has('_hybrid.glb') && has('_hybrid.ply')) modes.push('hybrid');
   if (has('_mpi.glb')) modes.push('mpi');
   if (has('_mpionly.glb')) modes.push('mpionly');
+  for (const v of SURF_VARIANTS) if (has(`_mpionly_${v}.glb`)) modes.push(v);
   return modes;
 }
 const entryModes = (s) => (s.pano ? panoModes(s.pano) : sceneModes(dir(s.coll, 'output2'), s.name));
@@ -380,7 +407,7 @@ app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
   // Delete all files in output2/ with the same base name, plus files derived
   // from it (bake-hybrid / bake-layers / quest-lod outputs and previews).
   // Exact suffixes, so deleting "foo" never touches "foo_2".
-  const derived = ['_hybrid.glb', '_hybrid.ply', '_surfaces.glb', '_patches.glb', '_mpi.glb', '_mpionly.glb', '_mpi_ktx2.glb', '_mpionly_ktx2.glb', '_surfaces_mesh.glb', '_patches_mesh.glb', '_mpi_mesh.glb', '_layers.glb', '_quest.ply',
+  const derived = ['_hybrid.glb', '_hybrid.ply', '_surfaces.glb', '_patches.glb', '_mpi.glb', '_mpionly.glb', '_mpi_ktx2.glb', '_mpionly_ktx2.glb', ...['surf', 'surf2', 'surf3', 'surf4'].flatMap((v) => [`_mpionly_${v}.glb`, `_mpionly_${v}_ktx2.glb`]), '_surfaces_mesh.glb', '_patches_mesh.glb', '_mpi_mesh.glb', '_layers.glb', '_quest.ply',
                    '_hybrid_vs_splats.jpg', '_hybrid_coverage.jpg', '_layers_vs_splats.jpg']
     .map(suffix => scene + suffix);
   const files = fs.readdirSync(outputDir);

@@ -130,7 +130,7 @@
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-    import {SplatMesh} from "@sparkjsdev/spark";
+    import { SplatMesh, dyno } from "@sparkjsdev/spark";
     import * as dat from "https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.module.js";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
     import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js';
@@ -141,6 +141,7 @@
     import { setupBench } from "/js/xrBench.js";
     import { createFlatSplats } from "/js/splatFlat.js";
     import { PanoLook, setupMsi } from "/js/panoView.js";
+    import { createDepthWarp, estimatePivot } from "/js/depthWarp.js";
     import { ARButton } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/webxr/ARButton.js";
     import { FontLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/FontLoader.js";
     import { TextGeometry } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/geometries/TextGeometry.js";
@@ -157,6 +158,8 @@
       const params = new URLSearchParams(window.location.search);
       return params.get(name);
     }
+    // MPI-surf view modes (surf, surf2, ...): <scene>_mpionly_<mode>.glb, no mesh.
+    const isSurf = (lod) => /^surf\d*$/.test(lod || '');
     // Files of a scene: public scenes under /output2/, private ones ("private:<name>", served only after
     // logging in) under /c/private/output2/ (collections.js, web.js).
     function sceneBase(scene) {
@@ -297,19 +300,17 @@
     // the extra pixels remove texture aliasing without softening), 1.0 for the splat views (splat-count bound).
     // It can't change mid-session. No fixed foveation by default.
     const xrScale = parseFloat(getQueryParam('xrscale')
-      || ((isPano ? panoMode === 'msi' : ['mpi', 'mpionly'].includes(getQueryParam('lod') || 'mpionly')) ? '1.4' : '1'));
+      || ((isPano ? panoMode === 'msi' : (['mpi', 'mpionly'].includes(getQueryParam('lod') || 'mpionly') || isSurf(getQueryParam('lod')))) ? '1.4' : '1'));
     const xrFoveation = parseFloat(getQueryParam('foveation') || '0');
     const xrStdDev = parseFloat(getQueryParam('xrstddev') || String(Math.sqrt(5)));
     // Close-up scenes cost more: their photos are wider-angle (the scene fills
     // more of the headset's view) with more large splats, and leaning in grows
     // splats further. These cap or avoid that:
     // - xrmaxpx: max splat radius on screen (Spark's maxPixelRadius; 512 default).
-    // - xrpush: start the scene this many metres further away (covers less of the view).
     // - adaptive=1: lower splat extent, size cap and foveation when frames
     //   drop, restore them when there's headroom (eye-buffer resolution can't
     //   change during a WebXR session).
     const xrMaxPx = parseFloat(getQueryParam('xrmaxpx') || '512');
-    const xrPush = parseFloat(getQueryParam('xrpush') || '0');
     const xrAdaptive = getQueryParam('adaptive') === '1';
     renderer.xr.setFramebufferScaleFactor(xrScale);
     renderer.xr.setFoveation(xrFoveation);
@@ -632,7 +633,9 @@
     // the Quest 3 (docs/quest-xr-findings.md §4b); falls back to the original splats when not baked.
     let lodMode = getQueryParam('lod') || 'mpionly';  // changeable in XR (gallery, secondary thumbstick)
     const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
-                        { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'mpionly', label: 'MPI-only' }];
+                        { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'mpionly', label: 'MPI-only' },
+                        { id: 'surf', label: 'MPI-surf' }, { id: 'surf2', label: 'Surf2 tight' },
+                        { id: 'surf3', label: 'Surf3 aligned' }, { id: 'surf4', label: 'Surf4 overlap' }];
     async function splatUrlFor(scene) {
       const full = `${sceneBase(scene)}.ply`;
       if (lodMode !== 'quest') return full;
@@ -851,11 +854,16 @@
         }
         console.warn(`No ${url}; using full splats.`);
       }
-      if (['surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode)) {
-        const suffix = `_${lodMode}`;
+      if (['surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isSurf(lodMode)) {
+        // MPI-surf (?lod=surf): MPI-only made of surface pieces, <scene>_mpionly_surf.glb (bake: SURF=1, see
+        // surface_pieces() in scripts/eval_alpha_patches.py). ?mpivar=<tag>: an experimental MPI-only bake,
+        // <scene>_mpionly_<tag>.glb (comparisons in the headset).
+        const mpivar = isSurf(lodMode) ? lodMode
+          : lodMode === 'mpionly' && (getQueryParam('mpivar') || '').replace(/[^a-z0-9]/gi, '');
+        const suffix = (isSurf(lodMode) ? '_mpionly' : `_${lodMode}`) + (mpivar ? `_${mpivar}` : '');
         const url = `${sceneBase(scene)}${suffix}.glb`;
         try {
-          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadSurfaces(scene, suffix, lodMode !== 'mpionly');
+          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadSurfaces(scene, suffix, lodMode !== 'mpionly' && !isSurf(lodMode));
         } catch (e) {
           console.error(`Failed to load ${url}:`, e);
         }
@@ -900,12 +908,52 @@
     let splat;
     if (hybrid === "true") {
       splat = createSplat(splatURL);
-    } else if (isPano || ['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode)) {
+    } else if (isPano || ['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isSurf(lodMode)) {
       splat = await loadContent(file);
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading
     }
     xrContent.add(splat);
+
+    // --- Per-scene view settings: size in XR, depth scale and offset (web/js/depthWarp.js; left controller
+    // trigger / grip in XR, sliders on the desktop). Saved per scene on the server (/view-config, inside the
+    // scene's collection) and restored whenever the scene is shown.
+    const depthWarp = createDepthWarp(THREE, dyno, SplatMesh);
+    const VIEW_DEFAULTS = { scale: 1, depthScale: 1, depthOffset: 0 };
+    let viewCfg = { ...VIEW_DEFAULTS };
+    let viewScene = file;                    // the scene viewCfg belongs to
+    async function loadViewConfig(name) {
+      try { return { ...VIEW_DEFAULTS, ...(await (await fetch(`/view-config/${encodeURIComponent(name)}`)).json()) }; }
+      catch (e) { return { ...VIEW_DEFAULTS }; }
+    }
+    let saveTimer = null;
+    function saveViewConfig() {
+      clearTimeout(saveTimer);
+      const name = viewScene, body = JSON.stringify(viewCfg);
+      saveTimer = setTimeout(() => fetch(`/view-config/${encodeURIComponent(name)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+      }).catch(() => {}), 500);
+    }
+    // Depth always; the size only in XR (panoramas keep their true size).
+    function applyViewConfig() {
+      depthWarp.set({ scale: viewCfg.depthScale, offset: viewCfg.depthOffset });
+      if (renderer.xr.isPresenting) xrRoot.scale.setScalar(isPanoScene(viewScene) ? 1 : viewCfg.scale);
+    }
+    const viewLabel = () => `Depth ×${viewCfg.depthScale.toFixed(2)}, offset ${viewCfg.depthOffset >= 0 ? '+' : ''}` +
+                            `${viewCfg.depthOffset.toFixed(2)} m`;
+    /** New content: warp it, load its scene's settings and set the depth pivot (a typical depth). */
+    async function prepareView(content, name) {
+      depthWarp.attach(content);
+      viewScene = name;
+      const radial = isPanoScene(name);
+      const [cfg, pivot] = await Promise.all([loadViewConfig(name), estimatePivot(THREE, SplatMesh, content, radial)]);
+      if (viewScene !== name) return;        // another scene was loaded meanwhile
+      viewCfg = cfg;
+      depthWarp.set({ radial, pivot });
+      applyViewConfig();
+    }
+    splat.userData.scene = file;
+    prepareView(splat, file).catch((e) => console.warn('View settings failed:', e));
 
     // --- Scene stepping in XR (A = next, B = previous; see XRSceneController) ---
     // The page can't reload without ending the XR session, so swap the splat in
@@ -930,9 +978,11 @@
         const wasPano = isPanoScene(splat?.userData?.scene ?? initialScene);
         const next = await loadContent(file);
         next.userData.scene = file;
+        await prepareView(next, file);
         applyVisibility(next);
         xrContent.add(next);
         xrContent.remove(splat);
+        depthWarp.detach(splat);
         disposeContent(splat);
         splat = next;
         // A panorama is centred on your head (and a photo scene back in front of you after one).
@@ -1038,10 +1088,29 @@
       onReloadScene: () => stepScene(0),
       onExit: () => renderer.xr.getSession()?.end(),
       onDeleteScene: () => deleteCurrentScene(),
-      homePush: xrPush,
       gallery: xrGallery,
       onCycleLod: (delta) => cycleLod(delta),
       isPano: () => isPanoScene(file),
+      // Left trigger / grip + controller motion along the gaze: depth offset (forward = farther, by the
+      // scene's typical depth per metre) / depth scale (forward = flatter).
+      depth: {
+        nudge: (kind, metres) => {
+          if (kind === 'offset') viewCfg.depthOffset += metres * depthWarp.get().pivot;
+          else viewCfg.depthScale = THREE.MathUtils.clamp(viewCfg.depthScale * Math.exp(-1.5 * metres), 0.05, 8);
+          applyViewConfig();
+          xrToast.show(viewLabel(), 1.2);
+        },
+      },
+      onViewChange: () => {
+        if (!isPanoScene(viewScene)) viewCfg.scale = xrRoot.scale.x;
+        saveViewConfig();
+      },
+      onResetView: () => {
+        viewCfg = { ...VIEW_DEFAULTS };
+        applyViewConfig();
+        saveViewConfig();
+        xrToast.show('Scale & depth reset', 1.5);
+      },
     });
     // Centre the scene on the headset shortly after entering XR (like pressing
     // the trigger): the 'local' origin isn't reliably where your head is, and
@@ -1084,6 +1153,7 @@
     renderer.xr.addEventListener('sessionstart', () => {
       requestHz(targetHz);
       xrController.applyHome();
+      applyViewConfig();                     // the scene's own size
       setTimeout(() => {
         if (renderer.xr.isPresenting) xrController.resetPlacement();
       }, 500);
@@ -1157,6 +1227,19 @@
     }
 
     const gui = new dat.GUI();
+    // Depth sliders (both kinds of scene), saved per scene like the XR controls.
+    const depthParams = {
+      get depthScale() { return viewCfg.depthScale; },
+      set depthScale(v) { viewCfg.depthScale = v; applyViewConfig(); saveViewConfig(); },
+      get depthOffset() { return viewCfg.depthOffset; },
+      set depthOffset(v) { viewCfg.depthOffset = v; applyViewConfig(); saveViewConfig(); },
+      reset() { viewCfg = { ...viewCfg, depthScale: 1, depthOffset: 0 }; applyViewConfig(); saveViewConfig(); },
+    };
+    function addDepthControls() {
+      gui.add(depthParams, 'depthScale', 0.05, 4, 0.01).name('depth scale').listen();
+      gui.add(depthParams, 'depthOffset', -10, 10, 0.01).name('depth offset (m)').listen();
+      gui.add(depthParams, 'reset').name('reset depth');
+    }
     if (isPano) {
       // Panorama options: what to show and how far you may move (look around by dragging).
       const reloadPano = () => stepScene(0);
@@ -1179,6 +1262,7 @@
       gui.add(panoParams, 'fov', 30, 110, 1).name('FOV').listen().onChange((v) => { panoLook.fov = v; });
       gui.add(panoParams, 'wiggle').name('wiggle (parallax)').onChange((v) => { panoLook.wiggle = v; });
       gui.add(panoParams, 'reset').name('back to centre (R)');
+      addDepthControls();
       setInterval(() => { panoParams.fov = panoLook.fov; }, 250);
       const help = document.createElement('div');
       help.id = 'pano-help';
@@ -1201,6 +1285,7 @@
     });
     gui.add(guiParams, 'showSplat').onChange(() => applyVisibility(splat));
     gui.add(guiParams, 'sortOnce').onChange(setSortOnce);
+    addDepthControls();
     }
     if (ui === "false") {
       gui.hide();

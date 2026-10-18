@@ -408,6 +408,10 @@
         <button type="button" data-lod="hybrid">Hybrid</button>
         <button type="button" data-lod="mpi" title="Hybrid mesh + the remaining splats as a sparse multi-plane image (scripts/bake_mpi.py); falls back to the original splats when not baked">Hybrid-MPI</button>
         <button type="button" data-lod="mpionly" title="All splats as a sparse multi-plane image, no mesh (scripts/bake_mpi.py --mpionly)">MPI-only</button>
+        <button type="button" data-lod="surf" title="MPI-only made of connected surface pieces instead of depth slices: smoother up close, lighter (SURF=1 bake)">MPI-surf</button>
+        <button type="button" data-lod="surf2" title="MPI-surf variant: one slice per piece, tight glue">Surf2</button>
+        <button type="button" data-lod="surf3" title="MPI-surf variant: depth-aligned cuts, matched glue">Surf3</button>
+        <button type="button" data-lod="surf4" title="MPI-surf variant: aligned cuts, linked corners, 1 px quad overlap">Surf4</button>
       </div>
     </div>
     <div class="opt-group" title="How 360° panoramas are shown: multi-sphere image (fast, for the Quest) or the original splats">
@@ -437,11 +441,6 @@
       <span class="opt-label">xrmaxpx</span>
       <input type="range" id="optXrmaxpx" min="16" max="512" step="8">
       <span class="opt-value" id="valXrmaxpx"></span>
-    </div>
-    <div class="opt-group" title="Start the scene this many metres further away, so it covers less of the view (trigger-reset keeps it)">
-      <span class="opt-label">xrpush</span>
-      <input type="range" id="optXrpush" min="0" max="2" step="0.1">
-      <span class="opt-value" id="valXrpush"></span>
     </div>
     <div class="opt-group" title="Adaptive quality: when frames drop, lower splat extent, size cap and foveation; restore them when there's headroom">
       <label class="opt-label" for="optAdaptive">adaptive</label>
@@ -521,7 +520,7 @@
     // --- View options: applied to every scene link ---
     // Viewer defaults (web/index.html). Presets set every XR option (not the view).
     // xrscale 'auto': the viewer picks 1.4 for the MPI views and 1.0 for the splat views (no xrscale in the link).
-    const XR_DEFAULTS = { xrscale: 'auto', foveation: 0, xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: false };
+    const XR_DEFAULTS = { xrscale: 'auto', foveation: 0, xrstddev: 2.24, xrmaxpx: 512, adaptive: false };
     const DEFAULT_OPTS = { lod: 'mpionly', pmode: 'msi', optsVersion: 4, ...XR_DEFAULTS };
     const FULL_QUALITY = { ...XR_DEFAULTS, foveation: 0, xrstddev: 2.83 };
     const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96, adaptive: true };
@@ -539,6 +538,7 @@
       delete opts.nearclip;
       delete opts.xrsize;
       delete opts.prepass;
+      delete opts.xrpush;   // removed: scenes always start at the capture camera
     } catch (e) {}
 
     function saveOpts() {
@@ -553,13 +553,12 @@
         $(this).toggleClass('active', $(this).data('pmode') === opts.pmode);
       });
       const autoScale = opts.xrscale === 'auto';
-      $('#optXrscale').val(autoScale ? (['mpi', 'mpionly'].includes(opts.lod) ? 1.4 : 1) : opts.xrscale);
+      $('#optXrscale').val(autoScale ? (['mpi', 'mpionly'].includes(opts.lod) || /^surf\d*$/.test(opts.lod) ? 1.4 : 1) : opts.xrscale);
       $('#valXrscale').text(autoScale ? 'auto' : Number(opts.xrscale).toFixed(2));
       $('#xrscaleAuto').toggleClass('active', autoScale);
       $('#optFoveation').val(opts.foveation); $('#valFoveation').text(Number(opts.foveation).toFixed(1));
       $('#optXrstddev').val(opts.xrstddev); $('#valXrstddev').text(Number(opts.xrstddev).toFixed(2));
       $('#optXrmaxpx').val(opts.xrmaxpx); $('#valXrmaxpx').text(Math.round(opts.xrmaxpx));
-      $('#optXrpush').val(opts.xrpush); $('#valXrpush').text(Number(opts.xrpush).toFixed(1) + ' m');
       $('#optAdaptive').prop('checked', !!opts.adaptive);
       // Rewrite each scene link, keeping scene (first) and ui as they are.
       $('.scene-item a').each(function () {
@@ -572,7 +571,7 @@
         url.searchParams.set('foveation', opts.foveation);
         url.searchParams.set('xrstddev', opts.xrstddev);
         url.searchParams.set('xrmaxpx', opts.xrmaxpx);
-        url.searchParams.set('xrpush', opts.xrpush);
+        url.searchParams.delete('xrpush');
         url.searchParams.set('adaptive', opts.adaptive ? '1' : '0');
         $(this).attr('href', url.pathname + url.search);
       });
@@ -612,7 +611,7 @@
       const $links = $('#perfLinks').empty();
       for (const t of PERF_TESTS) {
         const params = new URLSearchParams({ scene, ui: 'true', lod: t.lod, xrscale: t.xrscale, foveation: 0,
-                                             xrstddev: 2.24, xrmaxpx: 512, xrpush: 0, adaptive: 0, test: t.test });
+                                             xrstddev: 2.24, xrmaxpx: 512, adaptive: 0, test: t.test });
         if (t.variant) params.set('variant', t.variant);
         if (t.bench) params.set('bench', t.bench);
         if (t.hz) params.set('hz', t.hz);
@@ -719,7 +718,6 @@
       $('#optFoveation').on('input', function () { setOpts({ foveation: parseFloat(this.value) }); });
       $('#optXrstddev').on('input', function () { setOpts({ xrstddev: parseFloat(this.value) }); });
       $('#optXrmaxpx').on('input', function () { setOpts({ xrmaxpx: parseFloat(this.value) }); });
-      $('#optXrpush').on('input', function () { setOpts({ xrpush: parseFloat(this.value) }); });
       $('#optAdaptive').on('change', function () { setOpts({ adaptive: this.checked }); });
       $('#presetDefault').on('click', function () { setOpts(XR_DEFAULTS); });
       $('#presetFull').on('click', function () { setOpts(FULL_QUALITY); });

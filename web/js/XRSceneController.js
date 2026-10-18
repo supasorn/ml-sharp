@@ -15,10 +15,13 @@
  * - Button B/Y (5): [Short press] Previous scene; [Hold 1 s] Reload current scene.
  * - 360 panoramas (`isPano()`): thumbstick Left/Right snap-turns 30 degrees (right = look right; any
  *   push more sideways than up/down), Up/Down moves you (forward = forward; only for a push mostly
- *   forward/back, not right after a turn); the panorama is centred on your head (no homePush).
+ *   forward/back, not right after a turn); the panorama is centred on your head.
  *
  * SECONDARY CONTROLLER:
  * - Thumbstick Up/Down: Scale the scene (not for 360 panoramas: they keep their true size).
+ * - Index Trigger (0): Hold and move the controller forward/back along your gaze: depth offset (if `depth`
+ *   is given; forward = farther). Grip (1): the same for the depth scale (forward = flatter). As in
+ *   img3dviewer (z-offset / z-scale); see web/js/depthWarp.js.
  * - Thumbstick Left/Right (flick): Previous/next view mode (if `onCycleLod` is given).
  * - Button A/X (4): Open/close the scene gallery (if `gallery` is given).
  * - Button B/Y (5): Open/close the settings menu.
@@ -29,7 +32,7 @@
  *
  * SETTINGS MENU (thumbstick to navigate, trigger to select):
  * - Swap main/secondary hand, main on/off, secondary on/off,
- *   delete current scene (press trigger twice to confirm).
+ *   delete current scene (press trigger twice to confirm), reset scale & depth (if `onResetView`).
  */
 import * as THREE from "three";
 
@@ -44,9 +47,12 @@ export class XRSceneController {
    *   FontLoader, TextGeometry: three.js addons, for the settings menu text.
    *   onStepScene(delta), onReloadScene(), onDeleteScene(): scene callbacks.
    *   onExit(): leave the XR session.
-   *   homePush: metres the scene starts (and resets) in front of its default spot.
    *   gallery: optional XRGallery, toggled with the secondary A/X.
    *   isPano(): optional, whether a 360 panorama is shown (snap turn, centred on the head, no scaling).
+   *   depth: optional { nudge(kind, metres) }: kind "offset" | "scale", metres = controller motion along
+   *     the gaze while the secondary trigger / grip is held.
+   *   onViewChange(): optional, after the scene size or depth was changed (the viewer saves it per scene).
+   *   onResetView(): optional, settings menu item "Reset scale & depth".
    */
   constructor(renderer, camera, scene, options = {}) {
     this.renderer = renderer;
@@ -61,12 +67,16 @@ export class XRSceneController {
     this.onReloadScene = options.onReloadScene || (() => {});
     this.onExit = options.onExit || (() => {});
     this.onDeleteScene = options.onDeleteScene || (() => {});
-    this.homePush = options.homePush || 0;
     this.gallery = options.gallery || null;
     this.onCycleLod = options.onCycleLod || null;
     this._lodStickMoved = false;
     this.isPano = options.isPano || (() => false);
     this._turnStickMoved = false;
+    this.depth = options.depth || null;
+    this.onViewChange = options.onViewChange || (() => {});
+    this.onResetView = options.onResetView || null;
+    this._depthDrag = [null, null];   // last secondary controller position per held button (trigger, grip)
+    this._scaling = false;
 
     this.minScale = 0.05;
     this.maxScale = 20;
@@ -134,9 +144,11 @@ export class XRSceneController {
       child.geometry?.dispose();
       child.material?.dispose();
     }
-    this.menuGroup.add(new THREE.Mesh(
-      new THREE.PlaneGeometry(0.42, 0.3),
-      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.8 })));
+    const bg = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.42, this.onResetView ? 0.36 : 0.3),
+      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.8 }));
+    if (this.onResetView) bg.position.y = -0.03;      // room for the fifth item below
+    this.menuGroup.add(bg);
     if (!this._font || !this.TextGeometry) { this._loadFont(); return; }
 
     const text = (str, y, selected) => {
@@ -152,7 +164,8 @@ export class XRSceneController {
     text(`2. Main: ${this.mEnabled ? "ON" : "OFF"}`, 0.0, this.menuIndex === 1);
     text(`3. Secondary: ${this.sEnabled ? "ON" : "OFF"}`, -0.05, this.menuIndex === 2);
     text(this.confirmDelete ? "4. Delete? Trigger again!" : "4. Delete current scene", -0.10, this.menuIndex === 3);
-    text("[Trigger: select | Stick: navigate]", -0.135, false);
+    if (this.onResetView) text("5. Reset scale & depth", -0.15, this.menuIndex === 4);
+    text("[Trigger: select | Stick: navigate]", this.onResetView ? -0.185 : -0.135, false);
   }
 
   toggleMenu() {
@@ -185,7 +198,7 @@ export class XRSceneController {
       new XRRigidTransform({ x: p.x, y: p.y, z: p.z }, { x: q.x, y: q.y, z: q.z, w: q.w })));
   }
 
-  /** Session start: scene at the reference-space origin (your head), pushed by homePush. */
+  /** Session start: scene at the reference-space origin (your head, i.e. the capture camera). */
   applyHome() {
     if (!this.group) return;
     this.group.position.set(0, 0, 0);
@@ -193,13 +206,13 @@ export class XRSceneController {
     this.group.scale.setScalar(1);
     // three resets its custom reference space for each new session, so this is the base.
     this.baseSpace = this.renderer.xr.getReferenceSpace();
-    this.placePos.set(0, 0, -this._push());
+    this.placePos.set(0, 0, 0);
     this.placeQuat.identity();
     this._applyPlacement();
   }
 
-  /** Place the scene at your head, facing your gaze (yaw only), pushed forward by
-   *  homePush, and undo any hand rotation. */
+  /** Place the scene at your head (the capture camera where you are), facing your gaze (yaw only), and
+   *  undo any hand rotation. */
   resetPlacement() {
     if (!this.group) return;
     const cam = this.renderer.xr.getCamera();
@@ -210,7 +223,7 @@ export class XRSceneController {
     const headQuat = this.placeQuat.clone().multiply(quat);
     const yaw = new THREE.Euler(0, 0, 0, "YXZ").setFromQuaternion(headQuat).y;
     this.placeQuat.setFromEuler(new THREE.Euler(0, yaw, 0, "YXZ"));
-    this.placePos.copy(headPos).add(new THREE.Vector3(0, 0, -this._push()).applyQuaternion(this.placeQuat));
+    this.placePos.copy(headPos);
     this._applyPlacement();
     if (this.content && this.content.parent !== this.group) this.group.attach(this.content);   // never stay on a hand
     if (this.content && this.content.parent === this.group &&
@@ -219,9 +232,6 @@ export class XRSceneController {
       this.content.quaternion.identity();
     }
   }
-
-  /** Metres the scene sits in front of its home spot: none for a panorama (you stand at its centre). */
-  _push() { return this.isPano() ? 0 : this.homePush; }
 
   /** Turn the scene around your head by `angle` (radians about up; > 0 = you look further right). */
   turnAroundHead(angle) {
@@ -328,11 +338,14 @@ export class XRSceneController {
             return;
           }
           this.confirmDelete = true;
+        } else if (this.menuIndex === 4 && this.onResetView) {
+          this.onResetView();
         }
         this._buildMenu();
       }
       if (Math.abs(sUD) > 0.5 && !this._stickMoved) {
-        this.menuIndex = (this.menuIndex + (sUD > 0 ? 1 : -1) + 4) % 4;
+        const items = this.onResetView ? 5 : 4;
+        this.menuIndex = (this.menuIndex + (sUD > 0 ? 1 : -1) + items) % items;
         this.confirmDelete = false;
         this._stickMoved = true;
         this._buildMenu();
@@ -357,6 +370,30 @@ export class XRSceneController {
     if (this.sEnabled && this.group && sUD && !this.isPano()) {
       const s = THREE.MathUtils.clamp(this.group.scale.x * (1 - sUD * 0.02), this.minScale, this.maxScale);
       this.group.scale.setScalar(s);
+      this._scaling = true;
+    } else if (this._scaling && !sUD) {
+      this._scaling = false;
+      this.onViewChange();
+    }
+
+    // Secondary: trigger / grip held, controller moved along the gaze: depth offset / depth scale.
+    const sCont = this.conts[sInd];
+    if (this.depth) {
+      [[0, "offset"], [1, "scale"]].forEach(([btn, kind]) => {
+        if (this.sEnabled && sCont && sButt[btn].pressed) {
+          const last = this._depthDrag[btn];
+          if (last) {
+            const dir = new THREE.Vector3();
+            this.renderer.xr.getCamera().getWorldDirection(dir);
+            const along = new THREE.Vector3().subVectors(sCont.position, last).dot(dir);
+            if (along) this.depth.nudge(kind, along / this.group.scale.x);
+          }
+          this._depthDrag[btn] = sCont.position.clone();
+        } else if (this._depthDrag[btn]) {
+          this._depthDrag[btn] = null;
+          this.onViewChange();
+        }
+      });
     }
 
     if (!this.mEnabled || !this.group) return;

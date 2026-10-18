@@ -145,9 +145,11 @@ export class XRGallery {
       b.mesh.geometry.dispose(); b.mesh.material.map?.dispose(); b.mesh.material.dispose();
       this.targets = this.targets.filter((t) => t.mesh !== b.mesh);
     }
+    const cols = Math.min(lods.length, 5), rows = Math.ceil(lods.length / cols);   // wrap above the grid
     this.lodButtons = lods.map((l, i) => {
       const w = 0.2, b = label(w, 0.045, l.label, { px: 44 });
-      b.position.set((i - (lods.length - 1) / 2) * (w + 0.02), this.gridH / 2 + 0.05, 0);
+      b.position.set((i % cols - (cols - 1) / 2) * (w + 0.02),
+                     this.gridH / 2 + 0.05 + (rows - 1 - Math.floor(i / cols)) * 0.06, 0);
       b.renderOrder = 1002;
       this.group.add(b);
       this.targets.push({ mesh: b, action: () => this.o.onSelectLod(l.id) });

@@ -156,7 +156,7 @@ The viewer (`web/js/panoView.js`) switches by scene kind:
 - Desktop: look-around controls (`PanoLook`) instead of orbiting, its own options panel (360 view,
   MSI variant, move limit, FOV, wiggle, back to centre) and a hint bar; `?pmode=msi|splats`,
   `?pvariant=<dir>`. Splats of a panorama are sorted 360° by distance (`sort360`).
-- XR: the panorama is centred on your head (no `xrpush`), main thumbstick left/right snap-turns 30°
+- XR: the panorama is centred on your head, main thumbstick left/right snap-turns 30°
   (right = look right), the secondary stick doesn't scale it, eye buffer 1.4× for MSI; the in-XR
   gallery shows panoramas (badged) and its mode buttons become 360 MSI / 360 splats on a panorama;
   stepping between photo scenes and panoramas re-centres.

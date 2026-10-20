@@ -109,17 +109,16 @@ export class XRSceneController {
     this._initControllers();
   }
 
+  // Four controller slots: with hand tracking on, the Quest can list hands and controllers together, and three
+  // gives each input source the first free slot, so a reconnecting controller may land in slot 2 or 3. Each slot
+  // remembers its input source; update() picks one source per hand (a controller over a tracked hand).
   _initControllers() {
-    [this.renderer.xr.getController(0), this.renderer.xr.getController(1)].forEach((controller) => {
-      controller.addEventListener("connected", (event) => {
-        if (event.data.handedness === "right") this.conts[1] = controller;
-        else if (event.data.handedness === "left") this.conts[0] = controller;
-      });
-      controller.addEventListener("disconnected", () => {
-        if (controller === this.conts[1]) this.conts[1] = null;
-        else if (controller === this.conts[0]) this.conts[0] = null;
-      });
+    this.slots = [0, 1, 2, 3].map((i) => {
+      const controller = this.renderer.xr.getController(i);
+      controller.addEventListener("connected", (event) => { controller.userData.source = event.data; });
+      controller.addEventListener("disconnected", () => { controller.userData.source = null; });
       this.scene.add(controller);
+      return controller;
     });
   }
 
@@ -276,22 +275,32 @@ export class XRSceneController {
     const session = this.renderer.xr.getSession();
     if (!session) return;
 
-    const motionUD = [0, 0], motionLR = [0, 0];
+    // One input source per hand: a controller wins over a tracked hand (whose pinch would otherwise overwrite the
+    // controller's buttons every frame).
+    const pick = [null, null];
     for (const source of session.inputSources) {
       const hand = source.handedness === "left" ? 0 : source.handedness === "right" ? 1 : -1;
       if (hand < 0 || !source.gamepad || !source.gamepad.buttons) continue;
-      // Dead zone: a slightly off-centre stick must not keep nudging the scene.
-      const ud = source.gamepad.axes[3] || 0;
-      if (Math.abs(ud) > 0.15) motionUD[hand] = ud;
-      motionLR[hand] = source.gamepad.axes[2] || 0;
-      source.gamepad.buttons.forEach((button, i) => {
-        const b = this.butts[hand][i];
-        if (!b) return;
-        b.clicked = button.pressed && !b.pressed;
-        b.unclicked = !button.pressed && b.pressed;
-        b.pressed = button.pressed;
-      });
+      if (!pick[hand] || (pick[hand].hand && !source.hand)) pick[hand] = source;
     }
+    const motionUD = [0, 0], motionLR = [0, 0];
+    [0, 1].forEach((hand) => {
+      const source = pick[hand];
+      this.conts[hand] = source ? this.slots.find((c) => c.userData.source === source) ?? null : null;
+      // Dead zone: a slightly off-centre stick must not keep nudging the scene.
+      const ud = source?.gamepad.axes[3] || 0;
+      if (Math.abs(ud) > 0.15) motionUD[hand] = ud;
+      motionLR[hand] = source?.gamepad.axes[2] || 0;
+      // Every button every frame, released when the source is gone (asleep, tracking lost, switched to hands):
+      // otherwise its last state stuck (a click repeating every frame, a press that never ends, so a hold's
+      // timer kept running and the next press counted as held).
+      this.butts[hand].forEach((b, i) => {
+        const pressed = !!source?.gamepad.buttons[i]?.pressed;
+        b.clicked = pressed && !b.pressed;
+        b.unclicked = !pressed && b.pressed;
+        b.pressed = pressed;
+      });
+    });
 
     const mInd = this.motionInd, sInd = 1 - mInd;
     // The scene rides on the main controller only while its thumbstick is held in. Checked every frame (not

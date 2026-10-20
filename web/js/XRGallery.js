@@ -21,20 +21,35 @@ function overlayMaterial(opts) {
   return new THREE.MeshBasicMaterial({ depthTest: false, depthWrite: false, transparent: true, ...opts });
 }
 
-/** A plane showing text drawn on a canvas; `.setText()` redraws it. */
-function label(w, h, text, { bg = "rgba(40,40,40,0.9)", fg = "#fff", px = 64 } = {}) {
-  const canvas = document.createElement("canvas");
+/** A plane showing text drawn on a canvas; `.setText()` redraws it. With `fit`, the plane widens (never below `w`)
+ *  to hold the whole text on one line. */
+function label(w, h, text, { bg = "rgba(40,40,40,0.9)", fg = "#fff", px = 64, fit = false } = {}) {
+  let canvas = document.createElement("canvas");
   canvas.width = Math.round(w * 1600); canvas.height = Math.round(h * 1600);
-  const tex = new THREE.CanvasTexture(canvas);
+  let tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), overlayMaterial({ map: tex }));
   mesh.setText = (t, colors = {}) => {
-    const c = canvas.getContext("2d");
+    let c = canvas.getContext("2d");
+    c.font = `bold ${px}px sans-serif`;
+    if (fit) {
+      const cw = Math.max(Math.round(w * 1600), Math.ceil(c.measureText(t).width + canvas.height * 0.8));
+      if (cw !== canvas.width) {        // a new texture: a resized canvas can't reuse the old GPU allocation
+        canvas = document.createElement("canvas");
+        canvas.width = cw; canvas.height = Math.round(h * 1600);
+        tex.dispose();
+        tex = new THREE.CanvasTexture(canvas);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        mesh.material.map = tex;
+        mesh.scale.x = cw / Math.round(w * 1600);
+        c = canvas.getContext("2d");
+        c.font = `bold ${px}px sans-serif`;
+      }
+    }
     c.clearRect(0, 0, canvas.width, canvas.height);
     c.fillStyle = colors.bg ?? bg;
     c.beginPath(); c.roundRect(0, 0, canvas.width, canvas.height, canvas.height * 0.2); c.fill();
     c.fillStyle = colors.fg ?? fg;
-    c.font = `bold ${px}px sans-serif`;
     c.textAlign = "center"; c.textBaseline = "middle";
     c.fillText(t, canvas.width / 2, canvas.height / 2);
     tex.needsUpdate = true;
@@ -122,8 +137,8 @@ export class XRGallery {
     for (const c of this.cells) { c.frame.renderOrder = 1001; c.img.renderOrder = 1002; }
     for (const m of [this.prev, this.next, this.pageLabel]) m.renderOrder = 1002;
 
-    // A ray on each controller, shown while the gallery is open.
-    this.rays = [0, 1].map((i) => {
+    // A ray on each controller slot (XRSceneController uses four), shown while the gallery is open.
+    this.rays = [0, 1, 2, 3].map((i) => {
       const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]);
       const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false, transparent: true }));
       line.scale.z = RAY_LEN; line.visible = false; line.renderOrder = 1003;
@@ -271,12 +286,12 @@ export class XRGallery {
 
 /**
  * XRToast: a short text label floating in front of the head (e.g. the new view mode), fading out after
- * `seconds`. Call `show(text)`, and `update()` every frame.
+ * `seconds`; it widens to fit the text. Call `show(text)`, and `update()` every frame.
  */
 export class XRToast {
   constructor(renderer, scene) {
     this.renderer = renderer;
-    this.mesh = label(0.34, 0.06, "", { bg: "rgba(20,22,28,0.85)", px: 46 });
+    this.mesh = label(0.34, 0.06, "", { bg: "rgba(20,22,28,0.85)", px: 46, fit: true });
     this.mesh.visible = false;
     this.mesh.renderOrder = 1004;
     scene.add(this.mesh);

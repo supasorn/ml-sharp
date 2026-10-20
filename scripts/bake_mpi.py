@@ -65,32 +65,59 @@ def scene_plys(folder: Path, names):
 
 class Worker:
     """A persistent `eval_alpha_patches.py --serve` process (one per GPU and settings): Python, torch, CUDA and gsplat
-    load once instead of per scene (~5 s each)."""
+    load once instead of per scene (~5 s each), and a scene's files are written in the background while the next
+    scene runs on the GPU. It answers "gpu-done <ply>", then "ok <ply>" (or "fail <ply> ...") per scene."""
     def __init__(self, env):
         self.p = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "eval_alpha_patches.py"), "--serve"], env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.lock, self.waiting = threading.Lock(), {}         # ply -> (gpu-done Event, done Event, [result])
+        threading.Thread(target=self._read, daemon=True).start()
 
-    def bake(self, ply, log_path):
-        self.p.stdin.write(f"{ply}\t{log_path}\n"); self.p.stdin.flush()
-        r = self.p.stdout.readline()
-        if not r:
-            raise subprocess.CalledProcessError(self.p.wait(), "bake worker (exited)")
-        if not r.startswith("ok"):
-            raise subprocess.CalledProcessError(1, f"bake worker: {r.strip()}")
+    def _read(self):
+        for line in self.p.stdout:
+            kind, _, rest = line.rstrip("\n").partition(" ")
+            ply, _, msg = rest.partition(" ")
+            with self.lock:
+                w = self.waiting.get(ply)
+            if w is None:
+                continue
+            if kind == "gpu-done":
+                w[0].set()
+            else:
+                w[2].append(None if kind == "ok" else msg or kind)
+                w[0].set(); w[1].set()
+        with self.lock:                                   # the worker exited: fail whatever is pending
+            for w in self.waiting.values():
+                w[2].append("bake worker exited"); w[0].set(); w[1].set()
+
+    def bake(self, ply, log_path, gpu_done=None):
+        w = (threading.Event(), threading.Event(), [])
+        with self.lock:
+            self.waiting[str(ply)] = w
+            self.p.stdin.write(f"{ply}\t{log_path}\n"); self.p.stdin.flush()
+        w[0].wait()
+        if gpu_done is not None:
+            gpu_done()                                    # the GPU is free for the next scene
+        w[1].wait()
+        with self.lock:
+            self.waiting.pop(str(ply), None)
+        if w[2] and w[2][0] is not None:
+            raise subprocess.CalledProcessError(1, f"bake worker: {w[2][0]}")
 
 
 WORKERS, WORKERS_LOCK = {}, threading.Lock()
 
 
-def worker_bake(env, ply, log):
-    """Bake one scene with the worker for these settings (started on first use, restarted if it died)."""
+def worker_bake(env, ply, log, gpu_done=None):
+    """Bake one scene with the worker for these settings (started on first use, restarted if it died); gpu_done() is
+    called once its GPU work is done (its files are still being written)."""
     key = tuple(sorted(env.items()))
     with WORKERS_LOCK:
         w = WORKERS.get(key)
         if w is None or w.p.poll() is not None:
             w = WORKERS[key] = Worker(env)
     log.flush()
-    w.bake(ply, log.name)
+    w.bake(ply, log.name, gpu_done)
 
 
 def compressed(glb: Path):
@@ -103,7 +130,7 @@ def out_suffix(args, mpionly):
     return ("_mpionly" + (f"_{args.variant}" if args.variant else "")) if mpionly else "_mpi"
 
 
-def bake(ply: Path, gpu: str, args, log):
+def bake(ply: Path, gpu: str, args, log, gpu_done=None):
     out = args.input / f"{ply.stem}{out_suffix(args, args.mpionly)}.glb"
     if out.exists() and out.stat().st_mtime > ply.stat().st_mtime and not (args.overwrite or args.reexport):
         if not args.no_ktx2 and not compressed(out):
@@ -121,7 +148,7 @@ def bake(ply: Path, gpu: str, args, log):
                           "EXPORT_DIR": str(args.input)} | VARIANTS.get(args.variant, {})
         if args.uastc:
             env["KTX2_UASTC"] = "1"
-        worker_bake(env, link, log)
+        worker_bake(env, link, log, gpu_done)
         compress(out, args, log)
         return "done"
     cmd = [str(Path(sys.executable).with_name("sharp")), "bake-hybrid", "-i", str(link), "--keep-move", "0.3",
@@ -232,13 +259,19 @@ def main():
 
     def job(ply):
         slot = gpus.get()
+        held = [True]
+
+        def release():                                    # MPI-only: the GPU is free once the scene's GPU work is done
+            if held[0]:
+                held[0] = False
+                gpus.put(slot)
         logf = args.work / f"{ply.stem}{out_suffix(args, True) if args.mpionly else ''}.log"
         try:
             for attempt in range(4):
                 gpu = freest_gpu() if slot == "auto" else slot
                 try:
                     with open(logf, "w") as log:
-                        status = bake(ply, gpu, args, log)
+                        status = bake(ply, gpu, args, log, release)
                     break
                 except subprocess.CalledProcessError as e:
                     status = f"FAILED ({e.returncode}), see {logf}"
@@ -247,12 +280,14 @@ def main():
                     time.sleep(30)                         # shared GPUs: wait for memory, then retry
                     status += f" (out of GPU memory, retry {attempt + 1})"
         finally:
-            gpus.put(slot)
+            release()
         with lock:
             done[0] += 1
             print(f"[{done[0]}/{len(plys)} {time.time() - t0:.0f}s] {ply.stem}: {status}", flush=True)
 
-    with ThreadPoolExecutor(args.jobs if auto else len(args.gpus.split(","))) as ex:
+    # MPI-only: twice the GPU slots, so a scene's files are written while the next one runs on the GPU
+    slots = args.jobs if auto else len(args.gpus.split(","))
+    with ThreadPoolExecutor(slots * (2 if args.mpionly else 1)) as ex:
         list(ex.map(job, plys))
 
 

@@ -377,6 +377,16 @@ def cell_tiles(t, cy, cx, cell, cb):
     return t[:, r[:, :, None], c[:, None, :]].permute(1, 2, 3, 0)
 
 
+def to_np(t):
+    """GPU tensor -> numpy through pinned host memory: copies into fresh pageable memory crawl here (~190 MB/s on the
+    GB10, ~15x slower), and the export copies hundreds of MB of tiles."""
+    if t.device.type == "cpu":
+        return t.numpy()
+    b = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    b.copy_(t)
+    return b.numpy()
+
+
 _sec = {}                                          # BAKE_TIMING: seconds per section of the bin loop
 
 
@@ -1319,29 +1329,26 @@ def run(scene: Path):
             sec(f"raster L{lvl_}")
             rgb, a, dacc = out[0, ..., :3], alpha[0, ..., 0], out[0, ..., 3]
             if FASTWIN:
-                rw_ = torch.nonzero(a.amax(1) > 0)[:, 0]; cw_ = torch.nonzero(a.amax(0) > 0)[:, 0]
-                if len(rw_) == 0 or len(cw_) == 0:
-                    continue
-                r0_, r1_, c0_, c1_ = torch.stack([rw_[0], rw_[-1], cw_[0], cw_[-1]]).tolist()
-                y0c, x0c = r0_ // cell, c0_ // cell
-                nyw, nxw = r1_ // cell - y0c + 1, c1_ // cell - x0c + 1
-                R0, C0, hh, ww = y0c * cell - gb, x0c * cell - gb, nyw * cell + 2 * gb, nxw * cell + 2 * gb
-                ys0, xs0, ys1, xs1 = max(R0, 0), max(C0, 0), min(R0 + hh, Hc), min(C0 + ww, Wc)
-
-                def crop(t):                                 # (Hc, Wc[, C]) -> the window (hh, ww[, C]), 0 outside
-                    p_ = (xs0 - C0, C0 + ww - xs1, ys0 - R0, R0 + hh - ys1)
-                    return torch.nn.functional.pad(t[ys0:ys1, xs0:xs1], ((0, 0) if t.dim() == 3 else ()) + p_)
-                a_c = crop(a)                                                          # (hh, ww), with border
-                win = torch.cat([crop(rgb), a_c[..., None]], -1).half()               # (hh, ww, 4)
-                cells_w = win[gb:gb + nyw * cell, gb:gb + nxw * cell].reshape(nyw, cell, nxw, cell, 4).permute(0, 2, 1, 3, 4)
-                occ_w = cells_w[..., 3].amax((2, 3)) >= 1 / 255
+                # occupied cells from the alpha alone (max-pool per cell; the half-precision test as the full path),
+                # then only their bordered tiles gathered from the rasterizer's output (0 outside the frame)
+                amx = torch.nn.functional.max_pool2d(a[None, None], cell, cell, ceil_mode=True)[0, 0]
+                occ_c = amx.half() >= 1 / 255
                 if cmask_ is not None:                       # ADAPT: this level's cells only
-                    occ_w = occ_w & cmask_[y0c:y0c + nyw, x0c:x0c + nxw]
-                cyw, cxw = torch.nonzero(occ_w, as_tuple=True)
-                cy, cx = cyw + y0c, cxw + x0c
-                crops.append(cells_w[cyw, cxw].reshape(-1, 4))
+                    occ_c = occ_c & cmask_[:occ_c.shape[0], :occ_c.shape[1]]
+                cy, cx = torch.nonzero(occ_c, as_tuple=True)
+                if len(cy) == 0:
+                    continue
+                ar_ = torch.arange(cb, device=dev)
+                rr = cy[:, None] * cell - gb + ar_; cc = cx[:, None] * cell - gb + ar_            # (n, cb) frame px
+                okr, okc = (rr >= 0) & (rr < Hc), (cc >= 0) & (cc < Wc)
+                ri, ci = rr.clamp(0, Hc - 1)[:, :, None], cc.clamp(0, Wc - 1)[:, None, :]
+                ok2 = (okr[:, :, None] & okc[:, None, :])[..., None]
+                o4 = torch.where(ok2, out[0][ri, ci], 0)                                     # (n, cb, cb, RGB+D)
+                a4 = torch.where(ok2, alpha[0][ri, ci], 0)                                   # (n, cb, cb, 1)
+                tiles = torch.cat([o4[..., :3], a4], -1).half()                             # as the padded image
+                crops.append(tiles[:, gb:gb + cell, gb:gb + cell].reshape(-1, 4))
                 if EXPORT:
-                    sel = cell_tiles(win.permute(2, 0, 1), cyw, cxw, cell, cb).float()
+                    sel = tiles.float()
                     crops_b.append((sum(len(r) for r in rect_l), sel.half() if TILES_GPU else sel.half().cpu()))
                 cyn, cxn = cy.cpu().numpy(), cx.cpu().numpy()
                 rect_l.append(np.stack([cxn * cell, cyn * cell, (cxn + 1) * cell, (cyn + 1) * cell], 1))
@@ -1350,18 +1357,17 @@ def run(scene: Path):
                     meta_l.append(np.tile([lvl_, k // per_, k % per_, per_], (len(cyn), 1)))
                 cen_l.append(np.full(len(cyn), centers[k]))
                 # per-cell depth (as below): alpha-weighted mean disparity, corners shared by neighbouring cells
-                a_w = a_c[gb:gb + nyw * cell, gb:gb + nxw * cell]
-                d_w = crop(dacc)[gb:gb + nyw * cell, gb:gb + nxw * cell]
-                pd_w = torch.where(a_w > 1e-3, a_w / d_w.clamp(min=1e-6), 0)
-                aw = a_w.reshape(nyw, cell, nxw, cell).sum((1, 3))
-                dw = (a_w * pd_w).reshape(nyw, cell, nxw, cell).sum((1, 3))
-                dcell = torch.where(occ_w, dw / aw.clamp(min=1e-9), 0).double()
-                o = occ_w.double()
+                a_i = a4[:, gb:gb + cell, gb:gb + cell, 0]
+                d_i = o4[:, gb:gb + cell, gb:gb + cell, 3]
+                pd_i = torch.where(a_i > 1e-3, a_i / d_i.clamp(min=1e-6), 0)
+                aw = a_i.sum((1, 2)); dw = (a_i * pd_i).sum((1, 2))
+                dcell = (dw / aw.clamp(min=1e-9)).double()
                 G = torch.zeros(ny + 1, nx + 1, device=dev, dtype=torch.float64); Gn = torch.zeros_like(G)
+                one = torch.ones_like(dcell)
                 for oy in (0, 1):
                     for ox in (0, 1):
-                        G[y0c + oy:y0c + oy + nyw, x0c + ox:x0c + ox + nxw] += dcell * o
-                        Gn[y0c + oy:y0c + oy + nyw, x0c + ox:x0c + ox + nxw] += o
+                        G.index_put_((cy + oy, cx + ox), dcell, accumulate=True)
+                        Gn.index_put_((cy + oy, cx + ox), one, accumulate=True)
                 G = (G / Gn.clamp(min=1)).cpu().numpy()
                 if ADAPT:
                     used_ = (Gn > 0).cpu().numpy()
@@ -2141,27 +2147,30 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
             n_g = len(atb)
             half_u8 = np.zeros((n_g, cb // ds, cb // ds, 4), np.uint8)
             bbox = np.full((n_g, 4), -1, np.int64)                    # first row, last row, first col, last col
-            full_t = torch.tensor(full[st:st + n_g], device=dev)
-            for c0 in range(0, n_g, 16384):
-                t1 = atb[c0:c0 + 16384].to(dev).float().clamp(0, 1)              # (n, cb, cb, 4)
+            # live cells only (culled ones are never used; converting every tile to float was ~90% of this step)
+            lj_all = np.nonzero(live[st:st + n_g])[0]
+            for c0 in range(0, len(lj_all), 16384):
+                lj = lj_all[c0:c0 + 16384]
+                ljt = torch.tensor(lj, device=atb.device)
+                t1 = atb[ljt].to(dev).float().clamp(0, 1)                         # (n, cb, cb, 4)
                 th = torch.nn.functional.avg_pool2d(t1.permute(0, 3, 1, 2), ds).permute(0, 2, 3, 1) if ds > 1 else t1
-                half_u8[c0:c0 + len(t1)] = (unprem(th) * 255 + 0.5).byte().cpu().numpy()
+                half_u8[lj] = to_np((unprem(th) * 255 + 0.5).byte())
                 inner_h = th[:, g2:th.shape[1] - g2, g2:th.shape[2] - g2, 3] >= 0.5 / 255
                 inner_f = t1[:, gb:cb - gb, gb:cb - gb, 3] >= 0.5 / 255
-                fsel = full_t[c0:c0 + len(t1)]
+                fsel = torch.tensor(full[st + lj], device=dev)
                 for inner, sel in ((inner_h, ~fsel), (inner_f, fsel)):
                     if not sel.any():
                         continue
                     r0, r1 = first_last(inner[sel].any(2))
                     k0, k1 = first_last(inner[sel].any(1))
-                    ids = torch.nonzero(sel)[:, 0].cpu().numpy() + c0
+                    ids = lj[torch.nonzero(sel)[:, 0].cpu().numpy()]
                     bbox[ids] = torch.stack([r0, r1, k0, k1], 1).cpu().numpy()
             full_j = np.nonzero(full[st:st + n_g] & live[st:st + n_g])[0]
             full_u8 = {}
             for c0 in range(0, len(full_j), 16384):                   # full-resolution cells only, batched
                 ids = full_j[c0:c0 + 16384]
-                full_u8.update(zip(ids, (unprem(atb[torch.tensor(ids, device=atb.device)].to(dev).float().clamp(0, 1))
-                                         * 255 + 0.5).byte().cpu().numpy()))
+                full_u8.update(zip(ids, to_np((unprem(atb[torch.tensor(ids, device=atb.device)].to(dev).float().clamp(0, 1))
+                                               * 255 + 0.5).byte())))
             for j in np.nonzero(live[st:st + n_g] & (bbox[:, 0] >= 0))[0]:
                 i = st + j
                 x0, y0 = rects[i, 0], rects[i, 1]
@@ -2345,8 +2354,8 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
                         sw = torch.nn.functional.avg_pool2d(wg_.permute(0, 3, 1, 2), 3, 1, 1, count_include_pad=False).permute(0, 2, 3, 1)
                         Cu = torch.where(wg_ > 0, Cu, sm / sw.clamp(min=1e-6)); wg_ = torch.where(wg_ > 0, wg_, (sw > 0).float())
                     Cu8 = (torch.cat([Cu.clamp(0, 1), Oe if ALLO is not None else torch.ones_like(a_)], -1) * 255 + 0.5).byte()
-                    Cu8 = Cu8.reshape(len(ch_r), N_, H_, W_, 4).cpu().numpy()
-                    A8 = (a_[..., 0] * 255 + 0.5).byte().reshape(len(ch_r), N_, H_, W_).cpu().numpy()
+                    Cu8 = to_np(Cu8.reshape(len(ch_r), N_, H_, W_, 4))
+                    A8 = to_np((a_[..., 0] * 255 + 0.5).byte().reshape(len(ch_r), N_, H_, W_))
                     mb_ = torch.stack([mr0, mr1, mc0, mc1], 1).reshape(len(ch_r), N_, 4).cpu().numpy()
                     bx = torch.stack([r0, r1, k0, k1], 1).cpu().numpy()
                     for j, mem in enumerate(ch_r):
@@ -2783,12 +2792,19 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
                        np.array([[0, 1, 2]], np.uint32), np.zeros((3, 2), np.float32), pg_))
     tick("export: atlas pages, quads")
     path = (Path(EXPORT_DIR) if EXPORT_DIR else scene.parent) / f"{scene.stem}{EXPORT}.glb"
-    write_layer_glbs(path, meshes, ktx2=EXPORT_KTX2)
     quad_px = sum((geo[i][2] - geo[i][0]) * (geo[i][3] - geo[i][1]) for i in texs)
-    print(f"  quads cover {quad_px / (GW * SS * Hg * SS):.1f}x the frame (fill before blending/depth test)", flush=True)
-    print(f"  [{time.time() - T0:.0f}s] wrote {path} ({path.stat().st_size / 2**20:.0f} MB, {len(pages)} atlas pages of {page}^2, "
-          f"{len(texs)} patches, {texels / 1e6:.0f}M texels = {texels / (len(pages) * page * page):.0%} of the pages)",
-          flush=True)
+    n_tex, t0_ = len(texs), T0
+
+    def finish():                                     # CPU only: PNG / KTX2 encoding and the files
+        write_layer_glbs(path, meshes, ktx2=EXPORT_KTX2)
+        print(f"  quads cover {quad_px / (GW * SS * Hg * SS):.1f}x the frame (fill before blending/depth test)", flush=True)
+        print(f"  [{time.time() - t0_:.0f}s] wrote {path} ({path.stat().st_size / 2**20:.0f} MB, {len(pages)} atlas pages of {page}^2, "
+              f"{n_tex} patches, {texels / 1e6:.0f}M texels = {texels / (len(pages) * page * page):.0%} of the pages)",
+              flush=True)
+    if WRITER is None:
+        finish()
+    else:                                             # --serve: written in the background, next scene meanwhile
+        WRITER.submit(finish)
 
 
 def write_layer_glbs(path, meshes, ktx2=False):
@@ -2861,29 +2877,86 @@ def write_layer_glbs(path, meshes, ktx2=False):
             write_glb(Path(path).with_name(Path(path).stem + suffix + ".glb"), g, views)
 
 
+class _ThreadOut:
+    """sys.stdout / sys.stderr for --serve: each thread prints to its own target (the scene it works on)."""
+    def __init__(self, default):
+        self.default, self.local = default, __import__("threading").local()
+
+    def set(self, f):
+        self.local.f = f
+
+    def write(self, x):
+        return getattr(self.local, "f", self.default).write(x)
+
+    def flush(self):
+        getattr(self.local, "f", self.default).flush()
+
+
+class _Writer:
+    """--serve: runs each scene's file writing (finish() of export_glb) on a background thread; results in order."""
+    def __init__(self, out):
+        from concurrent.futures import ThreadPoolExecutor
+        self.pool, self.out, self.job = ThreadPoolExecutor(1), out, None
+
+    def submit(self, fn):
+        f = self.out.local.f                          # this scene's log
+        def run_():
+            self.out.set(f)
+            fn()
+        self.job = self.pool.submit(run_)
+
+
+WRITER = None                                     # --serve: a _Writer (export_glb hands the file writing to it)
+
+
 def serve():
     """--serve: bake scenes read from stdin, one per line ("<scene.ply>\t<log file>"), in this one process (no
-    start-up per scene: Python, torch, CUDA and gsplat load once); each scene's output goes to its log, and one line
-    per scene to stdout: "ok" or "fail <error>". Settings come from the environment, as for a single run."""
-    import contextlib, traceback
-    out = sys.stdout
+    start-up per scene: Python, torch, CUDA and gsplat load once). Each scene's output goes to its log. Per scene,
+    stdout gets "gpu-done <ply>" once its GPU work is done (the next scene can start: its files are written in the
+    background meanwhile), then "ok <ply>" when its files are written, or "fail <ply> <error>". Settings come from
+    the environment, as for a single run."""
+    global WRITER
+    import threading, traceback
+    real = sys.stdout
+    sys.stdout = sys.stderr = tl = _ThreadOut(real)
+    WRITER = _Writer(tl)
+    lock = threading.Lock()
+
+    def say(msg):
+        with lock:
+            real.write(msg + "\n"); real.flush()
     for line in sys.stdin:
         if not line.strip():
             continue
         ply, _, log = line.rstrip("\n").partition("\t")
+        lf = open(log or os.devnull, "a")
+        tl.set(lf)
+        WRITER.job = None
         try:
-            with open(log or os.devnull, "a") as lf, contextlib.redirect_stdout(lf), contextlib.redirect_stderr(lf):
-                try:
-                    run(Path(ply))
-                except Exception:
-                    traceback.print_exc()
-                    raise
-            print("ok", flush=True, file=out)
+            run(Path(ply))
         except Exception as e:
-            print(f"fail {type(e).__name__}: {str(e)[:200]}", flush=True, file=out)
+            traceback.print_exc()
+            tl.set(real); lf.close()
+            say(f"fail {ply} {type(e).__name__}: {str(e)[:200]}")
+            continue
         finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        tl.set(real)
+        job = WRITER.job
+        say(f"gpu-done {ply}")
+
+        def done_(j, ply=ply, lf=lf):
+            e = j.exception() if j is not None else None
+            if e is not None:
+                lf.write("".join(traceback.format_exception(e)))
+            lf.close()
+            say(f"ok {ply}" if e is None else f"fail {ply} {type(e).__name__}: {str(e)[:200]}")
+        if job is None:
+            done_(None)
+        else:
+            job.add_done_callback(done_)
+    WRITER.pool.shutdown(wait=True)
 
 
 if __name__ == "__main__":

@@ -306,11 +306,13 @@ gsplat renders of the splats, me_small + `20260102_153205_63202`, 5 moved eyes, 
   --astc-quality fast`): 6x faster to encode (UASTC: 152 CPU-s for 3 pages, 18 of 20 cores busy) and more accurate
   (+0.25 dB rendered). Quest/Apple/phones sample it natively; the viewer prefers it where supported, else UASTC
   (`_ktx2.glb`), else PNG; gallery "Textures".
-- **Bake speed** (plain MPI-only, me_small): 45 s -> ~6 s per scene in a persistent worker (`bake_mpi.py`;
-  ~11 s cold): bordered tiles gathered per occupied cell (not unfolded per frame) and kept on the GPU; per-bin work
-  on the window of cells with content (`FASTWIN`) and bin-sorted splat slices (byte-identical); culling from 9 eyes
-  at 0.25 resolution and Zstandard 9 (within 0.01 dB, +4% download); ASTC; no `sharp.cli`/`trimesh` imports
-  (~5 s). `BAKE_TIMING=1|2` prints stage / section times.
+- **Bake speed** (plain MPI-only, me_small): 45 s -> ~3.2 s per scene in a batch (`bake_mpi.py`'s persistent
+  worker, which writes a scene's files on a background thread while the next one runs on the GPU; ~11 s cold):
+  per bin only the occupied cells' bordered tiles are gathered from the rasterizer output and kept on the GPU
+  (`FASTWIN`, bin-sorted splat slices; per-cell depth sums in another order: renders within 0.003 levels);
+  GPU->host copies through pinned memory (fresh pageable memory: ~190 MB/s here); culling from 9 eyes at 0.25
+  resolution and Zstandard 9 (within 0.01 dB, +4% download); ASTC; no `sharp.cli`/`trimesh` imports (~5 s).
+  `BAKE_TIMING=1|2` prints stage / section times.
 
 ---
 

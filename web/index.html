@@ -330,6 +330,9 @@
     // the headset).
     // VR: our own button, requesting only 'local' (three's VRButton would also
     // ask for bounded-floor, which may pull the Quest towards roomscale).
+    // The controllers' connect events must be heard from the start: the buttons work before the first scene has
+    // loaded (and before xrController exists below).
+    XRSceneController.trackControllers(renderer);
     document.body.appendChild(ARButton.createButton(renderer));
     document.body.appendChild(createVRButton(renderer));
 
@@ -1342,14 +1345,17 @@
         xrToast.show(`90 Hz (this scene runs ${Math.round(fps)} fps at 120)`, 3);
       }
     }
-    renderer.xr.addEventListener('sessionstart', () => {
-      requestHz(targetHz);
-      xrController.applyHome();
+    function onSessionStart() {
+      xrController.applyHome();              // first: without it the sticks, turns and drags do nothing
       applyViewConfig();                     // the scene's own size
+      requestHz(targetHz);
       setTimeout(() => {
         if (renderer.xr.isPresenting) xrController.resetPlacement();
       }, 500);
-    });
+    }
+    renderer.xr.addEventListener('sessionstart', onSessionStart);
+    // Entered AR/VR while the first scene was still loading (this code runs after it): catch up.
+    if (renderer.xr.isPresenting) onSessionStart();
     renderer.xr.addEventListener('sessionend', () => xrController.resetAll());
 
     let meshObj = null;

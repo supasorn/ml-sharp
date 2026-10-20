@@ -109,17 +109,25 @@ export class XRSceneController {
     this._initControllers();
   }
 
-  // Four controller slots: with hand tracking on, the Quest can list hands and controllers together, and three
-  // gives each input source the first free slot, so a reconnecting controller may land in slot 2 or 3. Each slot
-  // remembers its input source; update() picks one source per hand (a controller over a tracked hand).
-  _initControllers() {
-    this.slots = [0, 1, 2, 3].map((i) => {
-      const controller = this.renderer.xr.getController(i);
+  /**
+   * Four controller slots: with hand tracking on, the Quest can list hands and controllers together, and three
+   * gives each input source the first free slot, so a reconnecting controller may land in slot 2 or 3. Each slot
+   * remembers its input source; update() picks one source per hand (a controller over a tracked hand).
+   * Call this as soon as the renderer exists (before the AR/VR buttons): a session entered before the listeners
+   * are attached never reports its controllers (no pointer, no drag).
+   */
+  static trackControllers(renderer) {
+    return (renderer.xr.userData ??= {}).slots ??= [0, 1, 2, 3].map((i) => {
+      const controller = renderer.xr.getController(i);
       controller.addEventListener("connected", (event) => { controller.userData.source = event.data; });
       controller.addEventListener("disconnected", () => { controller.userData.source = null; });
-      this.scene.add(controller);
       return controller;
     });
+  }
+
+  _initControllers() {
+    this.slots = XRSceneController.trackControllers(this.renderer);
+    this.slots.forEach((controller) => this.scene.add(controller));
   }
 
   // --- Settings menu ---------------------------------------------------------

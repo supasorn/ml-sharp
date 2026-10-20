@@ -244,21 +244,25 @@ def stitch_depth(depths, rots, f, size, eq_w, eq_h, device, border=0.03, prior=0
 # ---------------------------------------------------------------- output
 
 
-def write_ply(g: Gaussians3D, path: Path) -> None:
-    """Minimal 3DGS ply (sRGB colours like SHARP's export)."""
-    from plyfile import PlyData, PlyElement
-
+def write_ply(g: Gaussians3D, path: Path, spz: Path | None = None) -> None:
+    """Minimal 3DGS ply (sRGB colours like SHARP's export), written in one go (the bytes plyfile writes, ~10x
+    faster); spz: also the .spz (pano_spz.py) from the same data, without reading the ply back."""
     xyz = g.mean_vectors
     colors = convert_rgb_to_spherical_harmonics(cs_utils.linearRGB2sRGB(g.colors))
     op = torch.log(g.opacities / (1 - g.opacities)).clamp(-20, 20)[:, None]
     attrs = torch.cat([xyz, colors, op, torch.log(g.singular_values), g.quaternions], 1)
     names = (["x", "y", "z"] + [f"f_dc_{i}" for i in range(3)] + ["opacity"]
              + [f"scale_{i}" for i in range(3)] + [f"rot_{i}" for i in range(4)])
-    arr = attrs.cpu().numpy().astype(np.float32)
-    el = np.empty(len(arr), dtype=[(k, "f4") for k in names])
-    for k, name in enumerate(names):
-        el[name] = arr[:, k]
-    PlyData([PlyElement.describe(el, "vertex")]).write(str(path))
+    arr = np.ascontiguousarray(attrs.cpu().numpy().astype("<f4"))
+    el = arr.view(np.dtype([(k, "<f4") for k in names]))[:, 0]
+    header = ("ply\nformat binary_little_endian 1.0\n" f"element vertex {len(el)}\n"
+              + "".join(f"property float {k}\n" for k in names) + "end_header\n")
+    with open(path, "wb") as fh:
+        fh.write(header.encode("ascii"))
+        el.tofile(fh)
+    if spz is not None:
+        import pano_spz
+        pano_spz.write_spz(el, spz)
 
 
 def flat(g: Gaussians3D) -> Gaussians3D:
@@ -334,9 +338,10 @@ def run(args):
         if not args.no_align:
             dworld = rays @ Rt.T
             dworld = dworld / dworld.norm(dim=-1, keepdim=True)
-            u, v = dirs_to_equirect(dworld.cpu().numpy(), eq_w, eq_w // 2)
-            grid = torch.tensor(np.stack([u / eq_w * 2 - 1, v / (eq_w // 2) * 2 - 1], -1),
-                                device=device, dtype=torch.float32)
+            # dirs_to_equirect on the GPU (the numpy version, 2.4M rays a view, cost ~0.3 s a view)
+            lon = torch.atan2(dworld[..., 0], dworld[..., 2])
+            lat = torch.asin((-dworld[..., 1]).clamp(-1, 1))
+            grid = torch.stack([lon / math.pi, -lat / (math.pi / 2)], -1)          # = u / W * 2 - 1, v / H * 2 - 1
             # Wrap-safe enough: logd is continuous across the seam except at the exact column.
             lr = F.grid_sample(logd[None, None], grid[None], mode="bilinear", padding_mode="border",
                                align_corners=False)[0, 0]
@@ -358,7 +363,7 @@ def run(args):
     cpu.shutdown()
     if args.min_opacity > 0:
         g = select(g, g.opacities > args.min_opacity)
-    write_ply(g, out / f"{name}.ply")
+    write_ply(g, out / f"{name}.ply", None if args.no_spz else out / f"{name}.spz")
     info = dict(image=Path(args.input).name, panorama=True, layout=args.layout, fov=fov,
                 views=len(rots), splats=len(g.opacities), aligned=not args.no_align,
                 stitch=stats, seconds=round(time.time() - t0, 1))
@@ -376,10 +381,11 @@ def main(argv=None):
     p.add_argument("--depth-width", type=int, default=2048, help="Stitched distance map width.")
     p.add_argument("--no-align", action="store_true", help="Skip pass 2 alignment (baseline).")
     p.add_argument("--min-opacity", type=float, default=0.0)
+    p.add_argument("--no-spz", action="store_true", help="don't also write <name>.spz (scripts/pano_spz.py)")
     p.add_argument("--save-views", action="store_true")
     # mono: depth pass 3x faster (0.5 vs 1.6 s a view on the GB10) and +0.6 / +1.2 dB vs the panorama
-    # (R0011227 / hotel_room); all: 2 s faster still, same quality, kept optional.
-    p.add_argument("--bf16", choices=["off", "mono", "all"], default="mono",
+    # (R0011227 / hotel_room); all (default): ~2 s faster still, within -0.08..+0.31 dB of mono on both.
+    p.add_argument("--bf16", choices=["off", "mono", "all"], default="all",
                    help="bfloat16 autocast for the monodepth pass (mono) or the whole network (all)")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")

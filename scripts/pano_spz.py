@@ -14,8 +14,11 @@ import gzip
 import struct
 from pathlib import Path
 
+import sys
+
 import numpy as np
-from plyfile import PlyData
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 FRACTIONAL_BITS = 12  # 0.24 mm steps, +-2048 m range
 
@@ -25,7 +28,12 @@ def u8(x):
 
 
 def convert(src: Path, dst: Path) -> int:
-    v = PlyData.read(str(src))["vertex"].data
+    from eval_alpha_patches import read_ply_vertex   # one read (plyfile goes element by element: slow on the NAS)
+    return write_spz(read_ply_vertex(src), dst)
+
+
+def write_spz(v, dst: Path) -> int:
+    """v: the ply's vertex data (structured array with x.., f_dc_*, opacity, scale_*, rot_*)."""
     n = len(v)
     xyz = np.stack([v["x"], v["y"], v["z"]], -1).astype(np.float64)
     lim = (1 << 23) - 1
@@ -42,7 +50,7 @@ def convert(src: Path, dst: Path) -> int:
     rot = u8(q[:, :3] * 127.5 + 127.5).reshape(-1)
 
     header = struct.pack("<IIIBBBB", 0x5053474E, 2, n, 0, FRACTIONAL_BITS, 0, 0)
-    with gzip.open(dst, "wb", compresslevel=6) as f:
+    with gzip.open(dst, "wb", compresslevel=1) as f:   # 1: half the time of 6, 3% larger
         for part in (header, pos, alpha, color, scale, rot):
             f.write(part.tobytes() if isinstance(part, np.ndarray) else part)
     return n

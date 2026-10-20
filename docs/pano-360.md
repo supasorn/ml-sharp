@@ -169,7 +169,7 @@ first; `web.js` moves an equirectangular image (2:1 within 1%, ≥ 2000 px wide,
 `equirectangular` in its XMP) to `pano/inputs/` (name sanitised to `[\w.-]`) and anything else to
 `images/`. `scripts/pano_watch.py` (started by `scripts/start_server.sh`, log `logs/pano.log`) then runs
 `pano_predict.py` → `pano_spz.py` → `pano_msi.py --tex astc` (photo detail v4) for each input without
-`out_ico2_photo4/<name>_msi_astc.glb` (or an older `_msi_ktx2.glb`), ~70 s per panorama on the GB10; the gallery
+`out_ico2_photo4/<name>_msi_astc.glb` (or an older `_msi_ktx2.glb`), ~60 s per panorama on the GB10; the gallery
 shows it as
 "Processing 360°…" until the splats exist. `python scripts/pano_watch.py --root data/public --once [names]`
 does the same by hand.
@@ -197,5 +197,11 @@ One panorama went from ~240 s to ~100 s (`R0011227`, 20 ico views, splats bit-id
 - **Persistent watcher** (`pano_watch.py`): steps in-process (imports from the NAS and loading the model cost ~15 s
   per panorama), the MSI files written on a background thread while the next panorama is predicted (status lists
   them under `writing`).
-Timings (GB10): predict 39-45 s (was 138), spz 5 s, MSI 24-28 s (was 91), files written alongside the next
-panorama: ~70 s per panorama in a batch (was ~240).
+- **Round 3**: each MSI bin rendered once (nearest first; photo detail accumulates from those frames, the bins'
+  occupied cells are kept as raw crops and get the detail afterwards: textures bit-identical, vertices within
+  float rounding); corner refinement vectorized; the ply written with one `tofile` and read with
+  `eval_alpha_patches.read_ply_vertex` (plyfile: element by element); the `.spz` written by pano_predict from the
+  same data (gzip level 1: half the time, +3% size); the equirect lookup of pass 2 on the GPU; `--bf16 all` the
+  default (hotel_room +0.2 / +0.1 / +0.3 dB vs mono, R0011227 within 0.08 dB, ~2 s faster).
+Timings (GB10): predict + spz 38 s (was 138 + 6), MSI 19-21 s (was 91), files written alongside the next
+panorama: ~60 s per panorama in a batch (was ~240), ~75 s for the first (model load, imports).

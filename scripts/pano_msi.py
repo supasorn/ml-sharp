@@ -39,7 +39,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from plyfile import PlyData
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pano_predict import look_rotation  # noqa: E402
@@ -72,7 +71,7 @@ def cube_lookup(dirs: torch.Tensor):
 
 
 @torch.no_grad()
-def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centres, edge_jump, edge_px,
+def photo_detail(pano_path, frames, rots_np, S, fr, dev, min_w, centres, edge_jump, edge_px,
                  edge_darken, alpha_thr=None, erode_px=2, surface_band=0.05):
     """Per render pixel: the bin that dominates it from the centre and the colour to add to that bin so the
     composite from the centre equals the panorama (splats are ~2x softer than the photo).
@@ -93,7 +92,9 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     alpha >= alpha_thr at every pixel within erode_px (inside opaque surfaces, away from rims whose painted
     colour would slide when the eye moves), spread over the surface's bins in proportion to their alpha,
     i.e. the surface's own colour shifts by D / (its weight from the centre).
-    Returns apply(k, rgb, alpha) -> bin k's premultiplied rgb with the detail added (caller clamps).
+    frames: (bin, rgb, alpha) of every non-empty bin, nearest first (run() renders each bin once and keeps its cells).
+    Returns apply(k, rgb, alpha, crop) -> bin k's premultiplied rgb with the detail added (caller clamps); crop maps
+    the (6, S, S, ...) fields to the layout of rgb / alpha (identity: whole faces).
     """
     import cv2
 
@@ -108,10 +109,7 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     best_a = torch.zeros(6, S, S, device=dev)
     best_k = torch.full((6, S, S), -1, device=dev, dtype=torch.int16)
     alphas = {}                            # kept for the second pass (v4), which needs only alpha (~13 GB)
-    for k in range(B - 1, -1, -1):         # near first
-        if not (b == k).any():
-            continue
-        rgb, alpha, _ = render_bin(k)
+    for k, rgb, alpha in frames:           # near first
         alpha = alpha.clamp(0, 1)
         if alpha_thr is not None:
             alphas[k] = alpha
@@ -140,9 +138,7 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
         T2 = torch.ones(6, S, S, device=dev)
         surf_T = torch.ones(6, S, S, device=dev)
         surf_w = torch.zeros(6, S, S, device=dev)
-        for kb in range(B - 1, -1, -1):
-            if not (b == kb).any():
-                continue
+        for kb in sorted(alphas, reverse=True):                     # near first
             alpha = alphas.pop(kb)
             inb = (cen[kb] - d_best).abs() <= band
             surf_T = torch.where(inb, surf_T * (1 - alpha), surf_T)
@@ -156,9 +152,9 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
               f"residual |D| mean {D[inner].abs().mean():.4f}, applied on {weight[inner].mean():.1%} of pixels, "
               f"residual left {(D * (1 - weight[..., None]))[inner].abs().mean():.4f}", flush=True)
 
-        def apply_surface(kb, rgb, alpha):
-            inb = (cen[kb] - d_best).abs() <= band
-            return rgb + torch.where(inb[..., None], alpha[..., None] * shift, 0)
+        def apply_surface(kb, rgb, alpha, crop=lambda t: t):
+            inb = (cen[kb] - crop(d_best)).abs() <= crop(band)
+            return rgb + torch.where(inb[..., None], alpha[..., None] * crop(shift), 0)
         return apply_surface
     w3 = weight[..., None]
     if edge_darken:
@@ -169,8 +165,8 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
           f"of pixels (dominant weight >= {min_w}), {(weight == 0).float().mean():.1%} masked as depth edges, "
           f"{(weight < 1).float().mean():.1%} faded", flush=True)
 
-    def apply_dominant(kb, rgb, alpha):
-        return torch.where((best_k == kb)[..., None], rgb + delta, rgb)
+    def apply_dominant(kb, rgb, alpha, crop=lambda t: t):
+        return torch.where((crop(best_k) == kb)[..., None], rgb + crop(delta), rgb)
     return apply_dominant
 
 
@@ -224,7 +220,8 @@ def run(args, writer=None):
     gs = load_gsplat()
     ply = Path(args.ply)
     t0 = time.time()
-    v = PlyData.read(str(ply))["vertex"].data
+    from eval_alpha_patches import read_ply_vertex          # one read (plyfile: element by element, slow on the NAS)
+    v = read_ply_vertex(ply)
     sp_all = splat_tensors(v, dev)
     r = sp_all["means"].norm(dim=-1)
     d = (1 / r).cpu().numpy()
@@ -256,50 +253,69 @@ def run(args, writer=None):
     starts = np.r_[0, np.cumsum(torch.bincount(b, minlength=B).cpu().numpy())]
     sp_sorted = {key: val[order] for key, val in sp_all.items()}
     has_bin = starts[1:] > starts[:-1]
-    b = b.cpu().numpy()                                # photo_detail's (b == k).any(): numpy, no GPU sync
 
     def render_bin(k):
         sp = {key: val[int(starts[k]):int(starts[k + 1])] for key, val in sp_sorted.items()}
         return render_faces(gs, sp, rots, S, fr)
 
+    # Each bin is rendered once, nearest first: photo detail accumulates its composite from the frames, and only the
+    # bin's occupied cells (bordered crops of the raw render, ~5% of the faces) are kept until the detail is known
+    # (rendering every bin a second time cost ~6 s). Eval faces (--eval) are taken before the detail.
+    cb = cell + 2 * gb
+    kept_bins = {}                         # bin -> (cell index (n, 3), raw rgb+alpha crops (n, cb, cb, 4))
+    eval_faces = {} if args.eval else None
+    cull_alpha = {}
+    a_cells, dws = {}, {}
+
+    def frames():
+        for k in reversed(range(B)):       # near first
+            if not has_bin[k]:
+                continue
+            rgb, alpha, ed = render_bin(k)
+            raw = torch.cat([rgb, alpha[..., None]], -1)
+            rgba = raw.clamp(0, 1)                                                # (6,S,S,4) premultiplied
+            dist = ed * ray_norm
+            inner = rgba[:, gb:gb + Fr, gb:gb + Fr]
+            a_in = inner[..., 3].reshape(6, nc, cell, nc, cell)
+            alive = (a_in >= 0.5 / 255).any(4).any(2)                             # (6, nc, nc)
+            if args.cull > 0:                                 # coarse alpha, max and min (4 samples per cell side)
+                a_c = inner[..., 3][:, None]
+                pk = Fr // (nc * 4)
+                cull_alpha[k] = (torch.stack([F.max_pool2d(a_c, pk)[:, 0], -F.max_pool2d(-a_c, pk)[:, 0]]) * 255
+                                 ).round().to(torch.uint8)
+            a_cells[k] = a_in.sum((2, 4))
+            dws[k] = (dist[:, gb:gb + Fr, gb:gb + Fr] * inner[..., 3]).reshape(6, nc, cell, nc, cell).sum((2, 4))
+            if eval_faces is not None:
+                eval_faces[k] = (F.avg_pool2d(inner.permute(0, 3, 1, 2), TEXDS) * 255).round().to(torch.uint8)
+            idx = alive.nonzero()
+            if len(idx):                                     # bordered crops of the raw render: (n, cb, cb, 4)
+                kept_bins[k] = (idx, crop_cells(raw, idx))
+            yield k, rgb, alpha
+
+    def crop_cells(t, idx):                                  # (6, S, S, ...) -> the cells' bordered crops
+        t4 = t if t.dim() == 4 else t[..., None]
+        c = t4.unfold(1, cb, cell).unfold(2, cb, cell)[idx[:, 0], idx[:, 1], idx[:, 2]].permute(0, 2, 3, 1)
+        return c if t.dim() == 4 else c[..., 0]
+
     detail = None
     if args.photo_detail:
-        detail = photo_detail(args.photo_detail, render_bin, b, B, rots_np, S, fr, dev, args.detail_min_w,
+        detail = photo_detail(args.photo_detail, frames(), rots_np, S, fr, dev, args.detail_min_w,
                               centres, args.edge_jump, args.edge_px, args.edge_darken,
                               args.detail_alpha, args.detail_erode, args.surface_band)
+    else:
+        for _ in frames():
+            pass
 
     cells = []        # (bin, face, cy, cx)
     half_tex, full_tex, errs, wsum, rmean = [], {}, [], [], []
-    eval_faces = {} if args.eval else None
-    cull_alpha = {}
-    for k in range(B):                    # far first (bin 0 = lowest disparity)
-        if not has_bin[k]:
-            continue
-        rgb, alpha, ed = render_bin(k)
+    for k in sorted(kept_bins):           # far first (bin 0 = lowest disparity)
+        idx, raw = kept_bins.pop(k)
+        a_cell, dw = a_cells.pop(k), dws.pop(k)
+        rgb, alpha = raw[..., :3], raw[..., 3]
         if detail is not None:
-            rgb = detail(k, rgb, alpha)
+            rgb = detail(k, rgb, alpha, lambda t, idx=idx: crop_cells(t, idx))
             rgb = torch.minimum(rgb.clamp(min=0), alpha[..., None])               # valid premultiplied colour
-        rgba = torch.cat([rgb, alpha[..., None]], -1).clamp(0, 1)                 # (6,S,S,4) premultiplied
-        dist = ed * ray_norm
-        inner = rgba[:, gb:gb + Fr, gb:gb + Fr]
-        a_in = inner[..., 3].reshape(6, nc, cell, nc, cell)
-        alive = (a_in >= 0.5 / 255).any(4).any(2)                                 # (6, nc, nc)
-        if args.cull > 0:                                     # coarse alpha, max and min (4 samples per cell side)
-            a_c = inner[..., 3][:, None]
-            pk = Fr // (nc * 4)
-            cull_alpha[k] = (torch.stack([F.max_pool2d(a_c, pk)[:, 0], -F.max_pool2d(-a_c, pk)[:, 0]]) * 255
-                             ).round().to(torch.uint8)
-        a_cell = a_in.sum((2, 4))
-        dw = (dist[:, gb:gb + Fr, gb:gb + Fr] * inner[..., 3]).reshape(6, nc, cell, nc, cell).sum((2, 4))
-        if eval_faces is not None:
-            eval_faces[k] = (F.avg_pool2d(inner.permute(0, 3, 1, 2), TEXDS) * 255).round().to(torch.uint8)
-        idx = alive.nonzero()
-        if not len(idx):
-            continue
-        # Crops with borders: (n, cb, cb, 4)
-        cb = cell + 2 * gb
-        crops = rgba.unfold(1, cb, cell).unfold(2, cb, cell)                    # (6, nc', nc', 4, cb, cb)
-        crops = crops[idx[:, 0], idx[:, 1], idx[:, 2]].permute(0, 2, 3, 1)       # (n, cb, cb, 4)
+        crops = torch.cat([rgb, alpha[..., None]], -1).clamp(0, 1)                 # (n, cb, cb, 4) premultiplied
         t = crops.permute(0, 3, 1, 2)
         h = F.avg_pool2d(t, TEXDS)
         up = F.interpolate(h, scale_factor=TEXDS, mode="bilinear", align_corners=False)
@@ -340,22 +356,21 @@ def run(args, writer=None):
 
     # Per-cell radius refinement: corners = alpha-weighted mean of the (up to 4) cells sharing them,
     # clamped to the bin; corners on a face border stay at the bin centre (shared with the next face).
-    key = {tuple(cc): i for i, cc in enumerate(cells)}
+    # Vectorized: per (bin, face) grids of corner sums (a loop over the cells' corners cost ~3 s).
+    kk, fc_, cy_, cx_ = (cells[:, j] for j in range(4))
+    ws_g = np.zeros((B, 6, nc + 1, nc + 1)); rs_g = np.zeros_like(ws_g)
+    for oy in (0, 1):
+        for ox in (0, 1):
+            np.add.at(ws_g, (kk, fc_, cy_ + oy, cx_ + ox), wsum)
+            np.add.at(rs_g, (kk, fc_, cy_ + oy, cx_ + ox), wsum * rmean)
     corner_r = np.empty((N, 4))      # (x0y0, x1y0, x1y1, x0y1)
-    for i, (k, fc, cy, cx) in enumerate(cells):
-        for j, (oy, ox) in enumerate([(0, 0), (0, 1), (1, 1), (1, 0)]):
-            gy, gx = cy + oy, cx + ox
-            if not args.refine or gy in (0, nc) or gx in (0, nc):
-                corner_r[i, j] = 1 / centres[k]
-                continue
-            ws = rs = 0.0
-            for ny, nx in [(gy - 1, gx - 1), (gy - 1, gx), (gy, gx - 1), (gy, gx)]:
-                n = key.get((k, fc, ny, nx))
-                if n is not None:
-                    ws += wsum[n]
-                    rs += wsum[n] * rmean[n]
-            rr = rs / ws if ws > 0 else 1 / centres[k]
-            corner_r[i, j] = np.clip(rr, bin_lo_r[k], bin_hi_r[k])
+    r_c = 1 / np.asarray(centres)[kk]
+    for j, (oy, ox) in enumerate([(0, 0), (0, 1), (1, 1), (1, 0)]):
+        gy, gx = cy_ + oy, cx_ + ox
+        ws_, rs_ = ws_g[kk, fc_, gy, gx], rs_g[kk, fc_, gy, gx]
+        rr = np.clip(np.where(ws_ > 0, rs_ / np.where(ws_ > 0, ws_, 1), r_c), bin_lo_r[kk], bin_hi_r[kk])
+        border = (gy == 0) | (gy == nc) | (gx == 0) | (gx == nc)
+        corner_r[:, j] = np.where(border | (not args.refine), r_c, rr)
 
     # Corner directions (world, OpenCV frame).
     gx0 = cells[:, 3] * cell / fr - 1

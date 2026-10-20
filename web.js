@@ -189,6 +189,8 @@ app.post('/fps', express.json(), (req, res) => {
   res.sendStatus(204);
 });
 
+const PYTHON = path.join(process.env.SHARP_ENV || '/conda_envs/sharp', 'bin', 'python');
+
 // Small JPEG thumbnails (in-XR gallery, pending items), made once with the sharp conda env's Pillow ($SHARP_ENV)
 // (EXIF orientation applied, HEIC via pillow_heif) and cached in the collection's renderings/thumbs.
 const THUMB_PX = 512;   // gallery cards are 250 css px (500 device px on high-DPI screens)
@@ -200,7 +202,7 @@ function sendThumb(coll, src, outName, res, what) {
   const py = 'import sys\nfrom PIL import Image, ImageOps\ntry:\n import pillow_heif; pillow_heif.register_heif_opener()\n' +
              'except ImportError:\n pass\nim = ImageOps.exif_transpose(Image.open(sys.argv[1])).convert("RGB")\n' +
              `im.thumbnail((${THUMB_PX}, ${THUMB_PX}))\nim.save(sys.argv[2], quality=85)`;
-  execFile(path.join(process.env.SHARP_ENV || '/conda_envs/sharp', 'bin', 'python'), ['-c', py, src, out], (err) => {
+  execFile(PYTHON, ['-c', py, src, out], (err) => {
     if (err) { console.error('thumbnail failed:', what, err.message); return res.sendStatus(500); }
     res.sendFile(out);
   });
@@ -223,11 +225,13 @@ app.get('/thumb/:scene', (req, res) => {
   sendThumb(s.coll, src, `${s.name}_${THUMB_PX}.jpg`, res, req.params.scene);
 });
 // Thumbnail of a photo in a collection's images/ by file name (pending items have no scene yet).
+// ?pano=1: a panorama in pano/inputs that is still being processed.
 function thumbImg(req, res, coll, file) {
   if (!allow(req, res, coll)) return;
-  const src = path.join(dir(coll, 'images'), file);
+  const pano = req.query.pano === '1';
+  const src = path.join(pano ? path.join(dir(coll, 'pano'), 'inputs') : dir(coll, 'images'), file);
   if (file.includes('/') || file.includes('..') || !fs.existsSync(src)) return res.sendStatus(404);
-  sendThumb(coll, src, `_img_${file}_${THUMB_PX}.jpg`, res, file);
+  sendThumb(coll, src, `_${pano ? 'panoin' : 'img'}_${file}_${THUMB_PX}.jpg`, res, file);
 }
 app.get('/thumb-img/:file', (req, res) => thumbImg(req, res, PUB, req.params.file));
 app.get('/thumb-img/:coll/:file', (req, res) => {
@@ -253,14 +257,24 @@ function pendingImages(coll) {
     .map((f) => ({ file: f, coll: coll.id, mtime: fs.statSync(path.join(imgDir, f)).mtimeMs }))
     .sort((a, b) => b.mtime - a.mtime);
 }
-const allPending = (req) => visible(req).flatMap(pendingImages).sort((a, b) => b.mtime - a.mtime);
+// Panoramas in pano/inputs with nothing to show yet (scripts/pano_watch.py is on them).
+function pendingPanos(coll) {
+  const inputs = path.join(dir(coll, 'pano'), 'inputs');
+  if (!fs.existsSync(inputs)) return [];
+  return fs.readdirSync(inputs).filter((f) => /\.(jpe?g|png)$/i.test(f))
+    .filter((f) => !panoInfo(coll, f.replace(/\.[^.]+$/, '')))
+    .map((f) => ({ file: f, coll: coll.id, mtime: fs.statSync(path.join(inputs, f)).mtimeMs, pano: true }));
+}
+const allPending = (req) => visible(req).flatMap((c) => [...pendingImages(c), ...pendingPanos(c)])
+  .sort((a, b) => b.mtime - a.mtime);
 app.get('/pending', (req, res) => {
   try { res.json(allPending(req)); } catch (e) { res.status(500).send('Cannot read directory'); }
 });
 
 // Import from Google Photos (Picker API): see google_photos.js for setup; credentials in secrets/.
 // Photos go to the shown collection.
-require('./google_photos')(app, { imagesDir: () => dir(ACTIVE, 'images'), secretsDir: path.join(__dirname, 'secrets') });
+require('./google_photos')(app, { imagesDir: () => uploadDir(ACTIVE), onSaved: (file) => routeUpload(ACTIVE, file),
+                                 secretsDir: path.join(__dirname, 'secrets') });
 
 // View modes a scene can be shown in (gallery page and in-XR gallery grey out the rest).
 function sceneModes(outDir, name) {
@@ -297,11 +311,71 @@ app.get('/scenes', (req, res) => {
     res.status(500).send('Cannot read directory');
   }
 });
+// Models the watchers build for a scene, in build order: [label, done]. Photos: SHARP splats, then the MPI-only
+// bake (with its compressed copy); panoramas (scripts/pano_watch.py): splats, .spz, multi-sphere image.
+function buildStages(coll, name, pano) {
+  const has = (...p) => fs.existsSync(path.join(...p));
+  if (pano) {
+    const d = dir(coll, 'pano');
+    return [['splats', has(d, 'out_ico2', `${name}.ply`)], ['spz', has(d, 'out_ico2', `${name}.spz`)],
+            ['msi', has(d, 'out_ico2_photo4', `${name}_msi_ktx2.glb`)]];
+  }
+  const o = dir(coll, 'output2');
+  return [['splats', has(o, `${name}.ply`) && has(o, `${name}.json`)],
+          ['mpionly', has(o, `${name}_mpionly.glb`) && (has(o, `${name}_mpionly_astc.glb`) || has(o, `${name}_mpionly_ktx2.glb`))]];
+}
+// Chip states: done, then for the first missing model `next` (building / queued / stalled), queued after it.
+// null when everything is built.
+function stageStates(stages, next) {
+  const first = stages.findIndex(([, done]) => !done);
+  if (first < 0) return null;
+  return stages.map(([label, done], i) => [label, done ? 'done' : i === first ? next : 'queued']);
+}
+// Photos: building while the input is recent (the prediction and MPI watchers report nothing), stalled after 30 min.
+const photoNext = (mtime) => (Date.now() - mtime > 30 * 60e3 ? 'stalled' : 'building');
+// Panoramas: what scripts/pano_watch.py says it is working on (pano/.watch_status.json).
+function panoNext(coll, name) {
+  let st = null;
+  try { st = JSON.parse(fs.readFileSync(path.join(dir(coll, 'pano'), '.watch_status.json'), 'utf8')); } catch (e) {}
+  return st?.current === name ? 'building' : st?.failed?.includes(name) ? 'stalled' : 'queued';
+}
+function chipsHtml(states, pano) {
+  if (!states) return '';
+  const log = pano ? 'logs/pano.log' : 'logs/predict.log / logs/mpi.log';
+  const title = { done: 'built', building: 'being built', queued: 'waiting for its turn',
+                  stalled: `not built yet — check ${log}` };
+  return `<div class="build-chips">${states.map(([l, st]) =>
+    `<span class="chip ${st}" title="${l}: ${title[st]}">${st === 'done' ? '✓ ' : st === 'stalled' ? '! ' : ''}${l}</span>`).join('')}</div>`;
+}
+// Gallery cards still being built (pending inputs and scenes missing a model): one key per card and state, so the
+// gallery can reload when any of them moves on.
+function buildCards(req) {
+  const cards = [];
+  for (const p of allPending(req)) {
+    const coll = COLLECTIONS[p.coll], name = p.file.replace(/\.[^.]+$/, '');
+    const states = p.pano ? stageStates(buildStages(coll, name, true), panoNext(coll, name))
+                          : stageStates([['splats', false], ['mpionly', false]], photoNext(p.mtime));
+    cards.push({ key: `${p.coll}/${p.file}`, pending: p, states });
+  }
+  for (const s of allSceneEntries(visible(req))) {
+    const states = s.pano ? stageStates(buildStages(s.coll, s.name, true), panoNext(s.coll, s.name))
+      : stageStates(buildStages(s.coll, s.name, false), photoNext(s.mtime));
+    if (states) cards.push({ key: s.id, scene: s, states });
+  }
+  return cards;
+}
+const buildKey = (cards) => cards.map((c) => `${c.key}:${c.states.map((x) => x[1]).join(',')}`).sort().join('|');
+app.get('/build-status', (req, res) => {
+  try { res.json({ key: buildKey(buildCards(req)) }); } catch (e) { res.status(500).send('Cannot read directory'); }
+});
+
 app.get('/list', (req, res) => {
   // get "ui" get parameter
   const ui = req.query.ui || 'true';
-  let entries;
-  try { entries = allSceneEntries(visible(req)); } catch (e) { res.status(500).send('Cannot read directory'); return; }
+  let entries, cards;
+  try { entries = allSceneEntries(visible(req)); cards = buildCards(req); }
+  catch (e) { res.status(500).send('Cannot read directory'); return; }
+  const chipsOf = Object.fromEntries(cards.filter((c) => c.scene).map((c) => [c.key, chipsHtml(c.states, !!c.scene.pano)]));
   // Photo scenes and 360 panoramas (badge, own view modes), most recently modified first; private ones
   // with a lock badge.
   const items = entries.map((s) => {
@@ -315,7 +389,7 @@ app.get('/list', (req, res) => {
       return `
         <div class="${cls}" data-kind="pano" data-modes="${entryModes(s).join(' ')}" title="360° panorama: ${s.name}">
           <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
-            <div class="pano-wrap"><img src='${imgSrc}' alt='${s.name}' loading='lazy' /><span class="pano-badge">360°</span>${lock}</div>
+            <div class="pano-wrap"><img src='${imgSrc}' alt='${s.name}' loading='lazy' /><span class="pano-badge">360°</span>${lock}${chipsOf[name] || ''}</div>
           </a>
         </div>
       `;
@@ -323,29 +397,23 @@ app.get('/list', (req, res) => {
     return `
         <div class="${cls}" data-modes="${entryModes(s).join(' ')}">
           <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
-            <div class="pano-wrap"><img src='${imgSrc}' alt='${s.name}' loading='lazy' />${lock}</div>
+            <div class="pano-wrap"><img src='${imgSrc}' alt='${s.name}' loading='lazy' />${lock}${chipsOf[name] || ''}</div>
           </a>
         </div>
       `;
   }).join('\n');
   // Read the template and inject the items
   let template = fs.readFileSync(path.join(__dirname, 'web', 'list.html'), 'utf8');
-  // Photos still being processed: dimmed thumbnail with a spinner (not clickable), newest first.
-  let pending = '';
-  try {
-    pending = allPending(req).map(({ file, coll, mtime }) => {
-      const stale = Date.now() - mtime > 30 * 60 * 1000;
-      return `
-        <div class="scene-item pending" data-file="${encodeURIComponent(coll + '/' + file)}" title="${file}">
+  // Photos / panoramas still being processed (no scene yet): dimmed thumbnail with a chip per model.
+  const pending = cards.filter((c) => c.pending).map(({ pending: { file, coll, pano }, states }) => `
+        <div class="scene-item pending${pano ? ' pano' : ''}" data-file="${encodeURIComponent(coll + '/' + file)}" title="${pano ? '360° panorama: ' : ''}${file}">
           <div class="pending-wrap">
-            <img src='/thumb-img/${coll}/${encodeURIComponent(file)}' alt='${file}' loading='lazy' />
-            ${stale ? '' : '<div class="pending-spinner"></div>'}
-            <div class="pending-label">${stale ? 'Still not processed — check logs/predict.log' : 'Processing…'}</div>
+            <img src='/thumb-img/${coll}/${encodeURIComponent(file)}${pano ? '?pano=1' : ''}' alt='${file}' loading='lazy' />
+            ${pano ? '<span class="pano-badge">360°</span>' : ''}
+            ${chipsHtml(states, pano)}
           </div>
-        </div>`;
-    }).join('\n');
-  } catch (e) {}
-  const state = { mode: ACTIVE.id };
+        </div>`).join('\n');
+  const state = { mode: ACTIVE.id, buildKey: buildKey(cards) };
   template = template.replace('<!-- PRIVATE_STATE -->', `<script>window.PRIVATE_STATE = ${JSON.stringify(state)};</script>`);
   template = template.replace('<!-- SCENE_ITEMS_PLACEHOLDER -->', pending + items);
   res.send(template);
@@ -358,7 +426,7 @@ app.use('/js', express.static(path.join(__dirname, 'web', 'js')));
 // Uploads go to the shown collection.
 const storage = multer.diskStorage({
   destination: function(req, file, cb) {
-    cb(null, dir(collOf(req), 'images'));
+    cb(null, uploadDir(collOf(req)));
   },
   filename: function(req, file, cb) {
     let base = path.basename(file.originalname, path.extname(file.originalname));
@@ -372,26 +440,35 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage: storage });
+// Uploads and Google imports land in <collection>/renderings/uploads first, not in images/ (the prediction watcher
+// would take a 360 panorama for a photo), then routeUpload() moves each to images/ or, if it is an equirectangular
+// panorama (2:1, or tagged equirectangular in its XMP), to pano/inputs/ for scripts/pano_watch.py.
+function uploadDir(coll) {
+  const d = path.join(dir(coll, 'renderings'), 'uploads');
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+const EQUIRECT_PY = 'import sys\nfrom PIL import Image\ntry:\n import pillow_heif; pillow_heif.register_heif_opener()\n' +
+  'except ImportError:\n pass\nw, h = Image.open(sys.argv[1]).size\nhead = open(sys.argv[1], "rb").read(1 << 18)\n' +
+  'print(int(b"equirectangular" in head.lower() or (w >= 2000 and abs(w / h - 2) < 0.01)))';
+function isEquirect(file) {
+  return new Promise((resolve) => execFile(PYTHON, ['-c', EQUIRECT_PY, file], (err, out) => resolve(!err && out.trim() === '1')));
+}
+async function routeUpload(coll, file) {
+  const name = path.basename(file), ext = path.extname(name).toLowerCase();
+  const pano = ['.jpg', '.jpeg', '.png'].includes(ext) && await isEquirect(file);
+  // pano ids allow only [\w.-]
+  const dest = pano ? path.join(dir(coll, 'pano'), 'inputs', path.basename(name, path.extname(name)).replace(/[^\w.-]/g, '_') + ext)
+                    : path.join(dir(coll, 'images'), name);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(file, dest);   // a new file (not a rename): the prediction watcher reacts when a file is closed
+  fs.unlinkSync(file);
+  console.log(pano ? '360 panorama ->' : 'photo ->', coll.private ? '(private)' : dest);
+  return pano;
+}
 app.post('/upload', (req, res, next) => { if (allow(req, res, collOf(req))) next(); }, upload.array('files[]'), async (req, res) => {
   try {
-    await Promise.all(req.files.map(async (file) => {
-      const ext = path.extname(file.originalname).toLowerCase();
-
-      if (ext === '.jpg' || ext === '.jpeg' || ext === '.png' || ext === '.webp') {
-              // const newFileName = file.path.replace(/\.[^/.]+$/, '_resized.jpg');
-        // console.log("change from ", file.path, " to ", newFileName);
-        // await sharp(file.path).rotate().resize({ height: 1400 }).toFile(newFileName);
-        // fs.unlinkSync(file.path); // Delete original file
-
-        // no resize anymore, just rotate with exif
-        console.log("process image ", collOf(req).private ? '(private)' : file.path);
-        // fs.unlinkSync(file.path);
-        // const newFileName = file.path.replace(/\.[^/.]+$/, '_tmp.jpg');
-        // await sharp(file.path).rotate().resize({ height: 1400 }).toFile(newFileName);
-        // fs.unlinkSync(file.path); // Delete original file
-        // fs.renameSync(newFileName, file.path);
-      }
-    }));
+    for (const file of req.files) await routeUpload(collOf(req), file.path);
 
     res.send('Files uploaded and processed successfully.');
   } catch (error) {

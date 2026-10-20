@@ -162,5 +162,13 @@ The viewer (`web/js/panoView.js`) switches by scene kind:
   stepping between photo scenes and panoramas re-centres.
 
 The standalone viewer (`node scripts/pano_server.js`, port 3100/3543) still works for comparisons
-of all variants. Panoramas are not created by the watchers yet: run `pano_predict.py`, `pano_spz.py`
-and `pano_msi.py` by hand.
+of all variants.
+
+**Uploads**: the gallery's uploads (and Google Photos imports) land in `<collection>/renderings/uploads`
+first; `web.js` moves an equirectangular image (2:1 within 1%, ≥ 2000 px wide, or tagged
+`equirectangular` in its XMP) to `pano/inputs/` (name sanitised to `[\w.-]`) and anything else to
+`images/`. `scripts/pano_watch.py` (started by `scripts/start_server.sh`, log `logs/pano.log`) then runs
+`pano_predict.py` → `pano_spz.py` → `pano_msi.py` (photo detail v4) for each input without
+`out_ico2_photo4/<name>_msi_ktx2.glb`, ~4 min per panorama on the GB10; the gallery shows it as
+"Processing 360°…" until the splats exist. `python scripts/pano_watch.py --root data/public --once [names]`
+does the same by hand.

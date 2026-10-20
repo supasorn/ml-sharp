@@ -32,7 +32,8 @@ const SCOPE = 'https://www.googleapis.com/auth/photospicker.mediaitems.readonly'
 const PICKER = 'https://photospicker.googleapis.com/v1';
 
 // imagesDir: a folder, or a function (req) -> folder for an import started by that request (null: refused).
-module.exports = function googlePhotos(app, { imagesDir, secretsDir }) {
+// onSaved(file): optional, called after each download (web.js moves it on to images/ or pano/inputs/).
+module.exports = function googlePhotos(app, { imagesDir, onSaved, secretsDir }) {
   const importDir = typeof imagesDir === 'function' ? imagesDir : () => imagesDir;
   const credFile = path.join(secretsDir, 'google_oauth.json');
   const tokenFile = path.join(secretsDir, 'google_token.json');
@@ -129,6 +130,7 @@ module.exports = function googlePhotos(app, { imagesDir, secretsDir }) {
         if (!r.ok) { s.failed = (s.failed || 0) + 1; continue; }
         const name = targetName(m.mediaFile.filename, m.mediaFile.mimeType);
         fs.writeFileSync(path.join(s.dir, name), Buffer.from(await r.arrayBuffer()));
+        if (onSaved) await onSaved(path.join(s.dir, name));
         s.files.push(name);
         s.done++;
         console.log(`[google] imported ${name} (${s.done}/${s.total})`);

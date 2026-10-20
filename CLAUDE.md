@@ -14,7 +14,9 @@ Quick facts:
   never commit it). Gallery at `/list`, viewer at `/?scene=<name>&lod=hybrid`.
   `scripts/start_server.sh` runs it together with the SHARP prediction watcher
   and the MPI-only watcher (`scripts/bake_mpi.py --watch --mpionly`; new scenes
-  get only MPI-only, not Hybrid / Hybrid-MPI); stop it with Ctrl+C or
+  get only MPI-only, not Hybrid / Hybrid-MPI) and the panorama watcher
+  (`scripts/pano_watch.py`; uploaded 2:1 equirect images go to `pano/inputs/`,
+  not `images/`); stop it with Ctrl+C or
   `scripts/stop_server.sh` (pids in `logs/stack.pids`).
 - Bake hybrids: `sharp bake-hybrid -i output2` (outputs next to each scene);
   how-to with options and troubleshooting: `docs/hybrid-baking.md`.

@@ -20,11 +20,15 @@
 # again while an old stack is running on this machine stops the old one first.
 #
 # Logs: logs/{web,predict,mpi}.log (public) or data/private/logs/{web,predict,mpi}.log (private).
-# Env overrides: SHARP_ENV (conda env, default /conda_envs/sharp),
-#                PREDICT_GPU (default 0), MPI_GPU (default 1).
+# Env overrides: SHARP_ENV (conda env, default /conda_envs/sharp, /conda_envs/sharp_dgx on arm64 machines),
+#                PREDICT_GPU (default 0), MPI_GPU (default 1, or 0 with a single GPU).
 set -u
 cd "$(dirname "$0")/.."
-ENV="${SHARP_ENV:-/conda_envs/sharp}"
+if [ "$(uname -m)" = aarch64 ]; then ENV="${SHARP_ENV:-/conda_envs/sharp_dgx}"; else ENV="${SHARP_ENV:-/conda_envs/sharp}"; fi
+export SHARP_ENV="$ENV"                         # web.js makes thumbnails with this env's Python
+export PATH="$ENV/bin:$PATH"                    # its node, if the system has none
+NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
+[ "$NGPU" -le 1 ] && MPI_GPU="${MPI_GPU:-0}"
 PIDFILE=logs/stack.pids
 mkdir -p logs images output2
 

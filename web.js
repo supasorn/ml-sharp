@@ -189,7 +189,7 @@ app.post('/fps', express.json(), (req, res) => {
   res.sendStatus(204);
 });
 
-// Small JPEG thumbnails (in-XR gallery, pending items), made once with the sharp conda env's Pillow
+// Small JPEG thumbnails (in-XR gallery, pending items), made once with the sharp conda env's Pillow ($SHARP_ENV)
 // (EXIF orientation applied, HEIC via pillow_heif) and cached in the collection's renderings/thumbs.
 const THUMB_PX = 512;   // gallery cards are 250 css px (500 device px on high-DPI screens)
 const thumbDir = (coll) => path.join(dir(coll, 'renderings'), 'thumbs');
@@ -200,7 +200,7 @@ function sendThumb(coll, src, outName, res, what) {
   const py = 'import sys\nfrom PIL import Image, ImageOps\ntry:\n import pillow_heif; pillow_heif.register_heif_opener()\n' +
              'except ImportError:\n pass\nim = ImageOps.exif_transpose(Image.open(sys.argv[1])).convert("RGB")\n' +
              `im.thumbnail((${THUMB_PX}, ${THUMB_PX}))\nim.save(sys.argv[2], quality=85)`;
-  execFile('/conda_envs/sharp/bin/python', ['-c', py, src, out], (err) => {
+  execFile(path.join(process.env.SHARP_ENV || '/conda_envs/sharp', 'bin', 'python'), ['-c', py, src, out], (err) => {
     if (err) { console.error('thumbnail failed:', what, err.message); return res.sendStatus(500); }
     res.sendFile(out);
   });

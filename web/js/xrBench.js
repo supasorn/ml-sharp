@@ -12,6 +12,12 @@
  * ?benchscenes=a,b (default: 20260914_113455_56657, 20200927_161631).
  * Per phase: load, re-centre the scene in front, 2 s settle, 8 s measured.
  * Hold still, facing the scene, for comparable numbers.
+ *
+ * bench=ldi -- MPI-only vs its layered-depth-image bake (mpivar=ldi), compressed textures, alternating
+ * (A B A B) per scene of ?benchscenes (default: the four test scenes), same timing as bench=views.
+ *
+ * bench=vars -- MPI-only variant bakes of ?benchvars=a,b,c (compressed; "mpionly" = the plain MPI-only bake),
+ * run twice in turn (a b c a b c) on ?benchscenes (default: the scene opened), same timing as bench=views.
  */
 
 const VIEW_PHASES = [
@@ -20,6 +26,11 @@ const VIEW_PHASES = [
   { lod: "mpionly", tex: "png" }, { lod: "mpionly", tex: "ktx2" },
 ];
 const DEFAULT_SCENES = ["20260914_113455_56657", "20200927_161631"];
+const LDI_PHASES = [
+  { lod: "mpionly", tex: "ktx2" }, { lod: "mpionly", tex: "ktx2", mpivar: "ldi" },
+  { lod: "mpionly", tex: "ktx2" }, { lod: "mpionly", tex: "ktx2", mpivar: "ldi" },
+];
+const LDI_SCENES = ["20250810_134957_16671", "20260914_113455_56657", "me_small", "20200927_161631"];
 
 /**
  * Returns { step(now) } to call every frame (before rendering), or null if
@@ -28,8 +39,17 @@ const DEFAULT_SCENES = ["20260914_113455_56657", "20200927_161631"];
  * returns a promise resolved once that content is shown; onPhase(text) shows
  * a label in the headset; scenes is the list of scenes.
  */
-export function setupBench(name, { renderer, flatSplats, report, loadView, onPhase, scenes }) {
+export function setupBench(name, { renderer, flatSplats, report, loadView, onPhase, scenes, currentScene }) {
   if (name === "views" && loadView) return viewsBench(renderer, report, loadView, onPhase, scenes);
+  if (name === "ldi" && loadView) return viewsBench(renderer, report, loadView, onPhase,
+                                                    scenes && scenes.length ? scenes : LDI_SCENES, LDI_PHASES, "ldi");
+  if (name === "vars" && loadView) {
+    const vars = (new URLSearchParams(location.search).get("benchvars") || "mpionly").split(",").filter(Boolean)
+      .map((v) => v.replace(/[^a-z0-9]/gi, ""));
+    const one = vars.map((v) => ({ lod: "mpionly", tex: "ktx2", mpivar: v === "mpionly" ? "" : v }));
+    return viewsBench(renderer, report, loadView, onPhase, scenes && scenes.length ? scenes : [currentScene],
+                      [...one, ...one], "vars");
+  }
   if (name !== "corners" || !flatSplats) return null;
   const restoreCorners = flatSplats.corners;
   const phases = ["quad", "tri", "quad", "tri"];
@@ -69,11 +89,11 @@ export function setupBench(name, { renderer, flatSplats, report, loadView, onPha
   return { step };
 }
 
-function viewsBench(renderer, report, loadView, onPhase, scenes) {
+function viewsBench(renderer, report, loadView, onPhase, scenes, phases = VIEW_PHASES, test = "views") {
   const list = (scenes && scenes.length ? scenes : DEFAULT_SCENES)
-    .flatMap((scene) => VIEW_PHASES.map((p) => ({ scene, ...p })));
+    .flatMap((scene) => phases.map((p) => ({ scene, ...p })));
   const label = (p) => `${{ full: "Original splats", hybrid: "Hybrid", mpi: "Hybrid-MPI", mpionly: "MPI-only" }[p.lod]}`
-    + (p.tex === "ktx2" ? " · compressed" : "");
+    + (p.mpivar ? ` ${p.mpivar}` : "") + (p.tex === "ktx2" ? " · compressed" : "");
   // state: idle -> loading -> settle (2 s) -> measure (8 s) -> next phase
   const st = { i: -1, state: "idle", presentingSince: 0, t0: 0, frames: 0, measureStart: 0 };
 
@@ -88,7 +108,8 @@ function viewsBench(renderer, report, loadView, onPhase, scenes) {
       onPhase?.(`Bench ${i + 1}/${list.length} · ${label(p)}`, 10);
     }).catch((e) => {
       console.error("bench: load failed", p, e);
-      report({ test: "bench-views", phase: i, error: String(e), scene: p.scene, lod: p.lod, tex: p.tex });
+      report({ test: `bench-${test}`, phase: i, error: String(e), scene: p.scene, lod: p.lod, tex: p.tex,
+               mpivar: p.mpivar || null });
       st.state = "next";
     });
   }
@@ -115,7 +136,8 @@ function viewsBench(renderer, report, loadView, onPhase, scenes) {
       if (now - st.t0 < 8000) return;
       const fps = (st.frames - 1) * 1000 / (now - st.measureStart);
       const p = list[st.i];
-      report({ test: "bench-views", phase: st.i, fps: +fps.toFixed(1), scene: p.scene, lod: p.lod, tex: p.tex });
+      report({ test: `bench-${test}`, phase: st.i, fps: +fps.toFixed(1), scene: p.scene, lod: p.lod, tex: p.tex,
+               mpivar: p.mpivar || null });
       st.state = "next";
     }
     if (st.state === "next") {

@@ -10,18 +10,20 @@ GLTFLoader + KTX2Loader transcode to ASTC on the Quest, BC7 on desktops). --deco
 .glb whose PNG pages are the KTX2 pages decoded back to RGBA8 (what the GPU samples; UASTC -> ASTC is
 lossless), for offline quality checks.
 
-Needs `ktx` from KTX-Software (KTX_HOME, default ~/.local/opt/ktx-4.4.2/KTX-Software-4.4.2-Linux-x86_64).
+Needs `ktx` from KTX-Software (KTX_HOME, default ~/.local/opt/ktx-4.4.2/KTX-Software-4.4.2-Linux-<x86_64|arm64>).
 """
 import argparse
 import json
 import os
 import struct
 import subprocess
+import platform
 import tempfile
 import time
 from pathlib import Path
 
-KTX_HOME = Path(os.environ.get("KTX_HOME", Path.home() / ".local/opt/ktx-4.4.2/KTX-Software-4.4.2-Linux-x86_64"))
+KTX_HOME = Path(os.environ.get("KTX_HOME", Path.home() / ".local/opt/ktx-4.4.2" / (
+    "KTX-Software-4.4.2-Linux-" + {"aarch64": "arm64"}.get(platform.machine(), platform.machine()))))
 
 
 def ktx(*args):
@@ -30,10 +32,14 @@ def ktx(*args):
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-def ktx_args(quality=2, zstd=18, rdo=0.0, levels=3):
+def ktx_args(quality=2, zstd=18, rdo=0.0, levels=3, astc=None):
     """`ktx create` arguments for the layer pages: UASTC, linear transfer (premultiplied display-space values
-    sampled raw), box mipmaps, Zstandard."""
-    a = ["create", "--format", "R8G8B8A8_UNORM", "--encode", "uastc", "--uastc-quality", quality, "--assign-tf", "linear"]
+    sampled raw), box mipmaps, Zstandard. astc="fast" (etc.): plain ASTC 4x4 instead (the Quest's native format, no
+    transcoding; ~6x faster to encode than UASTC and more accurate, but most desktop GPUs can't sample it)."""
+    if astc:
+        a = ["create", "--format", "ASTC_4x4_UNORM_BLOCK", "--astc-quality", astc, "--assign-tf", "linear"]
+    else:
+        a = ["create", "--format", "R8G8B8A8_UNORM", "--encode", "uastc", "--uastc-quality", quality, "--assign-tf", "linear"]
     if levels > 1:
         a += ["--generate-mipmap", "--mipmap-filter", "box", "--levels", levels]
     if rdo > 0:

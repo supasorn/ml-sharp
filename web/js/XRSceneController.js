@@ -22,7 +22,6 @@
  * - Index Trigger (0): Hold and move the controller forward/back along your gaze: depth offset (if `depth`
  *   is given; forward = farther). Grip (1): the same for the depth scale (forward = flatter). As in
  *   img3dviewer (z-offset / z-scale); see web/js/depthWarp.js.
- * - Thumbstick Left/Right (flick): Previous/next view mode (if `onCycleLod` is given).
  * - Button A/X (4): Open/close the scene gallery (if `gallery` is given).
  * - Button B/Y (5): Open/close the settings menu.
  *
@@ -68,7 +67,6 @@ export class XRSceneController {
     this.onExit = options.onExit || (() => {});
     this.onDeleteScene = options.onDeleteScene || (() => {});
     this.gallery = options.gallery || null;
-    this.onCycleLod = options.onCycleLod || null;
     this._lodStickMoved = false;
     this.isPano = options.isPano || (() => false);
     this._turnStickMoved = false;
@@ -353,17 +351,6 @@ export class XRSceneController {
         this._stickMoved = false;
       }
       return;  // other inputs are blocked while the menu is open
-    }
-
-    // Secondary: thumbstick flick left/right cycles the view mode.
-    if (this.onCycleLod) {
-      const lr = motionLR[sInd];
-      if (Math.abs(lr) > 0.7 && !this._lodStickMoved && Math.abs(lr) > Math.abs(sUD) * 1.5) {
-        this._lodStickMoved = true;
-        this.onCycleLod(lr > 0 ? 1 : -1);
-      } else if (Math.abs(lr) < 0.3) {
-        this._lodStickMoved = false;
-      }
     }
 
     // Secondary: thumbstick scales the scene (around its placement point); panoramas keep their size.

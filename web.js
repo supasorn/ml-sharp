@@ -42,6 +42,7 @@ const collOf = () => ACTIVE;
 // Bare root goes to the gallery; with query params (?scene=..., etc.) it's the viewer.
 app.get('/', (req, res) => {
   if (Object.keys(req.query).length === 0) return res.redirect('/list');
+  res.set('Cache-Control', 'no-cache');   // revalidate every load: viewer changes show on a plain reload
   res.sendFile(path.join(__dirname, 'web', 'index.html'));
 });
 
@@ -127,6 +128,20 @@ app.get('/pano-info/:id', (req, res) => {
 // a scene removes it with its other <name>.* files.
 const VIEW_KEYS = ['scale', 'depthScale', 'depthOffset'];
 const viewCfgPath = (s) => path.join(dir(s.coll, s.pano ? path.join('pano', 'inputs') : 'output2'), `${s.name}.viewcfg`);
+// Every model of a scene, for the viewer's picker: its view modes (sceneModes: incl. every MPI-only variant bake).
+app.get('/scene-models/:scene', (req, res) => {
+  const s = parseId(req.params.scene);
+  if (!s) return res.sendStatus(404);
+  if (!allow(req, res, s.coll)) return;
+  if (s.pano) return res.json([]);
+  try {
+    const outDir = dir(s.coll, 'output2');
+    res.json(sceneModes(outDir, s.name).map((m) => ({ lod: m })));
+  } catch (e) {
+    res.status(500).send('Cannot read directory');
+  }
+});
+
 app.get('/view-config/:scene', (req, res) => {
   const s = parseId(req.params.scene);
   if (!s) return res.sendStatus(404);
@@ -248,15 +263,20 @@ app.get('/pending', (req, res) => {
 require('./google_photos')(app, { imagesDir: () => dir(ACTIVE, 'images'), secretsDir: path.join(__dirname, 'secrets') });
 
 // View modes a scene can be shown in (gallery page and in-XR gallery grey out the rest).
-// MPI-surf variants (surface-piece MPI-only bakes, <scene>_mpionly_<variant>.glb; compared in the headset).
-const SURF_VARIANTS = ['surf', 'surf2', 'surf3', 'surf4'];
 function sceneModes(outDir, name) {
   const has = (suffix) => fs.existsSync(path.join(outDir, name + suffix));
   const modes = ['full'];
   if (has('_hybrid.glb') && has('_hybrid.ply')) modes.push('hybrid');
   if (has('_mpi.glb')) modes.push('mpi');
   if (has('_mpionly.glb')) modes.push('mpionly');
-  for (const v of SURF_VARIANTS) if (has(`_mpionly_${v}.glb`)) modes.push(v);
+  // MPI-only variant bakes (<name>_mpionly_<tag>.glb, e.g. surf*, ldi, ad25): view modes named by their tag.
+  const pre = `${name}_mpionly_`;
+  try {
+    for (const f of fs.readdirSync(outDir).sort()) {
+      const tag = f.startsWith(pre) && f.endsWith('.glb') ? f.slice(pre.length, -4) : '';
+      if (/^[a-z0-9]+$/i.test(tag) && tag !== 'ktx2' && tag !== 'astc') modes.push(tag);   // not compressed copies
+    }
+  } catch (e) {}
   return modes;
 }
 const entryModes = (s) => (s.pano ? panoModes(s.pano) : sceneModes(dir(s.coll, 'output2'), s.name));
@@ -407,12 +427,12 @@ app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
   // Delete all files in output2/ with the same base name, plus files derived
   // from it (bake-hybrid / bake-layers / quest-lod outputs and previews).
   // Exact suffixes, so deleting "foo" never touches "foo_2".
-  const derived = ['_hybrid.glb', '_hybrid.ply', '_surfaces.glb', '_patches.glb', '_mpi.glb', '_mpionly.glb', '_mpi_ktx2.glb', '_mpionly_ktx2.glb', ...['surf', 'surf2', 'surf3', 'surf4'].flatMap((v) => [`_mpionly_${v}.glb`, `_mpionly_${v}_ktx2.glb`]), '_surfaces_mesh.glb', '_patches_mesh.glb', '_mpi_mesh.glb', '_layers.glb', '_quest.ply',
+  const derived = ['_hybrid.glb', '_hybrid.ply', '_surfaces.glb', '_patches.glb', '_mpi.glb', '_mpionly.glb', '_mpi_ktx2.glb', '_mpionly_ktx2.glb', '_mpi_astc.glb', '_mpionly_astc.glb', '_surfaces_mesh.glb', '_patches_mesh.glb', '_mpi_mesh.glb', '_layers.glb', '_quest.ply',
                    '_hybrid_vs_splats.jpg', '_hybrid_coverage.jpg', '_layers_vs_splats.jpg']
     .map(suffix => scene + suffix);
   const files = fs.readdirSync(outputDir);
   files.forEach(f => {
-    if (f.startsWith(scene + '.') || derived.includes(f)) {
+    if (f.startsWith(scene + '.') || derived.includes(f) || /^_mpionly_[a-z0-9]+(_ktx2|_astc)?\.glb$/i.test(f.slice(scene.length)) && f.startsWith(scene)) {
       fs.unlinkSync(path.join(outputDir, f));
     }
   });

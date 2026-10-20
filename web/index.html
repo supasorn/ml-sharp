@@ -159,7 +159,14 @@
       return params.get(name);
     }
     // MPI-surf view modes (surf, surf2, ...): <scene>_mpionly_<mode>.glb, no mesh.
-    const isSurf = (lod) => /^surf\d*$/.test(lod || '');
+    // Any other ?lod is an MPI-only variant bake: <scene>_mpionly_<lod>.glb (surf*, ldi, ad25, u512, p256, ...;
+    // listed in the model picker), no mesh. So every bake can be compared with ?lod=a,b,c.
+    const BASE_LODS = ['full', 'hybrid', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
+    const isVariant = (lod) => !!lod && /^[a-z0-9]+$/i.test(lod) && !BASE_LODS.includes(lod);
+    // ?lod=a,b[,c,d]: compare view modes on the desktop, side by side (two or three) or in a 2x2 grid (four),
+    // all seen through the one camera (synced). The first mode is the scene's mode otherwise (and in XR).
+    const lodList = (getQueryParam('lod') || 'mpionly').split(',').filter(Boolean).slice(0, 4);
+    const cmpCols = lodList.length === 4 ? 2 : lodList.length, cmpRows = lodList.length === 4 ? 2 : 1;
     // Files of a scene: public scenes under /output2/, private ones ("private:<name>", served only after
     // logging in) under /c/private/output2/ (collections.js, web.js).
     function sceneBase(scene) {
@@ -240,6 +247,8 @@
 
     let width = meta.width, height = meta.height;
     let ratio = width / height;
+    if (!isPano) { width *= cmpCols; height *= cmpRows; }   // comparison panels, each at the photo's aspect
+    const fitRatio = width / height;
     // let innerWidth = window.innerWidth;
     // let innerHeight = window.innerHeight;
     const container = document.getElementById('container');
@@ -251,11 +260,11 @@
 
     if (usableWidth < width) {
       width = usableWidth;
-      height = width / ratio;
+      height = width / fitRatio;
     }
     if (usableHeight < height) {
       height = usableHeight;
-      width = height * ratio;
+      width = height * fitRatio;
     }
 
     let linspace = [];
@@ -300,7 +309,7 @@
     // the extra pixels remove texture aliasing without softening), 1.0 for the splat views (splat-count bound).
     // It can't change mid-session. No fixed foveation by default.
     const xrScale = parseFloat(getQueryParam('xrscale')
-      || ((isPano ? panoMode === 'msi' : (['mpi', 'mpionly'].includes(getQueryParam('lod') || 'mpionly') || isSurf(getQueryParam('lod')))) ? '1.4' : '1'));
+      || ((isPano ? panoMode === 'msi' : (['mpi', 'mpionly'].includes(lodList[0]) || isVariant(lodList[0]))) ? '1.4' : '1'));
     const xrFoveation = parseFloat(getQueryParam('foveation') || '0');
     const xrStdDev = parseFloat(getQueryParam('xrstddev') || String(Math.sqrt(5)));
     // Close-up scenes cost more: their photos are wider-angle (the scene fills
@@ -482,14 +491,16 @@
                                xrScale, ...deviceInfo(), ...fields }),
       }).catch(() => {}),
       // bench=views: show one (scene, lod, tex) in place, re-centred in front of the viewer.
-      loadView: async ({ scene, lod, tex }) => {
+      loadView: async ({ scene, lod, tex, mpivar }) => {
         lodMode = lod;
         texKtx2 = tex === 'ktx2';
+        mpivarCur = mpivar || '';
         await stepScene(0, scene);
         xrController.resetPlacement();
       },
       onPhase: (text, seconds) => xrToast.show(text, seconds),
       scenes: (getQueryParam('benchscenes') || '').split(',').filter(Boolean),
+      currentScene: file,
     }) : null;
 
     // Diagnostics for the FPS reports: how often Spark rebuilds its splat data
@@ -552,6 +563,7 @@
 
     let center = new THREE.Vector3(0, 0, -center_depth);
     const controls = new OrbitControls(camera, renderer.domElement);
+    window.__dbg = { camera, controls, scene };   // for scripted views (tests): camera pose, orbit target, depthWarp
 
     function resetView() {
       camera.position.set(0, 0, 0);
@@ -631,11 +643,11 @@
     const hybridName = /^_[A-Za-z0-9_]+$/.test(getQueryParam('variant') || '') ? getQueryParam('variant') : '_hybrid';
     // Default view: MPI-only (all splats as a sparse multi-plane image), the fastest and best-looking mode on
     // the Quest 3 (docs/quest-xr-findings.md §4b); falls back to the original splats when not baked.
-    let lodMode = getQueryParam('lod') || 'mpionly';  // changeable in XR (gallery, secondary thumbstick)
+    let lodMode = lodList[0];  // changeable in XR (gallery, secondary thumbstick)
+    let mpivarCur = (getQueryParam('mpivar') || '').replace(/[^a-z0-9]/gi, '');   // ?mpivar (benchmarks switch it)
     const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
                         { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'mpionly', label: 'MPI-only' },
-                        { id: 'surf', label: 'MPI-surf' }, { id: 'surf2', label: 'Surf2 tight' },
-                        { id: 'surf3', label: 'Surf3 aligned' }, { id: 'surf4', label: 'Surf4 overlap' }];
+                        { id: 'ad12sep', label: 'MPI adaptive' }, { id: 'surf', label: 'MPI-surf' }];
     async function splatUrlFor(scene) {
       const full = `${sceneBase(scene)}.ply`;
       if (lodMode !== 'quest') return full;
@@ -778,8 +790,12 @@
       }
       let layerURL = `${sceneBase(scene)}${suffix}.glb`;
       if (texKtx2) {
-        const k = `${sceneBase(scene)}${suffix}_ktx2.glb`;
-        try { if ((await fetch(k, { method: 'HEAD' })).ok) layerURL = k; } catch (e) {}
+        // Plain ASTC 4x4 (<..>_astc.glb) where the GPU samples it natively (Quest, Apple, phones), else Basis UASTC
+        // (<..>_ktx2.glb, transcoded by the browser), else the PNG file; ?tex=ktx2 skips the ASTC file.
+        const astcOk = getQueryParam('tex') !== 'ktx2' && renderer.extensions.has('WEBGL_compressed_texture_astc');
+        for (const k of [...(astcOk ? [`${sceneBase(scene)}${suffix}_astc.glb`] : []), `${sceneBase(scene)}${suffix}_ktx2.glb`]) {
+          try { if ((await fetch(k, { method: 'HEAD' })).ok) { layerURL = k; break; } } catch (e) {}
+        }
       }
       const gltfs = await Promise.all([
         ...(withMesh ? [new GLTFLoader().loadAsync(meshURL)] : []),
@@ -790,8 +806,20 @@
         const model = gltf.scene;
         model.quaternion.set(1, 0, 0, 0);
         model.position.set(offset[0], offset[1], offset[2]);
+        // LCOL bakes: the colour page (3 visibility layers; splits in alpha) rides on a hidden mesh ldicolor_<w>_<h>.
+        let lcol = null;
         model.traverse((child) => {
-          if (!child.isMesh) return;
+          const m = /ldicolor_(\d+)_(\d+)/.exec(child.name || '');
+          if (!m || !child.isMesh || !child.material.map) return;
+          const cmap = child.material.map;
+          cmap.colorSpace = THREE.NoColorSpace; cmap.generateMipmaps = false;
+          cmap.minFilter = THREE.LinearFilter; cmap.magFilter = THREE.LinearFilter; cmap.needsUpdate = true;
+          const W = cmap.image.width, H = cmap.image.height, w = Number(m[1]), h = Number(m[2]);
+          lcol = { cmap, size: new THREE.Vector2(W, H), off1: new THREE.Vector2(w / W, 0), off2: new THREE.Vector2(0, h / H) };
+          child.visible = false;
+        });
+        model.traverse((child) => {
+          if (!child.isMesh || /ldicolor_/.test(child.name || '')) return;
           const map = child.material.map;
           if (map) map.colorSpace = THREE.SRGBColorSpace;
           child.material.dispose();
@@ -818,12 +846,108 @@
           // So: no colour space on the texture and no output conversion in the shader; filtering and
           // blending then work on the stored values, which is what the bake assumes.
           if (map) { map.colorSpace = THREE.NoColorSpace; map.needsUpdate = true; }
+          // Shared textures (bake ADAPT_SHARE, NeX-style): quads with TEXCOORD_1 (uv1) take colour from their tile's
+          // first half (stored un-premultiplied) and alpha from channel TEXCOORD_2.x (uv2) of its second half; -1 = plain.
+          const geom = child.geometry;
+          const shared = !!geom.getAttribute('uv1');
+          // Bake UNPREM (meshes surface_<k>_u): plain quads hold un-premultiplied colour; premultiply here.
+          const unprem = /surface_\d+_u\b/.test(child.name + ' ' + (child.parent?.name ?? ''));
+          const plainOut = unprem ? 'gl_FragColor = vec4(c.rgb * c.a, c.a);' : 'gl_FragColor = c;';
+          if (shared) {
+            geom.setAttribute('shUv', geom.getAttribute('uv1'));
+            geom.setAttribute('shCh', geom.getAttribute('uv2'));
+          }
+          if (shared && geom.getAttribute('uv3')) {
+            // LCW: alpha and colour weight from channels (r, g) or (b, a) of the plane's tile (TEXCOORD_1; uv2.x = pair,
+            // -1 = plain quad); colour mixed from two of the cell's layer tiles (uv2.y, uv3.x: layer indices; uv3.y:
+            // tile stride in uv) by the weight; tile 0 is at TEXCOORD_0.
+            geom.setAttribute('shL', geom.getAttribute('uv3'));
+            child.material = new THREE.ShaderMaterial({
+              uniforms: { map: { value: map }, lodBias: { value: hasMips ? layerLodBias : 0.0 } },
+              vertexShader: 'attribute vec2 shUv; attribute vec2 shCh; attribute vec2 shL; varying vec2 vUv; ' +
+                'varying vec2 vUv2; varying vec2 vCh; varying vec2 vL; void main() { vUv = uv; vUv2 = shUv; ' +
+                'vCh = shCh; vL = shL; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+              fragmentShader: 'uniform sampler2D map; uniform float lodBias; varying vec2 vUv; varying vec2 vUv2; ' +
+                'varying vec2 vCh; varying vec2 vL; void main() { ' +
+                'if (vCh.x < -0.5) { vec4 c = texture2D(map, vUv, lodBias); ' + plainOut + ' return; } ' +
+                'vec4 p = texture2D(map, vUv2, lodBias); ' +
+                'float a = vCh.x < 0.5 ? p.r : p.b; float w = vCh.x < 0.5 ? p.g : p.a; ' +
+                'vec3 cA = texture2D(map, vUv + vec2(vCh.y * vL.y, 0.0), lodBias).rgb; ' +
+                'vec3 cB = texture2D(map, vUv + vec2(vL.x * vL.y, 0.0), lodBias).rgb; ' +
+                'gl_FragColor = vec4(mix(cA, cB, w) * a, a); }',
+              side: THREE.DoubleSide, transparent: true, depthWrite: false,
+              blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+              blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+            });
+            child.renderOrder = 100 - Number(k[1]);
+            return;
+          }
+          if (shared && lcol) {
+            // LCOL: alpha from the plane's channel of its tile; colour from the visibility layer its bin falls in at
+            // this pixel (bin >= split 1: layer 1; >= split 2: layer 2; else 3), splits read unfiltered.
+            child.material = new THREE.ShaderMaterial({
+              uniforms: { map: { value: map }, cmap: { value: lcol.cmap }, csize: { value: lcol.size },
+                          off1: { value: lcol.off1 }, off2: { value: lcol.off2 },
+                          lodBias: { value: hasMips ? layerLodBias : 0.0 } },
+              vertexShader: 'attribute vec2 shUv; attribute vec2 shCh; varying vec2 vUv; varying vec2 vUv2; ' +
+                'varying float vCh; varying float vBin; void main() { vUv = uv; vUv2 = shUv; vCh = shCh.x; ' +
+                'vBin = shCh.y; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+              fragmentShader: 'uniform sampler2D map; uniform sampler2D cmap; uniform vec2 csize; uniform vec2 off1; ' +
+                'uniform vec2 off2; uniform float lodBias; varying vec2 vUv; varying vec2 vUv2; varying float vCh; ' +
+                'varying float vBin; void main() { vec4 p = texture2D(map, vUv2, lodBias); ' +
+                'float a = vCh < 0.5 ? p.r : (vCh < 1.5 ? p.g : (vCh < 2.5 ? p.b : p.a)); ' +
+                'ivec2 ip = ivec2(clamp(vUv, 0.0, 1.0) * csize); ' +
+                'float s1 = texelFetch(cmap, ip, 0).a * 255.0; ' +
+                'float s2 = texelFetch(cmap, ip + ivec2(off1 * csize), 0).a * 255.0; ' +
+                'vec2 o = vBin > s1 - 0.5 ? vec2(0.0) : (vBin > s2 - 0.5 ? off1 : off2); ' +
+                'gl_FragColor = vec4(texture2D(cmap, vUv + o).rgb * a, a); }',
+              side: THREE.DoubleSide, transparent: true, depthWrite: false,
+              blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+              blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+            });
+            child.renderOrder = 100 - Number(k[1]);
+            return;
+          }
           child.material = new THREE.ShaderMaterial({
-            uniforms: { map: { value: map }, lodBias: { value: hasMips ? layerLodBias : 0.0 } },
-            vertexShader: 'varying vec2 vUv; void main() { vUv = uv; ' +
-                          'gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
-            fragmentShader: 'uniform sampler2D map; uniform float lodBias; varying vec2 vUv; ' +
-                            'void main() { gl_FragColor = texture2D(map, vUv, lodBias); }',
+            uniforms: { map: { value: map }, lodBias: { value: hasMips ? layerLodBias : 0.0 },
+                        // identity depth warp until depthWarp.attach() shares its uniforms
+                        dwScale: { value: 1 }, dwOffset: { value: 0 }, dwPivot: { value: 1 }, dwRadial: { value: 0 } },
+            // PARALLAX bakes: shCh.y = the plane's thickness (disparity; 0 = none) and the colour tile's alpha = each
+            // texel's offset from the plane (in thicknesses): the lookups shift so each texel shows at its own depth,
+            // by offset x (eye_xy - x eye_z) / (1 - d eye_z) in photo-camera (glTF) coordinates.
+            vertexShader: shared
+              ? 'attribute vec2 shUv; attribute vec2 shCh; varying vec2 vUv; varying vec2 vUv2; varying float vCh; ' +
+                'varying float vDk; varying vec3 vP; varying vec3 vEye; ' +
+                'void main() { vUv = uv; vUv2 = shUv; vCh = shCh.x; vDk = shCh.y; vP = position; ' +
+                'vEye = (inverse(modelMatrix) * vec4(cameraPosition, 1.0)).xyz; ' +
+                'gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }'
+              : 'varying vec2 vUv; void main() { vUv = uv; ' +
+                'gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+            fragmentShader: shared
+              ? 'uniform sampler2D map; uniform float lodBias; varying vec2 vUv; varying vec2 vUv2; varying float vCh; ' +
+                'varying float vDk; varying vec3 vP; varying vec3 vEye; ' +
+                // the depth controls warp the geometry (web/js/depthWarp.js, same uniforms): the texel's true point
+                // and the plane's point are warped alike before taking their disparity difference
+                'uniform float dwScale; uniform float dwOffset; uniform float dwPivot; uniform float dwRadial; ' +
+                'vec3 dwarp(vec3 p) { float d = mix(p.z, length(p), dwRadial); ' +
+                'float d2 = max(min(abs(d), 0.15), dwPivot + dwScale * (d - dwPivot) + dwOffset); ' +
+                'return p * (d2 / max(abs(d), 1e-6)); } ' +
+                'void main() { vec2 xn = vP.xy / vP.z; ' +
+                'float s = (length(dFdx(vUv)) + length(dFdy(vUv))) / max(length(dFdx(xn)) + length(dFdy(xn)), 1e-9); ' +
+                'vec2 sh = vec2(0.0); ' +
+                'if (vDk > 0.0) { vec3 Pw = dwarp(vP); ' +
+                'float dt = 1.0 / vP.z + (texture2D(map, vUv, lodBias).a * 2.0 - 1.0) * vDk; ' +
+                'vec3 Tw = dwarp(vP * (1.0 / (vP.z * max(dt, 1e-4)))); ' +
+                'vec2 dir = (vEye.xy - xn * vEye.z) / (1.0 - vEye.z / Pw.z); ' +
+                'sh = (1.0 / Tw.z - 1.0 / Pw.z) * s * dir; ' +
+                // at most the tiles' border (2 texels at half resolution): never into a neighbouring tile of the atlas
+                'vec2 ts = vec2(textureSize(map, 0)); float m = length(sh * ts); if (m > 2.0) sh *= 2.0 / m; } ' +
+                'vec4 c = texture2D(map, vUv + sh, lodBias); if (vCh < -0.5) { ' + plainOut + ' return; } ' +
+                'vec4 p = texture2D(map, vUv2 + sh, lodBias); ' +
+                'float a = vCh < 0.5 ? p.r : (vCh < 1.5 ? p.g : (vCh < 2.5 ? p.b : p.a)); ' +
+                'gl_FragColor = vec4(c.rgb * a, a); }'
+              : 'uniform sampler2D map; uniform float lodBias; varying vec2 vUv; ' +
+                'void main() { vec4 c = texture2D(map, vUv, lodBias); ' + plainOut + ' }',
             side: THREE.DoubleSide, transparent: true, depthWrite: false,
             blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
             blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
@@ -854,16 +978,16 @@
         }
         console.warn(`No ${url}; using full splats.`);
       }
-      if (['surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isSurf(lodMode)) {
+      if (['surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
         // MPI-surf (?lod=surf): MPI-only made of surface pieces, <scene>_mpionly_surf.glb (bake: SURF=1, see
         // surface_pieces() in scripts/eval_alpha_patches.py). ?mpivar=<tag>: an experimental MPI-only bake,
         // <scene>_mpionly_<tag>.glb (comparisons in the headset).
-        const mpivar = isSurf(lodMode) ? lodMode
-          : lodMode === 'mpionly' && (getQueryParam('mpivar') || '').replace(/[^a-z0-9]/gi, '');
-        const suffix = (isSurf(lodMode) ? '_mpionly' : `_${lodMode}`) + (mpivar ? `_${mpivar}` : '');
+        const mpivar = isVariant(lodMode) ? lodMode
+          : lodMode === 'mpionly' && mpivarCur;
+        const suffix = (isVariant(lodMode) ? '_mpionly' : `_${lodMode}`) + (mpivar ? `_${mpivar}` : '');
         const url = `${sceneBase(scene)}${suffix}.glb`;
         try {
-          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadSurfaces(scene, suffix, lodMode !== 'mpionly' && !isSurf(lodMode));
+          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadSurfaces(scene, suffix, lodMode !== 'mpionly' && !isVariant(lodMode));
         } catch (e) {
           console.error(`Failed to load ${url}:`, e);
         }
@@ -908,7 +1032,7 @@
     let splat;
     if (hybrid === "true") {
       splat = createSplat(splatURL);
-    } else if (isPano || ['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isSurf(lodMode)) {
+    } else if (isPano || ['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
       splat = await loadContent(file);
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading
@@ -919,6 +1043,7 @@
     // trigger / grip in XR, sliders on the desktop). Saved per scene on the server (/view-config, inside the
     // scene's collection) and restored whenever the scene is shown.
     const depthWarp = createDepthWarp(THREE, dyno, SplatMesh);
+    window.__dbg.depthWarp = depthWarp;
     const VIEW_DEFAULTS = { scale: 1, depthScale: 1, depthOffset: 0 };
     let viewCfg = { ...VIEW_DEFAULTS };
     let viewScene = file;                    // the scene viewCfg belongs to
@@ -954,6 +1079,63 @@
     }
     splat.userData.scene = file;
     prepareView(splat, file).catch((e) => console.warn('View settings failed:', e));
+
+    // Comparison panels (?lod=a,b,...): the other modes' content of this scene, warped like the first, each
+    // drawn alone into its part of the canvas (renderPanels). Desktop only; XR shows the first mode.
+    const cmpPanels = [];                    // [{ content, lod }] after the first mode's
+    const cmpLabels = [];
+    if (!isPano && lodList.length > 1) {
+      lodList.forEach((lod) => {
+        const el = document.createElement('div');
+        el.textContent = (VIEW_MODES.find((m) => m.id === lod) || { label: lod }).label;
+        Object.assign(el.style, { position: 'fixed', zIndex: 999, padding: '3px 8px', borderRadius: '4px',
+                                  background: 'rgba(0,0,0,0.55)', color: '#fff', font: '13px sans-serif',
+                                  pointerEvents: 'none' });
+        document.body.appendChild(el);
+        cmpLabels.push(el);
+      });
+      (async () => {
+        for (const lod of lodList.slice(1)) {
+          lodMode = lod;
+          try {
+            const c = await loadContent(file);
+            c.userData.scene = file;
+            depthWarp.attach(c);
+            applyVisibility(c);
+            c.visible = false;
+            xrContent.add(c);
+            cmpPanels.push({ content: c, lod });
+          } catch (e) {
+            console.warn(`Comparison view ${lod} failed:`, e);
+          } finally {
+            lodMode = lodList[0];
+          }
+        }
+      })();
+    }
+    const panelSize = new THREE.Vector2();
+    function renderPanels() {
+      const all = [{ content: splat }, ...cmpPanels];
+      renderer.getSize(panelSize);
+      const pw = panelSize.x / cmpCols, ph = panelSize.y / cmpRows;
+      const rect = renderer.domElement.getBoundingClientRect();
+      renderer.setScissorTest(true);
+      for (let i = 0; i < cmpCols * cmpRows; i++) {
+        const col = i % cmpCols, row = Math.floor(i / cmpCols);
+        const y = panelSize.y - (row + 1) * ph;        // viewport origin: bottom left
+        renderer.setViewport(col * pw, y, pw, ph);
+        renderer.setScissor(col * pw, y, pw, ph);
+        all.forEach((p, j) => { p.content.visible = j === i; });
+        renderer.render(scene, camera);                // a panel without content (yet) is cleared
+        if (cmpLabels[i]) {
+          cmpLabels[i].style.left = `${rect.left + col * pw + 8}px`;
+          cmpLabels[i].style.top = `${rect.top + row * ph + 8}px`;
+        }
+      }
+      all.forEach((p, j) => { p.content.visible = j === 0; });
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, panelSize.x, panelSize.y);
+    }
 
     // --- Scene stepping in XR (A = next, B = previous; see XRSceneController) ---
     // The page can't reload without ending the XR session, so swap the splat in
@@ -1025,7 +1207,7 @@
       onSelectLod: (id) => isPanoScene(file) ? switchPanoMode(id) : switchLod(id),
     });
 
-    // View-mode switching in XR (gallery buttons, or a flick of the secondary thumbstick left/right):
+    // View-mode switching in XR (gallery buttons):
     // reload the current scene in the new mode and show its name briefly.
     const xrToast = new XRToast(renderer, scene);
     const modeLabel = (id) => ([...VIEW_MODES, ...PANO_MODES].find((m) => m.id === id) || { label: id }).label;
@@ -1044,16 +1226,6 @@
       xrToast.show(`${modeLabel(id)}…`, 30);
       await stepScene(0);
       xrToast.show(modeLabel(lodMode));
-    }
-    async function cycleLod(delta) {
-      const pano = isPanoScene(file), modes = pano ? PANO_MODES : VIEW_MODES;
-      let have = modes.map((m) => m.id);
-      try { have = (await (await fetch('/scene-modes')).json())[file] || (pano ? [] : ['full']); } catch (e) {}
-      const order = modes.map((m) => m.id).filter((id) => have.includes(id));
-      if (!order.length) return;
-      const i = order.indexOf(pano ? panoMode : lodMode);
-      const next = order[(i + delta + order.length) % order.length];
-      await (pano ? switchPanoMode(next) : switchLod(next));
     }
 
     // Delete the current scene from the XR menu: switch to the next scene
@@ -1089,7 +1261,6 @@
       onExit: () => renderer.xr.getSession()?.end(),
       onDeleteScene: () => deleteCurrentScene(),
       gallery: xrGallery,
-      onCycleLod: (delta) => cycleLod(delta),
       isPano: () => isPanoScene(file),
       // Left trigger / grip + controller motion along the gaze: depth offset (forward = farther, by the
       // scene's typical depth per metre) / depth scale (forward = flatter).
@@ -1227,6 +1398,36 @@
     }
 
     const gui = new dat.GUI();
+
+    // Model picker (desktop): every model of this scene (view modes and variant bakes, /scene-models); picking
+    // one reloads the page with it.
+    if (!isPano) {
+      const pick = document.createElement('select');
+      pick.id = 'model-pick';
+      pick.title = 'Model of this scene';
+      Object.assign(pick.style, { position: 'fixed', top: '10px', left: '200px', zIndex: 1000, font: '13px sans-serif',
+                                  padding: '4px 6px', borderRadius: '6px', background: 'rgba(20,20,20,0.85)',
+                                  color: '#fff', border: '1px solid #555' });
+      document.body.appendChild(pick);
+      const curVar = (getQueryParam('mpivar') || '').replace(/[^a-z0-9]/gi, '');
+      fetch(`/scene-models/${encodeURIComponent(file)}`).then((r) => r.json()).then((models) => {
+        for (const m of models) {
+          const o = document.createElement('option');
+          o.value = JSON.stringify(m);
+          const base = (VIEW_MODES.find((v) => v.id === m.lod) || { label: m.lod }).label;
+          o.textContent = isVariant(m.lod) && !VIEW_MODES.some((v) => v.id === m.lod) ? `MPI-only: ${m.lod}` : base;
+          o.selected = m.lod === (lodList[0] === 'mpionly' && curVar ? curVar : lodList[0]);
+          pick.appendChild(o);
+        }
+      }).catch(() => pick.remove());
+      pick.addEventListener('change', () => {
+        const m = JSON.parse(pick.value);
+        const url = new URL(window.location);
+        url.searchParams.set('lod', m.lod);
+        url.searchParams.delete('mpivar');
+        window.location.href = url.toString();
+      });
+    }
     // Depth sliders (both kinds of scene), saved per scene like the XR controls.
     const depthParams = {
       get depthScale() { return viewCfg.depthScale; },
@@ -1429,7 +1630,8 @@
         controls.update();
       }
       if (!isPano) controls.update();
-      renderer.render(scene, camera);
+      if (cmpLabels.length && !renderer.xr.isPresenting) renderPanels();
+      else renderer.render(scene, camera);
       // splat.rotation.y += 0.01;
       stats.end();
       if (renderer.xr.isPresenting) {

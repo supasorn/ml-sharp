@@ -24,7 +24,10 @@ runs `--watch --mpionly`.
 --gpus auto picks, for each scene, the GPU with the most free memory (the machine is shared), and a scene
 that runs out of GPU memory is retried up to 3 times after a short wait; --jobs sets how many run at once.
 
-Usage: python scripts/bake_mpi.py [-i output2] [--gpus 0,1,2,3|auto] [--jobs N] [--overwrite] [--watch] [scenes...]
+--mpionly --variant ad12sep bakes the adaptive MPI-only variant (<name>_mpionly_ad12sep.glb, viewer ?lod=ad12sep).
+
+Usage: python scripts/bake_mpi.py [-i output2] [--gpus 0,1,2,3|auto] [--jobs N] [--overwrite] [--watch]
+       [--mpionly [--variant ad12sep]] [scenes...]
 """
 import argparse
 import os
@@ -39,21 +42,71 @@ from queue import Queue
 
 ROOT = Path(__file__).resolve().parents[1]
 SUFFIX = "_hybrid_k03r05"
+# Culling from 9 viewpoints at 0.25 resolution and Zstandard 9 for the KTX2 pages: a third of the bake time of 18 viewpoints
+# at 0.5 and Zstandard 18, same quality (PSNR within 0.01 dB on two scenes), downloads ~4% larger.
+# Compressed textures: plain ASTC 4x4 (<x>_astc.glb: the Quest's own format, ~1.5 s to encode); --uastc also writes
+# Basis UASTC (<x>_ktx2.glb, for desktop GPUs without ASTC; ~9 s more). Without either the viewer uses the PNG file.
 MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "REFINE": "1", "CULL": "0.05", "CELL_BORDER": "4",
-           "EXPORT_KTX2": "1", "CULL_SCALE": "0.5", "EXPORT": "_mpi", "EVAL": "0"}
+           "EXPORT_KTX2": "1", "KTX2_UASTC": "0", "KTX2_ASTC": "fast", "CULL_SCALE": "0.25", "CULL_EYES": "9",
+           "KTX2_ZSTD": "9", "EXPORT": "_mpi", "EVAL": "0"}
+# --variant (with --mpionly): extra settings of an MPI-only variant bake, written as <name>_mpionly_<variant>.glb
+# (viewer ?lod=<variant>). ad12sep: 4x finer planes where stacking shows (threshold 12), un-premultiplied colour and
+# alpha in separate tiles (KTX2-friendly); ~40 s per scene on a GB10 (plain MPI-only: ~20 s).
+VARIANTS = {"ad12sep": {"ADAPT": "4", "ADAPT_T": "12", "ADAPT_W": "6", "ADAPT_N": "2", "UNPREM": "1", "SEPA": "1",
+                        "MAXPAGES": "6"}}
 
 
 def scene_plys(folder: Path, names):
-    sys.path.insert(0, str(ROOT / "src"))
-    from sharp.cli.bake_hybrid import scene_plys as all_plys
-    plys = [p for p in all_plys(folder) if p.with_suffix(".json").exists()]
-    return [p for p in plys if not names or p.stem in names]
+    """Scene .ply files (with their .json) in the folder, excluding derived outputs; as sharp.cli.bake_hybrid's
+    scene_plys, which isn't imported: `sharp.cli` loads the whole SHARP model stack (~5 s)."""
+    plys = sorted(p for p in folder.glob("*.ply") if not p.stem.endswith(("_quest", "_pruned", "_mesh", "_hybrid")))
+    return [p for p in plys if p.with_suffix(".json").exists() and (not names or p.stem in names)]
+
+
+class Worker:
+    """A persistent `eval_alpha_patches.py --serve` process (one per GPU and settings): Python, torch, CUDA and gsplat
+    load once instead of per scene (~5 s each)."""
+    def __init__(self, env):
+        self.p = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "eval_alpha_patches.py"), "--serve"], env=env,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    def bake(self, ply, log_path):
+        self.p.stdin.write(f"{ply}\t{log_path}\n"); self.p.stdin.flush()
+        r = self.p.stdout.readline()
+        if not r:
+            raise subprocess.CalledProcessError(self.p.wait(), "bake worker (exited)")
+        if not r.startswith("ok"):
+            raise subprocess.CalledProcessError(1, f"bake worker: {r.strip()}")
+
+
+WORKERS, WORKERS_LOCK = {}, threading.Lock()
+
+
+def worker_bake(env, ply, log):
+    """Bake one scene with the worker for these settings (started on first use, restarted if it died)."""
+    key = tuple(sorted(env.items()))
+    with WORKERS_LOCK:
+        w = WORKERS.get(key)
+        if w is None or w.p.poll() is not None:
+            w = WORKERS[key] = Worker(env)
+    log.flush()
+    w.bake(ply, log.name)
+
+
+def compressed(glb: Path):
+    """Its compressed-texture copy (ASTC or UASTC) exists and is current."""
+    return any(k.exists() and k.stat().st_mtime >= glb.stat().st_mtime
+               for k in (glb.with_name(glb.stem + "_astc.glb"), glb.with_name(glb.stem + "_ktx2.glb")))
+
+
+def out_suffix(args, mpionly):
+    return ("_mpionly" + (f"_{args.variant}" if args.variant else "")) if mpionly else "_mpi"
 
 
 def bake(ply: Path, gpu: str, args, log):
-    out = args.input / f"{ply.stem}{'_mpionly' if args.mpionly else '_mpi'}.glb"
+    out = args.input / f"{ply.stem}{out_suffix(args, args.mpionly)}.glb"
     if out.exists() and out.stat().st_mtime > ply.stat().st_mtime and not (args.overwrite or args.reexport):
-        if not args.no_ktx2 and not out.with_name(out.stem + "_ktx2.glb").exists():
+        if not args.no_ktx2 and not compressed(out):
             compress(out, args, log)                          # e.g. an earlier run stopped before compressing
             return "compressed"
         return "skipped"
@@ -62,18 +115,20 @@ def bake(ply: Path, gpu: str, args, log):
     if not link.exists():
         link.symlink_to(ply.resolve())
     shutil.copy(ply.with_suffix(".json"), work / f"{ply.stem}.json")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu) | ({"KTX2_UASTC": "1"} if args.uastc else {})
     if args.mpionly:
-        env |= MPI_ENV | {"NOMESH": "1", "EXPORT": "_mpionly", "SUFFIX": SUFFIX, "EXPORT_DIR": str(args.input)}
-        subprocess.run([sys.executable, str(ROOT / "scripts" / "eval_alpha_patches.py"), str(link)], check=True,
-                       env=env, stdout=log, stderr=subprocess.STDOUT)
+        env |= MPI_ENV | {"NOMESH": "1", "EXPORT": out_suffix(args, True), "SUFFIX": SUFFIX,
+                          "EXPORT_DIR": str(args.input)} | VARIANTS.get(args.variant, {})
+        if args.uastc:
+            env["KTX2_UASTC"] = "1"
+        worker_bake(env, link, log)
         compress(out, args, log)
         return "done"
     cmd = [str(Path(sys.executable).with_name("sharp")), "bake-hybrid", "-i", str(link), "--keep-move", "0.3",
            "--max-depth-ratio", "0.05", "--name-suffix", SUFFIX] + (["--overwrite"] if args.overwrite else [])
     subprocess.run(cmd, check=True, env=env, stdout=log, stderr=subprocess.STDOUT)
     shutil.copy(work / f"{ply.stem}{SUFFIX}.glb", args.input / f"{ply.stem}_mpi_mesh.glb")
-    env |= MPI_ENV | {"SUFFIX": SUFFIX, "EXPORT_DIR": str(args.input)}
+    env |= MPI_ENV | {"SUFFIX": SUFFIX, "EXPORT_DIR": str(args.input)} | ({"KTX2_UASTC": "1"} if args.uastc else {})
     subprocess.run([sys.executable, str(ROOT / "scripts" / "eval_alpha_patches.py"), str(link)], check=True,
                    env=env, stdout=log, stderr=subprocess.STDOUT)
     compress(out, args, log)
@@ -81,11 +136,8 @@ def bake(ply: Path, gpu: str, args, log):
 
 
 def compress(glb: Path, args, log):
-    """<x>.glb -> <x>_ktx2.glb (compressed textures), unless --no-ktx2."""
-    if args.no_ktx2:
-        return
-    k = glb.with_name(glb.stem + "_ktx2.glb")
-    if k.exists() and k.stat().st_mtime >= glb.stat().st_mtime:   # the export already wrote it (EXPORT_KTX2)
+    """<x>.glb -> <x>_ktx2.glb (compressed textures), unless --no-ktx2 or the export already wrote a compressed copy."""
+    if args.no_ktx2 or compressed(glb):
         return
     subprocess.run([sys.executable, str(ROOT / "scripts" / "glb_ktx2.py"), str(glb),
                     str(glb.with_name(glb.stem + "_ktx2.glb"))], check=True, stdout=log, stderr=subprocess.STDOUT)
@@ -105,10 +157,10 @@ def watch(args):
     while True:
         for mpionly in ((True,) if args.mpionly else (True, False)):
             for ply in scene_plys(args.input, set()):
-                sfx = "_mpionly" if mpionly else "_mpi"
+                sfx = out_suffix(args, mpionly)
                 out = args.input / f"{ply.stem}{sfx}.glb"
                 done_ = out.exists() and out.stat().st_mtime > ply.stat().st_mtime and (
-                    args.no_ktx2 or out.with_name(out.stem + "_ktx2.glb").exists())
+                    args.no_ktx2 or compressed(out))
                 key = (ply.stem, sfx)
                 if done_ or failed.get(key) == ply.stat().st_mtime or oom.get(key, (0, 0))[1] > time.time():
                     continue
@@ -117,7 +169,7 @@ def watch(args):
                 args.mpionly = mpionly
                 t0 = time.time()
                 try:
-                    with open(args.work / f"{ply.stem}{'_mpionly' if mpionly else ''}.log", "w") as log:
+                    with open(args.work / f"{ply.stem}{out_suffix(args, True) if mpionly else ''}.log", "w") as log:
                         status = bake(ply, gpu, args, log)
                     print(f"{time.strftime('%H:%M:%S')} {ply.stem}{sfx}: {status} in {time.time() - t0:.0f}s", flush=True)
                     if status == "skipped":                   # nothing to do after all: don't spin on it
@@ -125,7 +177,7 @@ def watch(args):
                     oom.pop(key, None)
                 except (subprocess.CalledProcessError, OSError) as e:
                     tries = oom.get(key, (0, 0))[0]
-                    logf = args.work / f"{ply.stem}{'_mpionly' if mpionly else ''}.log"
+                    logf = args.work / f"{ply.stem}{out_suffix(args, True) if mpionly else ''}.log"
                     if "OutOfMemoryError" in logf.read_text(errors="ignore") and tries < 6:
                         wait = min(30 * 2 ** tries, 600)           # shared GPUs: wait for memory, then retry
                         oom[key] = (tries + 1, time.time() + wait)
@@ -160,6 +212,8 @@ def main():
     ap.add_argument("--reexport", action="store_true", help="redo only the MPI export (reuse the hybrid bakes)")
     ap.add_argument("--mpionly", action="store_true", help="MPI from all splats, no hybrid mesh (_mpionly.glb)")
     ap.add_argument("--no-ktx2", action="store_true", help="don't write the compressed-texture variant")
+    ap.add_argument("--uastc", action="store_true", help="also write Basis UASTC textures (<x>_ktx2.glb, desktop GPUs)")
+    ap.add_argument("--variant", choices=sorted(VARIANTS), help="MPI-only variant bake (with --mpionly; see VARIANTS)")
     ap.add_argument("--watch", action="store_true", help="keep baking new scenes as they appear")
     ap.add_argument("--poll", type=float, default=10.0, help="seconds between folder checks in --watch mode")
     ap.add_argument("scenes", nargs="*")
@@ -178,7 +232,7 @@ def main():
 
     def job(ply):
         slot = gpus.get()
-        logf = args.work / f"{ply.stem}{'_mpionly' if args.mpionly else ''}.log"
+        logf = args.work / f"{ply.stem}{out_suffix(args, True) if args.mpionly else ''}.log"
         try:
             for attempt in range(4):
                 gpu = freest_gpu() if slot == "auto" else slot

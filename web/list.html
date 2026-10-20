@@ -409,9 +409,15 @@
         <button type="button" data-lod="mpi" title="Hybrid mesh + the remaining splats as a sparse multi-plane image (scripts/bake_mpi.py); falls back to the original splats when not baked">Hybrid-MPI</button>
         <button type="button" data-lod="mpionly" title="All splats as a sparse multi-plane image, no mesh (scripts/bake_mpi.py --mpionly)">MPI-only</button>
         <button type="button" data-lod="surf" title="MPI-only made of connected surface pieces instead of depth slices: smoother up close, lighter (SURF=1 bake)">MPI-surf</button>
-        <button type="button" data-lod="surf2" title="MPI-surf variant: one slice per piece, tight glue">Surf2</button>
-        <button type="button" data-lod="surf3" title="MPI-surf variant: depth-aligned cuts, matched glue">Surf3</button>
-        <button type="button" data-lod="surf4" title="MPI-surf variant: aligned cuts, linked corners, 1 px quad overlap">Surf4</button>
+        <button type="button" data-lod="ad12sep" title="MPI-only with 4x finer planes where stacking shows and colour and alpha in separate tiles: fewer stacking artifacts, more fill (bake_mpi.py --mpionly --variant ad12sep); falls back to the original splats when not baked">Adaptive</button>
+      </div>
+    </div>
+    <div class="opt-group" title="Texture files of the MPI views: Auto = plain ASTC (_astc.glb) where the GPU supports it (Quest, Mac, phones), else Basis UASTC (_ktx2.glb), else PNG; UASTC = the _ktx2.glb files (older bakes); PNG = uncompressed">
+      <span class="opt-label">Textures</span>
+      <div class="seg" id="texSeg">
+        <button type="button" data-tex="auto">Auto</button>
+        <button type="button" data-tex="ktx2">UASTC</button>
+        <button type="button" data-tex="png">PNG</button>
       </div>
     </div>
     <div class="opt-group" title="How 360° panoramas are shown: multi-sphere image (fast, for the Quest) or the original splats">
@@ -521,7 +527,7 @@
     // Viewer defaults (web/index.html). Presets set every XR option (not the view).
     // xrscale 'auto': the viewer picks 1.4 for the MPI views and 1.0 for the splat views (no xrscale in the link).
     const XR_DEFAULTS = { xrscale: 'auto', foveation: 0, xrstddev: 2.24, xrmaxpx: 512, adaptive: false };
-    const DEFAULT_OPTS = { lod: 'mpionly', pmode: 'msi', optsVersion: 4, ...XR_DEFAULTS };
+    const DEFAULT_OPTS = { lod: 'mpionly', pmode: 'msi', tex: 'auto', optsVersion: 4, ...XR_DEFAULTS };
     const FULL_QUALITY = { ...XR_DEFAULTS, foveation: 0, xrstddev: 2.83 };
     const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96, adaptive: true };
     let opts = { ...DEFAULT_OPTS };
@@ -534,6 +540,8 @@
       if (saved.optsVersion < 3) { saved.xrscale = 1; saved.foveation = 0; saved.optsVersion = 3; }
       // One-time switch to automatic resolution (1.4 for MPI views), the new default.
       if (saved.optsVersion < 4) { saved.xrscale = 'auto'; saved.optsVersion = 4; }
+      // Removed experimental view modes (Surf2-9, Bent, Regions): back to the default view.
+      if (/^surf(?:[2-9]|1[0-4])$/.test(saved.lod || '')) saved.lod = 'mpionly';
       opts = { ...opts, ...saved };
       delete opts.nearclip;
       delete opts.xrsize;
@@ -552,8 +560,11 @@
       $('#pmodeSeg button').each(function () {
         $(this).toggleClass('active', $(this).data('pmode') === opts.pmode);
       });
+      $('#texSeg button').each(function () {
+        $(this).toggleClass('active', $(this).data('tex') === (opts.tex || 'auto'));
+      });
       const autoScale = opts.xrscale === 'auto';
-      $('#optXrscale').val(autoScale ? (['mpi', 'mpionly'].includes(opts.lod) || /^surf\d*$/.test(opts.lod) ? 1.4 : 1) : opts.xrscale);
+      $('#optXrscale').val(autoScale ? (['full', 'hybrid'].includes(opts.lod) ? 1 : 1.4) : opts.xrscale);
       $('#valXrscale').text(autoScale ? 'auto' : Number(opts.xrscale).toFixed(2));
       $('#xrscaleAuto').toggleClass('active', autoScale);
       $('#optFoveation').val(opts.foveation); $('#valFoveation').text(Number(opts.foveation).toFixed(1));
@@ -573,6 +584,8 @@
         url.searchParams.set('xrmaxpx', opts.xrmaxpx);
         url.searchParams.delete('xrpush');
         url.searchParams.set('adaptive', opts.adaptive ? '1' : '0');
+        if ((opts.tex || 'auto') === 'auto') url.searchParams.delete('tex');   // viewer default: ASTC > UASTC > PNG
+        else url.searchParams.set('tex', opts.tex);
         $(this).attr('href', url.pathname + url.search);
       });
       // Grey out scenes that don't have the selected view mode (not baked yet).
@@ -713,6 +726,7 @@
       $('#perfScene').on('input', renderPerfLinks);
       $('#lodSeg').on('click', 'button', function () { setOpts({ lod: $(this).data('lod') }); });
       $('#pmodeSeg').on('click', 'button', function () { setOpts({ pmode: $(this).data('pmode') }); });
+      $('#texSeg').on('click', 'button', function () { setOpts({ tex: $(this).data('tex') }); });
       $('#optXrscale').on('input', function () { setOpts({ xrscale: parseFloat(this.value) }); });
       $('#xrscaleAuto').on('click', function () { setOpts({ xrscale: 'auto' }); });
       $('#optFoveation').on('input', function () { setOpts({ foveation: parseFloat(this.value) }); });

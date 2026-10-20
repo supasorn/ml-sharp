@@ -19,7 +19,7 @@ original: 1.18M). Quality test scene: `20251023_155037` (palm trees, people).
 | Whole stack | `scripts/start_server.sh` | Web server + prediction watcher (GPU 0) + `bake-hybrid --watch` (GPU 1); photos dropped on the gallery become hybrids automatically. Logs in `logs/`. |
 | Server | `node web.js` | HTTP 3000, HTTPS 3443 (WebXR needs HTTPS; cert/key in `certs/`, git-ignored). `/` → gallery `/list`; `/scenes` JSON; `/fps` logs XR reports to `logs/xr_perf.jsonl` (git-ignored); `/delete` removes a scene and its derived files. |
 | Hybrid-MPI bake | `python scripts/bake_mpi.py` (all scenes, one per GPU; `--reexport`, `--overwrite`) | Per scene: `bake-hybrid --keep-move 0.3 --max-depth-ratio 0.05` into `renderings/mpi_work/`, then the remaining splats as a sparse MPI (`scripts/eval_alpha_patches.py` MPI mode). Writes `<scene>_mpi_mesh.glb` + `<scene>_mpi.glb` to `output2/`. ~50 s/scene/GPU. See §4b. Not run automatically for new scenes. |
-| Viewer | `web/index.html` | Spark 0.1.10 + three.js r178. `?lod=mpionly` (default)`|mpi|hybrid|full|layers|quest` (`patches`, `surfaces`: experimental); compressed layer textures by default (`?tex=png` off); `?hz=120` asks for 120 Hz; secondary thumbstick flick cycles modes in XR. FPS reports carry device info (`device`, `xrMode`, `refreshHz`, `fb`, `ua`). |
+| Viewer | `web/index.html` | Spark 0.1.10 + three.js r178. `?lod=mpionly` (default)`|mpi|hybrid|full|layers|quest` (`patches`, `surfaces`: experimental); compressed layer textures by default (`?tex=png` off); `?hz=120` asks for 120 Hz; view modes switch in XR from the gallery (A/X). FPS reports carry device info (`device`, `xrMode`, `refreshHz`, `fb`, `ua`). |
 | XR controls | `web/js/XRSceneController.js` | Ported from `/projects/img3dviewer`'s `XRMeshController`. Secondary X opens the in-XR gallery (`web/js/XRGallery.js`: thumbnails from `/thumb/<scene>`, view-mode buttons, scenes without the mode greyed out via `/scene-modes`). |
 | Splat drawing | `web/js/splatFlat.js` | Non-instanced, one triangle per splat (default). See §3. |
 | Benchmarks | `web/js/xrBench.js` | Self-running in-headset benchmarks (`?bench=<name>`). |
@@ -218,7 +218,7 @@ hybrid 32.5 / 26.4):
     overdraw ~20% / ~40% but cost 0.2–0.9 / 0.8–1.8 dB at 10–30 cm (worst on
     the heavy `20200927_161631`). Keep 128.
 12. **Cell culling** (`CULL=0.05`, default in `bake_mpi.py`): render the MPI +
-    mesh from 18 viewpoints spanning ±0.3 m, composite in depth order, and drop
+    mesh from 18 viewpoints (bake_mpi.py: 9, at 0.25 resolution, see §4c) spanning ±0.3 m, composite in depth order, and drop
     cells whose alpha × transmittance in front stays < 0.05 everywhere.
     Drops 35% of cells (triangles, texels) and 11–21% of the input view's layer
     fragments at no measurable cost (≤ 0.04 dB, held-out viewpoints included;
@@ -276,6 +276,42 @@ Texture reads were a real bottleneck (compression +31–53% on heavy scenes;
 hidden at 90 Hz, where every MPI mode sat at the cap), and MPI-only is faster
 than Hybrid-MPI (no mesh triangles, no uncompressed mesh texture).
 
+### 4c. MPI-only follow-ups (2026-10-19/20, DGX Spark GB10; `scripts/eval_alpha_patches.py` options)
+
+Scored with `scripts/glb_render.py` (vectorized offline renderer: plain / shared-tile / LCOL / LCW / parallax quads,
+KTX2 + ASTC pages with the viewer's trilinear mips and LOD bias, look-at cameras `x,y,z@tx,ty,tz`) against
+gsplat renders of the splats, me_small + `20260102_153205_63202`, 5 moved eyes, **on the compressed textures**.
+- **Adaptive planes `ad12sep`** (`ADAPT=4 ADAPT_T=12`, 4x finer bins in cells with textured strip edges): +2.5 dB
+  over MPI-only on me_small (37.0 vs 34.6), +2 dB on the wide scene, removes forehead/hairline stacking. Cost
+  1.6x (me_small) to 2x fill and 2.2x quads; on a cluttered interior (`20260914_155935_32199`, 64% of cells
+  flagged, 8 atlas pages) the Quest fell to ~22 fps (MPI-only 90): needs a budget on the flagged cells.
+  `bake_mpi.py --mpionly --variant ad12sep`; gallery "Adaptive". 96 base bins x4 matched 128x4 with 13% less fill;
+  128x2 / 64x4 cost 0.2 / 0.4 dB for -22% / -30% fill. 8-px cells: 2.6x quads, Quest 103 fps (quads, not fill,
+  were the limit up to 21x fill on me_small). 32-px cells: 21.6x fill, still 120 Hz on me_small.
+- **Compression artifacts**: premultiplied RGBA of ~10 stacked semi-transparent planes compresses 3.5x worse than
+  opaque texels; the errors add up and show as 4x4 blocks on magnified half-res cells. `UNPREM=1` (un-premultiplied,
+  spread colour) cut the KTX2 loss from 2.5 to 0.9 dB; `SEPA=1` (each plane's colour tile alpha 255 + alphas
+  packed 4 per tile, viewer's shared shader) removes the blocks. SEPA tiles are grouped by runs of 4 depth-adjacent
+  planes of a cell inside page-sized depth bands (`SEPA_BAND`), and every quad is drawn at its own plane's place:
+  otherwise holes / thin lines at moved views (planes drawn a page too early).
+- **Colour layers** (`LCOL` 3 frame-wide layers, `LCT` per-cell tiles, `LCW` weights between 2 layers): remove the
+  LCOL ghost face, but one colour per visibility layer costs 2-6 dB vs per-plane colour; cutting planes by layer
+  (LCT) leaves dark seams (two filtered alpha edges cover < the plane). Not worth it unless texture memory limits.
+- **Gap copies** (`GAPCOPY`): fill the gaps between strips of a surface crossing planes, +0.2 dB, +17% fill; they
+  don't fix the shear of features (each strip still at its plane's depth). **Parallax** (`PARALLAX=1` with SEPA:
+  per-texel depth offset in the colour tile's alpha, lookup shifted in the shader): 128 planes + parallax = 37.1 dB
+  on me_small at plain MPI-only fill, but offsets are bounded by one plane and the shift by the 2-texel border, so
+  it breaks up close (0.5 m from a face 2 m away) like plain MPI. Viewer: must apply the per-photo depth warp.
+- **ASTC instead of UASTC**: plain ASTC 4x4 KTX2 (`<x>_astc.glb`, `ktx create --format ASTC_4x4_UNORM_BLOCK
+  --astc-quality fast`): 6x faster to encode (UASTC: 152 CPU-s for 3 pages, 18 of 20 cores busy) and more accurate
+  (+0.25 dB rendered). Quest/Apple/phones sample it natively; the viewer prefers it where supported, else UASTC
+  (`_ktx2.glb`), else PNG; gallery "Textures".
+- **Bake speed** (plain MPI-only, me_small): 45 s -> ~6 s per scene in a persistent worker (`bake_mpi.py`;
+  ~11 s cold): bordered tiles gathered per occupied cell (not unfolded per frame) and kept on the GPU; per-bin work
+  on the window of cells with content (`FASTWIN`) and bin-sorted splat slices (byte-identical); culling from 9 eyes
+  at 0.25 resolution and Zstandard 9 (within 0.01 dB, +4% download); ASTC; no `sharp.cli`/`trimesh` imports
+  (~5 s). `BAKE_TIMING=1|2` prints stage / section times.
+
 ---
 
 ## 5. Approaches that did not work (and why)
@@ -308,6 +344,11 @@ than Hybrid-MPI (no mesh triangles, no uncompressed mesh texture).
   artifacts that were obvious in XR (pruning flicker), so confirm visually.
 
 ## 7. Offline evaluation pitfalls (cost many wrong conclusions)
+
+- **Score the compressed textures** (`<x>_astc.glb` / `_ktx2.glb` through `scripts/glb_read.py`), not the PNG
+  pages: compression cost per-plane premultiplied colour 2.5 dB and reversed rankings (§4c).
+- **Viewer-only effects**: the per-photo depth warp (`depthWarp.js`) changes geometry in the viewer only;
+  check viewer changes headless (Playwright Chromium + SwiftShader; needs nss/fonts libs, see `chromelibs` env).
 
 The harness renders splats with gsplat and meshes with pyvista/VTK:
 - **Don't flip** VTK textures or screenshots: with camera up = (0,−1,0) and

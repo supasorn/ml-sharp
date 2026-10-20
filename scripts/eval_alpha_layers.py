@@ -32,7 +32,21 @@ from PIL import Image
 from plyfile import PlyData
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from sharp.cli.bake_layers import load_gsplat, splat_tensors  # noqa: E402
+
+
+def _load_bake_layers():
+    """sharp/cli/bake_layers.py as a module of its own: `from sharp.cli.bake_layers import ...` runs sharp.cli's
+    __init__, which imports the whole SHARP model stack (timm: ~3 s) that the bakes don't need."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_sharp_bake_layers", Path(__file__).resolve().parents[1] / "src" / "sharp" / "cli" / "bake_layers.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_bl = _load_bake_layers()
+load_gsplat, splat_tensors = _bl.load_gsplat, _bl.splat_tensors
 
 OUT = Path("renderings") / ("alpha_layers_safe" if os.environ.get("SAFE") else "alpha_layers")
 GW, SS = 1024, 2           # fit grid width, supersampling of renders

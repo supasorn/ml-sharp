@@ -50,13 +50,23 @@ import eval_alpha_surfaces as s1  # noqa: E402
 import eval_alpha_surfaces2 as s2  # noqa: E402
 from eval_alpha_layers import cast, dev, psnr, raster, splat_tensors  # noqa: E402
 
-GW, SS = ev.GW, ev.SS
+GW, SS = int(os.environ.get("GW", ev.GW)), ev.SS   # GW: render grid width (render px = GW * SS across the photo)
 TILE = int(os.environ.get("TILE", 16))
 PX = float(os.environ.get("PX", 0.5))
 MOVE = float(os.environ.get("MOVE", 0.3))
 SUFFIX = os.environ.get("SUFFIX", "_hybrid")
 EXPORT = os.environ.get("EXPORT", "")
 EXPORT_DIR = os.environ.get("EXPORT_DIR", "")
+# PHOTO_DETAIL (MPI-only, plain bins): add the photo's detail the splats lost onto each pixel's front opaque surface,
+# so the composite from the photo's camera equals the photo (scripts/pano_msi.py's photo detail v4; see
+# photo_detail_mpi). PHOTO: the photo (default <EXPORT_DIR>/../images/<json image>); PD_ALPHA: surface opacity needed;
+# PD_ERODE: px (at GW 1024; scaled with GW) kept clear of the surface's rim; PD_BAND: relative disparity of the
+# bins that form the dominant bin's surface (at least 1.5 bins).
+PHOTO_DETAIL = bool(int(os.environ.get("PHOTO_DETAIL", 0)))
+PHOTO = os.environ.get("PHOTO", "")
+PD_ALPHA = float(os.environ.get("PD_ALPHA", 0.95))
+PD_ERODE = float(os.environ.get("PD_ERODE", 2))
+PD_BAND = float(os.environ.get("PD_BAND", 0.05))
 EVAL = int(os.environ.get("EVAL", 1))
 FITFLAT = bool(os.environ.get("FITFLAT", "1") != "0")  # fronto-parallel patches (tilted RANSAC planes mix depths)
 TEXDS = int(os.environ.get("TEXDS", 2))
@@ -414,6 +424,67 @@ def tick(label):
 
 _PLY_T = {"float": "f4", "float32": "f4", "double": "f8", "uchar": "u1", "uint8": "u1", "char": "i1", "int8": "i1",
           "ushort": "u2", "short": "i2", "uint": "u4", "uint32": "u4", "int": "i4", "int32": "i4"}
+
+
+def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H):
+    """PHOTO_DETAIL: the residual photo - composite (from the photo's camera, at render resolution), put onto each
+    pixel's dominant surface: the bins within PD_BAND relative disparity (>= 1.5 bins) of the bin with the largest
+    weight T * alpha. Only where that surface is opaque (alpha >= PD_ALPHA at every px within PD_ERODE): away from
+    rims, whose painted colour would slide off the object as the eye moves (halos; docs/pano-360.md). Spread over
+    the surface's bins in proportion to their alpha, i.e. the surface's colour shifts by D / its weight.
+    Returns apply(k, rgb, a) -> bin k's premultiplied rgb with the detail (clamped to a valid colour)."""
+    from PIL import Image, ImageOps
+    F_ = torch.nn.functional
+    im = ImageOps.exif_transpose(Image.open(photo)).convert("RGB").resize((W, H), Image.LANCZOS)
+    P = torch.zeros(Hc, Wc, 3, device=dev)
+    P[MARGIN:MARGIN + H, MARGIN:MARGIN + W] = torch.from_numpy(np.asarray(im)).to(dev).float() / 255
+    inside = torch.zeros(Hc, Wc, device=dev, dtype=torch.bool)
+    inside[MARGIN:MARGIN + H, MARGIN:MARGIN + W] = True
+    o_ = torch.argsort(b_t, stable=True)
+    st_ = np.r_[0, np.cumsum(torch.bincount(b_t, minlength=len(centers)).cpu().numpy())]
+    srt = {kk: v[o_] for kk, v in kept.items()}
+
+    def render(k):
+        sub = {kk: v[int(st_[k]):int(st_[k + 1])] for kk, v in srt.items()}
+        out, alpha, _ = ev.gs.rendering.rasterization(**sub, viewmats=torch.eye(4, device=dev)[None], Ks=Kc,
+                                                      width=Wc, height=Hc, eps2d=ev.EPS, render_mode="RGB")
+        return out[0].clamp(0, 1), alpha[0, ..., 0].clamp(0, 1)
+    ks = [k for k in reversed(range(len(centers))) if st_[k + 1] > st_[k]]   # near first
+    C = torch.zeros(Hc, Wc, 3, device=dev); T = torch.ones(Hc, Wc, device=dev)
+    best_w = torch.zeros(Hc, Wc, device=dev); best_k = torch.full((Hc, Wc), -1, device=dev, dtype=torch.long)
+    for k in ks:
+        rgb, a = render(k)
+        w = T * a
+        better = w > best_w
+        best_w = torch.where(better, w, best_w); best_k = torch.where(better, k, best_k)
+        C += T[..., None] * rgb
+        T = T * (1 - a)
+    D = torch.where(inside[..., None], P - C, 0)
+    cen = torch.tensor(np.asarray(centers), device=dev, dtype=torch.float32)
+    binw = float(cen[1] - cen[0]) if len(cen) > 1 else 0.0
+    d_best = cen[best_k.clamp(min=0)]
+    band = torch.maximum(PD_BAND * d_best, torch.full_like(d_best, 1.5 * binw))
+    T2 = torch.ones(Hc, Wc, device=dev); surf_T = torch.ones(Hc, Wc, device=dev); surf_w = torch.zeros(Hc, Wc, device=dev)
+    for k in ks:                                     # the dominant surface's opacity and weight from the camera
+        _, a = render(k)
+        inb = (cen[k] - d_best).abs() <= band
+        surf_T = torch.where(inb, surf_T * (1 - a), surf_T)
+        surf_w = surf_w + torch.where(inb, T2 * a, 0)
+        T2 = T2 * (1 - a)
+    opaque = (((1 - surf_T) >= PD_ALPHA) & (best_k >= 0) & inside).float()[None, None]
+    r = max(1, round(PD_ERODE * W / (1024 * SS)))
+    weight = (-F_.max_pool2d(-opaque, 2 * r + 1, 1, r))[0, 0]                     # erosion: all of the window
+    shift = weight[..., None] * D / surf_w[..., None].clamp(min=0.3)
+    ins = D[inside]
+    print(f"  photo detail ({Path(photo).name} at {W}x{H}; surface opacity >= {PD_ALPHA}, band {PD_BAND}, erode {r} "
+          f"px): residual |D| mean {ins.abs().mean():.4f}, applied on {weight[inside].mean():.1%} of the photo, "
+          f"residual left {(D * (1 - weight[..., None]))[inside].abs().mean():.4f}", flush=True)
+
+    def apply(k, rgb, a):
+        inb = (cen[k] - d_best).abs() <= band
+        new = rgb + torch.where(inb[..., None], a[..., None] * shift, 0)
+        return torch.minimum(new.clamp(min=0), a[..., None])                    # valid premultiplied colour
+    return apply
 
 
 def read_ply_vertex(path):
@@ -1318,6 +1389,12 @@ def run(scene: Path):
         FASTWIN = (not SURF and ldi_m is None and not (TILE_NEAR or TILE_FAR) and not EXTEND and not GAPCOPY
                    and not PARALLAX and not LCOL and not SNAP and bend_cl is None and REFINE and REFINE_MODE == "mean"
                    and not os.environ.get("NOFASTWIN"))
+        pd_apply = None
+        if PHOTO_DETAIL:
+            assert FASTWIN and not ADAPT, "PHOTO_DETAIL needs plain MPI-only bins"
+            photo = PHOTO or str(Path(EXPORT_DIR or scene.parent).parent / "images" / meta["image"])
+            pd_apply = photo_detail_mpi(photo, kept, passes_[0][0], passes_[0][1], Kc, Wc, Hc, W, H)
+            tick("photo detail")
         tick("adaptive detection (and earlier)")
         lvl_prev = 0
         bin_sort = {}                                 # FASTWIN: id(bin index tensor) -> (bin-sorted splats, starts)
@@ -1344,6 +1421,9 @@ def run(scene: Path):
                 sub = {kk: v[m] for kk, v in kept.items()}
             out, alpha, _ = ev.gs.rendering.rasterization(**sub, viewmats=torch.eye(4, device=dev)[None], Ks=Kc,
                                                           width=Wc, height=Hc, eps2d=ev.EPS, render_mode="RGB+D")
+            if pd_apply is not None:
+                out = torch.cat([pd_apply(k, out[..., :3].clamp(0, 1)[0], alpha[0, ..., 0].clamp(0, 1))[None],
+                                 out[..., 3:]], -1)
             sec(f"raster L{lvl_}")
             rgb, a, dacc = out[0, ..., :3], alpha[0, ..., 0], out[0, ..., 3]
             if FASTWIN:

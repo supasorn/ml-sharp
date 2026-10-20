@@ -307,6 +307,12 @@ gsplat renders of the splats, me_small + `20260102_153205_63202`, 5 moved eyes, 
 
   64 planes alone lose 1.1-1.2 dB (0.67x fill); SEPA is worth only 0.1-0.2 dB over un-premultiplied single tiles
   with ASTC, so `ad12sep` uses the plain one-lookup shader (MPI-only's cost per fragment). Bake ~5.7 s per scene.
+- **Photo detail** (`PHOTO_DETAIL=1`, MPI-only plain bins; `photo_detail_mpi`): composite the bins from the photo's
+  camera, put the residual photo - composite onto each pixel's front opaque surface (panorama v4 rules: opacity
+  >= 0.95, eroded 2 px, spread over the surface's bins). 2.2 mm ultrawide `20260523_140013_30959`, input view vs
+  the photo at 4096 px: MPI-only 30.3 dB, `photo` (GW 1024, MAXPAGES 8, TEXFULL_THR 0.0015) 31.8, `photo2` (GW 2000
+  = the photo's 4000 px, TILE 32 so the same ~28k quads, MAXPAGES 12) 32.8; no halos at 0.15 / 0.3 m moves. Fill
+  unchanged; `photo2` 7 pages (86 MB ASTC) vs 3. Headset speed not measured yet.
 - **Compression artifacts**: premultiplied RGBA of ~10 stacked semi-transparent planes compresses 3.5x worse than
   opaque texels; the errors add up and show as 4x4 blocks on magnified half-res cells. `UNPREM=1` (un-premultiplied,
   spread colour) cut the KTX2 loss from 2.5 to 0.9 dB; `SEPA=1` (each plane's colour tile alpha 255 + alphas

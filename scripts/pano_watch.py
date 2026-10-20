@@ -2,23 +2,29 @@
 the gallery shows (docs/pano-360.md):
   1. scripts/pano_predict.py  -> pano/out_ico2/<name>.ply (SHARP splats; ~2 min on the GB10)
   2. scripts/pano_spz.py      -> pano/out_ico2/<name>.spz (the viewer's "360 splats")
-  3. scripts/pano_msi.py      -> pano/out_ico2_photo4/<name>_msi[_ktx2].glb (photo-detail v4 multi-sphere image,
+  3. scripts/pano_msi.py      -> pano/out_ico2_photo4/<name>_msi[_astc].glb (photo-detail v4 multi-sphere image,
                                  the viewer's default "360 MSI")
 web.js puts uploaded panoramas into pano/inputs (scripts/start_server.sh runs this watcher next to the others).
 
 python scripts/pano_watch.py --root data/public [--once] [names...]
 A panorama is picked up once its file has been unchanged for a few seconds; one whose steps failed is retried only
 after the file changes. Logs per panorama go to stdout. pano/.watch_status.json tells the gallery what is being
-built ({"current": name, "step": "splats" | "spz" | "msi", "failed": [names]}).
+built ({"current": name, "step": "splats" | "spz" | "msi", "writing": [names], "failed": [names]}).
+
+One process for all panoramas, as the photo bake's persistent worker (scripts/bake_mpi.py): the scripts are imported
+and the SHARP model loaded once (fresh processes cost ~15 s of imports and loading per panorama), and a panorama's
+MSI files (PNG pages, ASTC copy) are written on a background thread while the next one is predicted.
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, gc, json, os, sys, time, traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKPOINT = ROOT / "sharp_2572gikvuh.pt"
 EXTS = (".jpg", ".jpeg", ".png")
 MSI_DIR = "out_ico2_photo4"
-MSI_ARGS = ["--maxpages", "16", "--texfull-thr", "0.0015", "--detail-alpha", "0.95", "--detail-erode", "2"]
+MSI_ARGS = ["--maxpages", "16", "--texfull-thr", "0.0015", "--detail-alpha", "0.95", "--detail-erode", "2",
+            "--tex", "astc", "--cull", "0.05"]   # cull: 23% fewer cells, renders within 61+ dB from moved eyes
 
 
 def newer(out: Path, src: Path) -> bool:
@@ -31,25 +37,29 @@ def write_status(pano: Path, **st):
     os.replace(tmp, pano / ".watch_status.json")
 
 
-def process(img: Path, pano: Path, status):
+def process(img: Path, pano: Path, status, writer):
+    """The missing steps for one panorama, in this process; returns the future of its MSI files (written on
+    `writer`), or None."""
+    import pano_msi, pano_predict, pano_spz
     name = img.stem
     ply, spz = pano / "out_ico2" / f"{name}.ply", pano / "out_ico2" / f"{name}.spz"
-    msi = pano / MSI_DIR / f"{name}_msi_ktx2.glb"
-    py = [sys.executable, "-u"]
-    steps = [("splats", ply, py + [str(ROOT / "scripts/pano_predict.py"), str(img), "-o", str(ply.parent),
-                         "--checkpoint", str(CHECKPOINT)]),
-             ("spz", spz, py + [str(ROOT / "scripts/pano_spz.py"), str(ply)]),
-             ("msi", msi, py + [str(ROOT / "scripts/pano_msi.py"), str(ply), "-o", str(msi.parent), *MSI_ARGS,
-                         "--photo-detail", str(img)])]
-    for label, out, cmd in steps:
+    msi = pano / MSI_DIR / f"{name}_msi_astc.glb"
+    steps = [("splats", ply, lambda: pano_predict.main([str(img), "-o", str(ply.parent),
+                                                        "--checkpoint", str(CHECKPOINT)])),
+             ("spz", spz, lambda: pano_spz.main([str(ply)])),
+             ("msi", msi, lambda: pano_msi.main([str(ply), "-o", str(msi.parent), *MSI_ARGS,
+                                                 "--photo-detail", str(img)], writer=writer))]
+    fut = None
+    for label, out, fn in steps:
         if newer(out, img):
             continue
         status(current=name, step=label)
         out.parent.mkdir(parents=True, exist_ok=True)
         t = time.time()
         print(f"  {out.name} ...", flush=True)
-        subprocess.run(cmd, check=True, cwd=ROOT, stdout=sys.stdout, stderr=subprocess.STDOUT)
-        print(f"  {out.name}: {time.time() - t:.0f} s", flush=True)
+        fut = fn()
+        print(f"  {out.name}: {time.time() - t:.0f} s{' (files being written)' if fut is not None else ''}", flush=True)
+    return fut
 
 
 def todo(pano: Path, names):
@@ -58,7 +68,7 @@ def todo(pano: Path, names):
         if img.suffix.lower() not in EXTS or (names and img.stem not in names):
             continue
         try:
-            if not newer(pano / MSI_DIR / f"{img.stem}_msi_ktx2.glb", img):
+            if not any(newer(pano / MSI_DIR / f"{img.stem}_msi_{k}.glb", img) for k in ("astc", "ktx2")):
                 yield img
         except OSError:                                        # removed while listing
             continue
@@ -72,9 +82,35 @@ def main():
     ap.add_argument("names", nargs="*", help="only these panoramas (file names without extension)")
     args = ap.parse_args()
     pano = args.root.resolve() / "pano"
+    sys.path.insert(0, str(ROOT / "scripts"))
+    os.chdir(ROOT)
     failed = {}                                                # name -> input mtime that failed
+    writing = {}                                               # name -> (future of its MSI files, start, mtime)
+    writer = ThreadPoolExecutor(1)
     print(f"watching {pano / 'inputs'} for 360 panoramas (every {args.poll:.0f} s)", flush=True)
-    status = lambda **st: write_status(pano, failed=sorted(failed), **st)
+    current = {"current": None}
+    lock = __import__("threading").Lock()                     # status and `writing` change on the writer thread too
+
+    def status(**st):
+        with lock:
+            current.update(st)
+            write_status(pano, failed=sorted(failed), writing=sorted(writing), **current)
+
+    def fail(name, mtime, e):
+        failed[name] = mtime
+        print(f"  {name} FAILED ({type(e).__name__}: {e}); retried when the file changes", flush=True)
+        traceback.print_exc()
+
+    def written(name, t, mtime, fut):                          # on the writer thread, when the files are written
+        with lock:
+            del writing[name]
+        try:
+            fut.result()
+            print(f"  {name}: done in {time.time() - t:.0f} s", flush=True)
+        except Exception as e:
+            fail(name, mtime, e)
+        status()
+
     status(current=None)
     while True:
         for img in todo(pano, set(args.names)):
@@ -82,23 +118,30 @@ def main():
                 mtime = img.stat().st_mtime
             except OSError:                                    # removed since the scan
                 continue
-            if failed.get(img.stem) == mtime or (not args.once and time.time() - mtime < 5):
+            if (img.stem in writing or failed.get(img.stem) == mtime
+                    or (not args.once and time.time() - mtime < 5)):
                 continue
             t = time.time()
             print(f"[{time.strftime('%H:%M:%S')}] {img.name}", flush=True)
             try:
-                process(img, pano, status)
-                print(f"  done in {time.time() - t:.0f} s", flush=True)
-            except (subprocess.CalledProcessError, OSError) as e:
+                fut = process(img, pano, status, writer)
+                if fut is not None:
+                    with lock:
+                        writing[img.stem] = fut
+                    fut.add_done_callback(lambda f, n=img.stem, t=t, m=mtime: written(n, t, m, f))
+                else:
+                    print(f"  done in {time.time() - t:.0f} s", flush=True)
+            except Exception as e:
                 if not img.exists():                           # removed while being processed
                     print("  input removed; skipped", flush=True)
-                    status(current=None)
-                    continue
-                failed[img.stem] = mtime
-                print(f"  FAILED ({e}); "
-                      "retried when the file changes", flush=True)
-            status(current=None)
+                else:
+                    fail(img.stem, mtime, e)
+            finally:
+                gc.collect()
+                __import__("torch").cuda.empty_cache()         # the next panorama (and the other watchers) need it
+            status(current=None, step=None)
         if args.once:
+            writer.shutdown(wait=True)
             break
         time.sleep(args.poll)
 

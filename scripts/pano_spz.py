@@ -48,10 +48,10 @@ def convert(src: Path, dst: Path) -> int:
     return n
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("ply", nargs="+")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     for s in args.ply:
         src = Path(s)
         dst = src.with_suffix(".spz")

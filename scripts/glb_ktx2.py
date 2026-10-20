@@ -86,7 +86,7 @@ def write_glb(path, g, views):
                            + struct.pack("<II", len(out), 0x004E4942) + bytes(out))
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("src", type=Path)
     ap.add_argument("dst", type=Path)
@@ -97,7 +97,9 @@ def main():
                     help="mipmap levels (box filter; 1 = none). The Quest shrinks full-resolution cells 2-3x; "
                          "with cells' 4-texel borders, levels 0-2 stay free of neighbouring cells")
     ap.add_argument("--decoded", type=Path, help="also write a .glb with the decoded pages as PNG")
-    a = ap.parse_args()
+    ap.add_argument("--astc", metavar="QUALITY", help="plain ASTC 4x4 at this astcenc quality (e.g. fast) instead of "
+                    "UASTC: ~6x faster to encode; GPUs without ASTC (desktop) can't load it")
+    a = ap.parse_args(argv)
     g, bin_ = read_glb(a.src)
     views = [bin_[v.get("byteOffset", 0):v.get("byteOffset", 0) + v["byteLength"]] for v in g["bufferViews"]]
     gk = json.loads(json.dumps(g))
@@ -107,7 +109,8 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         pngs = [views[im["bufferView"]] for im in g["images"]]
         png_bytes = sum(len(p) for p in pngs)
-        kts = encode_pages(pngs, td, quality=a.quality, zstd=a.zstd, rdo=a.rdo, levels=a.levels)   # pages in parallel
+        kts = encode_pages(pngs, td, quality=a.quality, zstd=a.zstd, rdo=a.rdo, levels=a.levels,   # pages in parallel
+                           astc=a.astc)
         ktx_bytes = sum(len(k) for k in kts)
         for i, (im, kb) in enumerate(zip(g["images"], kts)):
             bv = im["bufferView"]

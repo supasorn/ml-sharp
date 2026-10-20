@@ -168,7 +168,34 @@ of all variants.
 first; `web.js` moves an equirectangular image (2:1 within 1%, ≥ 2000 px wide, or tagged
 `equirectangular` in its XMP) to `pano/inputs/` (name sanitised to `[\w.-]`) and anything else to
 `images/`. `scripts/pano_watch.py` (started by `scripts/start_server.sh`, log `logs/pano.log`) then runs
-`pano_predict.py` → `pano_spz.py` → `pano_msi.py` (photo detail v4) for each input without
-`out_ico2_photo4/<name>_msi_ktx2.glb`, ~4 min per panorama on the GB10; the gallery shows it as
+`pano_predict.py` → `pano_spz.py` → `pano_msi.py --tex astc` (photo detail v4) for each input without
+`out_ico2_photo4/<name>_msi_astc.glb` (or an older `_msi_ktx2.glb`), ~70 s per panorama on the GB10; the gallery
+shows it as
 "Processing 360°…" until the splats exist. `python scripts/pano_watch.py --root data/public --once [names]`
 does the same by hand.
+
+## Processing speed (2026-10-20, GB10)
+
+One panorama went from ~240 s to ~100 s (`R0011227`, 20 ico views, splats bit-identical except where noted):
+- **Pass 2 reuses pass 1's monodepth output** (the predictor ran the monodepth network again on the same view):
+  only the fields the predictor reads, features as float16 (0.7 GB a view; splats within 1e-5, +14 GB peak).
+- **Ownership before the covariance transform**: SHARP's `apply_transform` decomposes every covariance with a fp64
+  SVD on the CPU (2.5 s for a view's 1.18M splats); only the view's own third is transformed now, on a thread that
+  overlaps the next view's GPU pass. (A GPU Jacobi 3x3 solver was slower than the CPU SVD at 400k splats, and a
+  batched `torch.linalg.eigh` on the GPU crashed the machine's session twice — don't.)
+- **bf16 autocast for the monodepth pass** (`--bf16 mono`, default): 0.5 vs 1.6 s a view, and *better* vs the
+  panorama (+0.6 dB R0011227, +1.2 dB hotel_room at the centre; renders vs fp32 34 dB, no visible change).
+  `--bf16 all` saves 2 s more at the same quality. Batching views doesn't help.
+- **MSI**: pages written by `eval_alpha_patches.write_layer_glbs` (parallel PNG, fast level; trimesh's export
+  took 26 s), and `--tex astc` (ASTC 4x4, 5 s vs UASTC 26 s; the viewer loads `_msi_astc.glb` where the GPU has
+  ASTC, else `_msi_ktx2.glb`, else the PNG file).
+- **MSI render**: splats bin-sorted once and sliced per bin (a boolean mask over 7.8M splats per bin and pass cost
+  ~7 s); cell lists built per bin, not per cell; photo detail's second pass reuses the first pass's alpha (~13 GB)
+  instead of rendering every bin again; Zstandard 9 (as the photo bake). Output identical.
+- **Cell culling** (`--cull 0.05`, 15 eyes within +-0.3 m, as the photo bake's CULL): 23-25% fewer cells, a page
+  less; renders vs unculled from 8 moved eyes 61-83 dB (<= 0.014% of pixels differ by > 8 levels). +4 s.
+- **Persistent watcher** (`pano_watch.py`): steps in-process (imports from the NAS and loading the model cost ~15 s
+  per panorama), the MSI files written on a background thread while the next panorama is predicted (status lists
+  them under `writing`).
+Timings (GB10): predict 39-45 s (was 138), spz 5 s, MSI 24-28 s (was 91), files written alongside the next
+panorama: ~70 s per panorama in a batch (was ~240).

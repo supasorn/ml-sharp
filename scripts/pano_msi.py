@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -39,7 +38,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-import trimesh
 from PIL import Image
 from plyfile import PlyData
 
@@ -109,11 +107,14 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
     best_T = torch.ones(6, S, S, device=dev)
     best_a = torch.zeros(6, S, S, device=dev)
     best_k = torch.full((6, S, S), -1, device=dev, dtype=torch.int16)
+    alphas = {}                            # kept for the second pass (v4), which needs only alpha (~13 GB)
     for k in range(B - 1, -1, -1):         # near first
         if not (b == k).any():
             continue
         rgb, alpha, _ = render_bin(k)
         alpha = alpha.clamp(0, 1)
+        if alpha_thr is not None:
+            alphas[k] = alpha
         w = T * alpha
         better = w > best_w
         best_w = torch.where(better, w, best_w)
@@ -142,8 +143,7 @@ def photo_detail(pano_path, render_bin, b, B, rots_np, S, fr, dev, min_w, centre
         for kb in range(B - 1, -1, -1):
             if not (b == kb).any():
                 continue
-            _, alpha, _ = render_bin(kb)
-            alpha = alpha.clamp(0, 1)
+            alpha = alphas.pop(kb)
             inb = (cen[kb] - d_best).abs() <= band
             surf_T = torch.where(inb, surf_T * (1 - alpha), surf_T)
             surf_w = surf_w + torch.where(inb, T2 * alpha, 0)
@@ -218,7 +218,8 @@ def cell_contrib(alphas, centres, nc, dev, res=256, eyes=CULL_EYES):
     return best.reshape(B, 6, nc, nc)
 
 
-def run(args):
+def run(args, writer=None):
+    """writer: optional executor; the files are then written on it (returns its future) while the caller goes on."""
     dev = torch.device("cuda")
     gs = load_gsplat()
     ply = Path(args.ply)
@@ -249,8 +250,16 @@ def run(args):
     c = (torch.arange(S, device=dev) + 0.5 - S / 2) / fr
     ray_norm = torch.sqrt(c[None, :] ** 2 + c[:, None] ** 2 + 1)
 
+    # Splats sorted by bin once: each bin is a slice (a boolean mask over all splats per bin, three passes with
+    # photo detail, cost ~7 s).
+    order = torch.argsort(b, stable=True)
+    starts = np.r_[0, np.cumsum(torch.bincount(b, minlength=B).cpu().numpy())]
+    sp_sorted = {key: val[order] for key, val in sp_all.items()}
+    has_bin = starts[1:] > starts[:-1]
+    b = b.cpu().numpy()                                # photo_detail's (b == k).any(): numpy, no GPU sync
+
     def render_bin(k):
-        sp = {key: val[b == k] for key, val in sp_all.items()}
+        sp = {key: val[int(starts[k]):int(starts[k + 1])] for key, val in sp_sorted.items()}
         return render_faces(gs, sp, rots, S, fr)
 
     detail = None
@@ -264,7 +273,7 @@ def run(args):
     eval_faces = {} if args.eval else None
     cull_alpha = {}
     for k in range(B):                    # far first (bin 0 = lowest disparity)
-        if not (b == k).any():
+        if not has_bin[k]:
             continue
         rgb, alpha, ed = render_bin(k)
         if detail is not None:
@@ -295,19 +304,17 @@ def run(args):
         h = F.avg_pool2d(t, TEXDS)
         up = F.interpolate(h, scale_factor=TEXDS, mode="bilinear", align_corners=False)
         err = (up - t)[:, :3, gb:cb - gb, gb:cb - gb].abs().mean((1, 2, 3))
-        for j in range(len(idx)):
-            cells.append((k, *idx[j].tolist()))
+        n0 = sum(len(c_) for c_ in cells)
+        cells.append(np.c_[np.full(len(idx), k), idx.cpu().numpy()])
         half_tex.append((h.permute(0, 2, 3, 1) * 255).round().to(torch.uint8).cpu())
         errs.append(err.cpu())
         cand = (err > args.texfull_thr).nonzero()[:, 0]
-        n0 = len(cells) - len(idx)
         if len(cand):
             ft = (crops[cand] * 255).round().to(torch.uint8).cpu()
-            for j, ci in enumerate(cand.tolist()):
-                full_tex[n0 + ci] = ft[j]
+            full_tex.update(zip((n0 + cand.cpu().numpy()).tolist(), ft))
         wsum.append(a_cell[idx[:, 0], idx[:, 1], idx[:, 2]].cpu())
         rmean.append((dw[idx[:, 0], idx[:, 1], idx[:, 2]] / a_cell[idx[:, 0], idx[:, 1], idx[:, 2]].clamp(min=1e-6)).cpu())
-    cells = np.array(cells)
+    cells = np.concatenate(cells)
     half_tex = torch.cat(half_tex).numpy()
     errs = torch.cat(errs).numpy()
     wsum = torch.cat(wsum).numpy()
@@ -399,9 +406,7 @@ def run(args):
     pages.append(cur)
 
     out_glb = Path(args.output or ply.parent) / f"{ply.stem}_msi.glb"
-    meshes, texels = {}, 0
-    from trimesh.visual.material import PBRMaterial
-    from trimesh.visual.texture import TextureVisuals
+    meshes, texels = [], 0
     for pg, ids in enumerate(pages):
         img = np.zeros((PAGE, PAGE, 4), np.uint8)
         ids = np.array(ids)
@@ -416,28 +421,35 @@ def run(args):
             texels += t.shape[0] * t.shape[1]
             uu.append([x, x + w, x + w, x])
             vv.append([y, y, y + w, y + w])
-        uu = np.array(uu, float) / PAGE
-        vv = np.array(vv, float) / PAGE
+        uv = np.stack([np.array(uu, np.float32).reshape(-1), np.array(vv, np.float32).reshape(-1)], 1) / PAGE
         faces = (np.arange(len(ids))[:, None, None] * 4 + np.array([[0, 1, 2], [0, 2, 3]])[None]).reshape(-1, 3)
-        mat = PBRMaterial(name=f"msi_{pg}", baseColorTexture=Image.fromarray(img, "RGBA"), metallicFactor=0.0,
-                          roughnessFactor=1.0, doubleSided=True, alphaMode="BLEND")
-        vis = TextureVisuals(uv=np.stack([uu.reshape(-1), 1 - vv.reshape(-1)], 1), material=mat)
-        meshes[f"surface_{len(pages) - 1 - pg}"] = trimesh.Trimesh(
-            vertices=verts[ids].reshape(-1, 3).astype(np.float32), faces=faces, process=False, visual=vis)
-    trimesh.Scene(meshes).export(out_glb)
+        meshes.append((f"surface_{len(pages) - 1 - pg}", verts[ids].reshape(-1, 3).astype(np.float32),
+                       faces.astype(np.uint32), uv, img))
+    # The photo bake's glTF writer: PNG pages encoded in parallel at fast compression (trimesh's export took
+    # ~26 s for 10 pages, one at a time at the default level).
     info = dict(bins=B, cells=int(N), full_res_cells=int(full.sum()), pages=len(pages), face=args.face,
-                texels_M=round(texels / 1e6, 1), r_min=float(1 / hi), r_max=float(1 / max(lo, 1e-6)),
-                mb=round(out_glb.stat().st_size / 2 ** 20, 1), seconds=round(time.time() - t0))
-    print(f"  wrote {out_glb}: {json.dumps(info)}", flush=True)
-    if not args.no_ktx2:
-        subprocess.run([sys.executable, str(Path(__file__).parent / "glb_ktx2.py"), str(out_glb),
-                        str(out_glb.with_name(out_glb.stem + "_ktx2.glb"))]
-                       + (["--rdo", str(args.ktx2_rdo)] if args.ktx2_rdo > 0 else []), check=True)
-
+                texels_M=round(texels / 1e6, 1), r_min=float(1 / hi), r_max=float(1 / max(lo, 1e-6)))
     if eval_faces is not None:
         info["eval"] = evaluate(gs, sp_all, eval_faces, centres, args)
         print(f"  eval: {json.dumps(info['eval'])}", flush=True)
-    out_glb.with_suffix(".json").write_text(json.dumps(info, indent=2))
+
+    def finish():                                            # CPU only: PNG pages, compressed copy, json
+        import glb_ktx2
+        from eval_alpha_patches import write_layer_glbs
+        write_layer_glbs(out_glb, meshes)
+        info.update(mb=round(out_glb.stat().st_size / 2 ** 20, 1), seconds=round(time.time() - t0))
+        print(f"  wrote {out_glb}: {json.dumps(info)}", flush=True)
+        if not args.no_ktx2:
+            # ASTC (<name>_msi_astc.glb, the Quest's format; viewer falls back to the PNG file elsewhere) or Basis
+            # UASTC (<name>_msi_ktx2.glb, any GPU; ~6x slower to encode); Zstandard 9 as the photo bake (+4% size)
+            astc = args.tex == "astc"
+            glb_ktx2.main([str(out_glb), str(out_glb.with_name(out_glb.stem + ("_astc.glb" if astc else "_ktx2.glb"))),
+                           "--zstd", "9"] + (["--astc", "fast"] if astc else [])
+                          + (["--rdo", str(args.ktx2_rdo)] if args.ktx2_rdo > 0 and not astc else []))
+        out_glb.with_suffix(".json").write_text(json.dumps(info, indent=2))
+    if writer is not None:
+        return writer.submit(finish)
+    finish()
 
 
 @torch.no_grad()
@@ -494,7 +506,7 @@ def evaluate(gs, sp_all, faces, centres, args, size=512, fov=90):
     return res
 
 
-def main():
+def main(argv=None, writer=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("ply")
     p.add_argument("-o", "--output", default=None)
@@ -526,9 +538,11 @@ def main():
                    help="Drop cells contributing less than this from every eye within +-0.3 m (0 = off).")
     p.add_argument("--ktx2-rdo", type=float, default=0.0, help="UASTC RDO lambda for the KTX2 file (0 = off).")
     p.add_argument("--no-ktx2", action="store_true")
+    p.add_argument("--tex", choices=["astc", "uastc"], default="uastc",
+                   help="compressed copy: ASTC 4x4 (_msi_astc.glb) or Basis UASTC (_msi_ktx2.glb)")
     p.add_argument("--eval", action="store_true")
     p.add_argument("--eval-images", action="store_true")
-    run(p.parse_args())
+    return run(p.parse_args(argv), writer)
 
 
 if __name__ == "__main__":

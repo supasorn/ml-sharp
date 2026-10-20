@@ -37,7 +37,8 @@ import torch.nn.functional as F
 
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import color_space as cs_utils
-from sharp.utils.gaussians import Gaussians3D, convert_rgb_to_spherical_harmonics, unproject_gaussians
+from sharp.utils.gaussians import (Gaussians3D, apply_transform, convert_rgb_to_spherical_harmonics,
+                                   get_unprojection_matrix)
 
 LOGGER = logging.getLogger("pano")
 INTERNAL = 1536  # SHARP's input resolution
@@ -127,25 +128,46 @@ def project_to_view(d: torch.Tensor, R: torch.Tensor, f: float, size: int):
 # ---------------------------------------------------------------- model
 
 
+_MODELS = {}                               # loaded once per process (scripts/pano_watch.py runs many panoramas)
+
+
 def load_model(checkpoint: Path, device: torch.device):
-    model = create_predictor(PredictorParams())
-    model.load_state_dict(torch.load(checkpoint, weights_only=True))
-    return model.eval().to(device)
+    key = (str(Path(checkpoint).resolve()), str(device))
+    if key not in _MODELS:
+        model = create_predictor(PredictorParams())
+        model.load_state_dict(torch.load(checkpoint, weights_only=True))
+        _MODELS[key] = model.eval().to(device)
+    return _MODELS[key]
 
 
 @torch.no_grad()
-def monodepth(model, image: torch.Tensor, disparity_factor: float) -> torch.Tensor:
-    """Front-layer z-depth (INTERNAL x INTERNAL) as SHARP predicts it."""
+def monodepth(model, image: torch.Tensor, disparity_factor: float):
+    """Front-layer z-depth (INTERNAL x INTERNAL) as SHARP predicts it, and the monodepth network's output for
+    predict_aligned: only the fields the predictor reads, features as float16 (0.7 GB a view instead of 2.3 GB;
+    splats within 1e-5 of recomputing them, opacity within 0.02)."""
     out = model.monodepth_model(image)
     disp = out.disparity[:, 0:1].clamp(min=1e-4, max=1e4)
-    return (disparity_factor / disp)[0, 0]
+    keep = out._replace(encoder_features=[], intermediate_features=[], decoder_features=out.decoder_features.half(),
+                        output_features=[t.half() for t in out.output_features])
+    return (disparity_factor / disp)[0, 0], keep
 
 
 @torch.no_grad()
-def predict_aligned(model, image, disparity_factor: float, depth: torch.Tensor | None):
+def predict_aligned(model, image, disparity_factor: float, depth: torch.Tensor | None, mono_out=None):
+    """SHARP with the stitched depth; mono_out: pass 1's monodepth output for this view, reused instead of
+    running the monodepth network (most of the forward) a second time on the same image."""
     fac = torch.tensor([disparity_factor], device=image.device)
     d = None if depth is None else depth[None, None]
-    return model(image, fac, d)
+    if mono_out is None:
+        return model(image, fac, d)
+    full = mono_out._replace(decoder_features=mono_out.decoder_features.float(),
+                             output_features=[t.float() for t in mono_out.output_features])
+    model.monodepth_model.forward = lambda _image: full
+    try:
+        return model(image, fac, d)
+    finally:
+        del model.monodepth_model.forward              # back to the class's forward
+
 
 
 # ---------------------------------------------------------------- depth stitching
@@ -284,8 +306,10 @@ def run(args):
             cv2.imwrite(str(out / f"{name}_view{k:02d}.jpg"),
                         cv2.cvtColor((v[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
-    # Pass 1: monodepth per view, stitched.
-    depths = [monodepth(model, v, factor) for v in views]
+    # Pass 1: monodepth per view, stitched (outputs kept: pass 2 reuses them).
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.bf16 in ("mono", "all")):
+        depths, mono_outs = zip(*[monodepth(model, v, factor) for v in views])
+    depths = [z.float() for z in depths]
     eq_w = args.depth_width
     logd, s, stats = stitch_depth(depths, rots, f, size, eq_w, eq_w // 2, device)
     LOGGER.info("depth stitch: %s", json.dumps(stats))
@@ -301,6 +325,9 @@ def run(args):
     K = torch.tensor([[f, 0, size / 2, 0], [0, f, size / 2, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
                      device=device, dtype=torch.float32)
     kept = []
+    # The covariance transform (CPU SVD, ~0.9 s a view) runs on a thread while the GPU predicts the next view.
+    from concurrent.futures import ThreadPoolExecutor
+    cpu = ThreadPoolExecutor(1)
     for k, (R, img) in enumerate(zip(rots, views)):
         Rt = torch.tensor(R, device=device, dtype=torch.float32)
         target = None
@@ -314,15 +341,21 @@ def run(args):
             lr = F.grid_sample(logd[None, None], grid[None], mode="bilinear", padding_mode="border",
                                align_corners=False)[0, 0]
             target = torch.exp(lr) / rays.norm(dim=-1)  # distance -> z-depth
-        g_ndc = predict_aligned(model, img, factor, target)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.bf16 == "all"):
+            g_ndc = flat(predict_aligned(model, img, factor, target, mono_outs[k]))
+        g_ndc = Gaussians3D(*[t.float() for t in g_ndc])
         E = torch.eye(4, device=device)
         E[:3, :3] = Rt.T  # world -> camera
-        g = flat(unproject_gaussians(g_ndc, E, K, (size, size)))
-        dirn = g.mean_vectors / g.mean_vectors.norm(dim=-1, keepdim=True)
-        owner = (dirn @ axes.T).argmax(-1)
-        kept.append(select(g, owner == k))
+        unproj = get_unprojection_matrix(E, K, (size, size))
+        # Ownership from the world-space centres first: only the kept third gets the (CPU, per-splat SVD)
+        # covariance transform.
+        mean = g_ndc.mean_vectors @ unproj[:3, :3].T + unproj[:3, 3]
+        owner = (mean / mean.norm(dim=-1, keepdim=True) @ axes.T).argmax(-1)
+        own = select(g_ndc, owner == k)
+        kept.append(cpu.submit(lambda own=own, m=unproj[:3]: flat(apply_transform(Gaussians3D(*[t[None] for t in own]), m))))
         LOGGER.info("view %d: kept %d / %d", k, int((owner == k).sum()), len(owner))
-    g = cat(kept)
+    g = cat([f.result() for f in kept])
+    cpu.shutdown()
     if args.min_opacity > 0:
         g = select(g, g.opacities > args.min_opacity)
     write_ply(g, out / f"{name}.ply")
@@ -333,7 +366,7 @@ def run(args):
     LOGGER.info("wrote %s (%d splats) in %.1fs", out / f"{name}.ply", len(g.opacities), time.time() - t0)
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input")
     p.add_argument("-o", "--output", default="pano/out")
@@ -344,7 +377,11 @@ def main():
     p.add_argument("--no-align", action="store_true", help="Skip pass 2 alignment (baseline).")
     p.add_argument("--min-opacity", type=float, default=0.0)
     p.add_argument("--save-views", action="store_true")
-    args = p.parse_args()
+    # mono: depth pass 3x faster (0.5 vs 1.6 s a view on the GB10) and +0.6 / +1.2 dB vs the panorama
+    # (R0011227 / hotel_room); all: 2 s faster still, same quality, kept optional.
+    p.add_argument("--bf16", choices=["off", "mono", "all"], default="mono",
+                   help="bfloat16 autocast for the monodepth pass (mono) or the whole network (all)")
+    args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     run(args)
 

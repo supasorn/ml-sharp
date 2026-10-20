@@ -682,7 +682,9 @@
         return s;
       }
       const v = info.variants.find((x) => x.id === panoVariant) || info.variants[0];
-      const url = (texKtx2 && v.msi) || v.msiPng || v.msi;
+      // ASTC where the GPU samples it (Quest), else Basis UASTC, else PNG (as for photo scenes; ?tex=ktx2 skips ASTC)
+      const astcOk = getQueryParam('tex') !== 'ktx2' && renderer.extensions.has('WEBGL_compressed_texture_astc');
+      const url = (texKtx2 && astcOk && v.msiAstc) || (texKtx2 && v.msi) || v.msiPng || v.msi || v.msiAstc;
       ktx2Loader ??= new KTX2Loader()
         .setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/libs/basis/')
         .detectSupport(renderer);

@@ -81,8 +81,10 @@ function panoInfo(coll, name) {
   const variants = [];
   for (const v of PANO_VARIANTS) {
     const ktx2 = path.join(panoDir, v.id, `${name}_msi_ktx2.glb`), png = path.join(panoDir, v.id, `${name}_msi.glb`);
+    const astc = path.join(panoDir, v.id, `${name}_msi_astc.glb`);
     if (!fs.existsSync(ktx2) && !fs.existsSync(png)) continue;
     variants.push({ ...v, msi: fs.existsSync(ktx2) ? url(`${v.id}/${name}_msi_ktx2.glb`) : null,
+                    msiAstc: fs.existsSync(astc) ? url(`${v.id}/${name}_msi_astc.glb`) : null,
                     msiPng: fs.existsSync(png) ? url(`${v.id}/${name}_msi.glb`) : null });
     mtime = Math.max(mtime, fs.statSync(fs.existsSync(ktx2) ? ktx2 : png).mtimeMs);
   }
@@ -318,7 +320,7 @@ function buildStages(coll, name, pano) {
   if (pano) {
     const d = dir(coll, 'pano');
     return [['splats', has(d, 'out_ico2', `${name}.ply`)], ['spz', has(d, 'out_ico2', `${name}.spz`)],
-            ['msi', has(d, 'out_ico2_photo4', `${name}_msi_ktx2.glb`)]];
+            ['msi', has(d, 'out_ico2_photo4', `${name}_msi_astc.glb`) || has(d, 'out_ico2_photo4', `${name}_msi_ktx2.glb`)]];
   }
   const o = dir(coll, 'output2');
   return [['splats', has(o, `${name}.ply`) && has(o, `${name}.json`)],
@@ -337,7 +339,7 @@ const photoNext = (mtime) => (Date.now() - mtime > 30 * 60e3 ? 'stalled' : 'buil
 function panoNext(coll, name) {
   let st = null;
   try { st = JSON.parse(fs.readFileSync(path.join(dir(coll, 'pano'), '.watch_status.json'), 'utf8')); } catch (e) {}
-  return st?.current === name ? 'building' : st?.failed?.includes(name) ? 'stalled' : 'queued';
+  return st?.current === name || st?.writing?.includes(name) ? 'building' : st?.failed?.includes(name) ? 'stalled' : 'queued';
 }
 function chipsHtml(states, pano) {
   if (!states) return '';

@@ -288,6 +288,25 @@ gsplat renders of the splats, me_small + `20260102_153205_63202`, 5 moved eyes, 
   `bake_mpi.py --mpionly --variant ad12sep`; gallery "Adaptive". 96 base bins x4 matched 128x4 with 13% less fill;
   128x2 / 64x4 cost 0.2 / 0.4 dB for -22% / -30% fill. 8-px cells: 2.6x quads, Quest 103 fps (quads, not fill,
   were the limit up to 21x fill on me_small). 32-px cells: 21.6x fill, still 120 Hz on me_small.
+- **Fast `ad12sep` (current recipe; the one above is now `ad12q`)**: the shop scene showed the cost: at the 10/15/30%
+  budgets (1.26-1.64x fill) the Quest ran 55/51/42 fps vs MPI-only 90 (itself at its limit there: ~90 at 120 Hz), i.e.
+  ~1.3x per fragment on top of the fill: the SEPA shader (two lookups; the parallax path's derivatives per fragment
+  and a matrix inverse per vertex ran even without parallax; now a lean shader when no quad has parallax). Fill per
+  dB is far better from **64 base planes** refined where flagged than from 128 (budget sweep, ASTC, dB over MPI-only
+  / fill vs MPI-only, shop | me_small | wide `20260102_153205_63202`):
+
+  | Recipe | shop | me_small | wide |
+  |---|---|---|---|
+  | 128 x4, 30%, SEPA (`ad12q`) | +0.64 / 1.64x | +2.1 / 1.60x | +2.0 / 2.12x |
+  | 128 x4, 30%, single texture (UNPREM) | +0.52 / 1.64x | +1.9 / 1.60x | |
+  | 128 x4, 5% / 10% | +0.30 / 1.14x, +0.39 / 1.26x | +0.81 / 1.13x, +0.98 / 1.23x | |
+  | 64 x2, 50% | +0.19 / 0.92x | +0.56 / 0.88x | -0.05 / 0.97x |
+  | **64 x3, 50% (`ad12sep`)** | **+0.66 / 1.13x** | **+1.15 / 1.02x** | **+0.65 / 1.18x** |
+  | 64 x4, 50% | +0.84 / 1.31x | +1.47 / 1.13x | +1.06 / 1.37x |
+  | 48 x4, no budget | +0.74 / 1.17x | +0.86 / 0.95x | |
+
+  64 planes alone lose 1.1-1.2 dB (0.67x fill); SEPA is worth only 0.1-0.2 dB over un-premultiplied single tiles
+  with ASTC, so `ad12sep` uses the plain one-lookup shader (MPI-only's cost per fragment). Bake ~5.7 s per scene.
 - **Compression artifacts**: premultiplied RGBA of ~10 stacked semi-transparent planes compresses 3.5x worse than
   opaque texels; the errors add up and show as 4x4 blocks on magnified half-res cells. `UNPREM=1` (un-premultiplied,
   spread colour) cut the KTX2 loss from 2.5 to 0.9 dB; `SEPA=1` (each plane's colour tile alpha 255 + alphas

@@ -15,4 +15,5 @@ for p in sys.argv[2:]:
         a_, b_ = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]; area += np.abs(a_[:, 0] * b_[:, 1] - a_[:, 1] * b_[:, 0]).sum() / 2
         nq += len(g["F"]) // 2; tex[id(g["tex"])] = g["tex"].shape[0] * g["tex"].shape[1]
     print(f"{os.path.basename(p):40s} fill {area / (W * H):5.2f}x  quads {nq / 1e3:6.0f}k  pages {sum(tex.values()) / 1e6:5.0f}M texels  "
-          f"ktx2 {os.path.getsize(p.replace('.glb', '_ktx2.glb')) / 2**20:4.0f} MB")
+          + "  ".join(f"{k} {os.path.getsize(p.replace('.glb', f'_{k}.glb')) / 2**20:4.0f} MB" for k in ("ktx2", "astc")
+                     if os.path.exists(p.replace('.glb', f'_{k}.glb'))))

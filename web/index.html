@@ -908,6 +908,27 @@
             child.renderOrder = 100 - Number(k[1]);
             return;
           }
+          // SEPA without PARALLAX (every shCh.y = 0): a lean shader, the colour and the plane's alpha channel only (the
+          // parallax one below costs derivatives per fragment and a matrix inverse per vertex: ~1/3 slower on the Quest).
+          const parallax = shared && geom.getAttribute('uv2').array.some((v, i) => i % 2 === 1 && v > 0);
+          if (shared && !parallax) {
+            child.material = new THREE.ShaderMaterial({
+              uniforms: { map: { value: map }, lodBias: { value: hasMips ? layerLodBias : 0.0 } },
+              vertexShader: 'attribute vec2 shUv; attribute vec2 shCh; varying vec2 vUv; varying vec2 vUv2; ' +
+                'varying vec4 vSel; void main() { vUv = uv; vUv2 = shUv; ' +
+                'vSel = shCh.x < -0.5 ? vec4(-1.0) : vec4(equal(vec4(shCh.x), vec4(0.0, 1.0, 2.0, 3.0))); ' +
+                'gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+              fragmentShader: 'uniform sampler2D map; uniform float lodBias; varying vec2 vUv; varying vec2 vUv2; ' +
+                'varying vec4 vSel; void main() { vec4 c = texture2D(map, vUv, lodBias); ' +
+                'if (vSel.x < -0.5) { ' + plainOut + ' return; } ' +
+                'float a = dot(texture2D(map, vUv2, lodBias), vSel); gl_FragColor = vec4(c.rgb * a, a); }',
+              side: THREE.DoubleSide, transparent: true, depthWrite: false,
+              blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+              blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+            });
+            child.renderOrder = 100 - Number(k[1]);
+            return;
+          }
           child.material = new THREE.ShaderMaterial({
             uniforms: { map: { value: map }, lodBias: { value: hasMips ? layerLodBias : 0.0 },
                         // identity depth warp until depthWarp.attach() shares its uniforms

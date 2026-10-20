@@ -409,7 +409,7 @@
         <button type="button" data-lod="mpi" title="Hybrid mesh + the remaining splats as a sparse multi-plane image (scripts/bake_mpi.py); falls back to the original splats when not baked">Hybrid-MPI</button>
         <button type="button" data-lod="mpionly" title="All splats as a sparse multi-plane image, no mesh (scripts/bake_mpi.py --mpionly)">MPI-only</button>
         <button type="button" data-lod="surf" title="MPI-only made of connected surface pieces instead of depth slices: smoother up close, lighter (SURF=1 bake)">MPI-surf</button>
-        <button type="button" data-lod="ad12sep" title="MPI-only with 4x finer planes where stacking shows and colour and alpha in separate tiles: fewer stacking artifacts, more fill (bake_mpi.py --mpionly --variant ad12sep); falls back to the original splats when not baked">Adaptive</button>
+        <button type="button" data-lod="ad12sep" title="MPI-only with 64 base planes, 3x finer where stacking shows: fewer stacking artifacts at about MPI-only speed (bake_mpi.py --mpionly --variant ad12sep); falls back to the original splats when not baked">Adaptive</button>
       </div>
     </div>
     <div class="opt-group" title="Texture files of the MPI views: Auto = plain ASTC (_astc.glb) where the GPU supports it (Quest, Mac, phones), else Basis UASTC (_ktx2.glb), else PNG; UASTC = the _ktx2.glb files (older bakes); PNG = uncompressed">

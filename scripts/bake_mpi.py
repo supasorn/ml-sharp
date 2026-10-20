@@ -50,10 +50,14 @@ MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "REFINE": "1",
            "EXPORT_KTX2": "1", "KTX2_UASTC": "0", "KTX2_ASTC": "fast", "CULL_SCALE": "0.25", "CULL_EYES": "9",
            "KTX2_ZSTD": "9", "EXPORT": "_mpi", "EVAL": "0"}
 # --variant (with --mpionly): extra settings of an MPI-only variant bake, written as <name>_mpionly_<variant>.glb
-# (viewer ?lod=<variant>). ad12sep: 4x finer planes where stacking shows (threshold 12), un-premultiplied colour and
-# alpha in separate tiles (KTX2-friendly); ~40 s per scene on a GB10 (plain MPI-only: ~20 s).
-VARIANTS = {"ad12sep": {"ADAPT": "4", "ADAPT_T": "12", "ADAPT_W": "6", "ADAPT_N": "2", "UNPREM": "1", "SEPA": "1",
-                        "MAXPAGES": "6"}}
+# (viewer ?lod=<variant>). ad12sep: 64 base planes, 3x finer where stacking shows (threshold 12) in at most 50% of
+# the cells, un-premultiplied colour: about MPI-only's fill and per-fragment cost (Quest speed), +0.6-1.2 dB.
+# ad12q: the earlier recipe (128 planes, 4x finer in at most 30% of the cells, colour and alpha in separate tiles):
+# +2 dB but 1.6-2.1x the fill and a two-texture shader (shop scene 42 fps vs 90).
+VARIANTS = {"ad12sep": {"BINS": "64", "ADAPT": "3", "ADAPT_T": "12", "ADAPT_W": "6", "ADAPT_N": "2",
+                        "ADAPT_BUDGET": "0.5", "UNPREM": "1", "MAXPAGES": "6"},
+            "ad12q": {"ADAPT": "4", "ADAPT_T": "12", "ADAPT_W": "6", "ADAPT_N": "2", "ADAPT_BUDGET": "0.3",
+                      "UNPREM": "1", "SEPA": "1", "MAXPAGES": "6"}}
 
 
 def scene_plys(folder: Path, names):

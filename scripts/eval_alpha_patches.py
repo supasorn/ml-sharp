@@ -120,6 +120,9 @@ ADAPT_T = float(os.environ.get("ADAPT_T", 25))
 ADAPT_N = int(os.environ.get("ADAPT_N", 8))
 ADAPT_D = int(os.environ.get("ADAPT_D", 0))                   # strip-edge px per cell flagging it alone (0 = off)
 ADAPT_W = int(os.environ.get("ADAPT_W", 2))                   # contrast window radius (render px)
+# ADAPT_BUDGET: at most this fraction of cells refined (0 = no limit): above it, the cells with the most textured strip
+# edges keep the finer bins (busy scenes flagged 60%+ of their cells: 2x fill, 8 atlas pages, ~22 fps on the Quest)
+ADAPT_BUDGET = float(os.environ.get("ADAPT_BUDGET", 0))
 # LDI=1 (MPI, not SURF): layered depth image. A front layer (per pixel, the slices composited near to far until
 # LDI_OPAQUE opaque) on one continuous grid mesh (a vertex every LDI_STEP render px on the median-depth map),
 # cut only where its depth jumps by more than LDI_CUT parallax px at MOVE; MPI-only slices behind it for
@@ -253,7 +256,7 @@ SNAP_TAG = ((f"n{TILE_NEAR}-{NEAR_M:g}" if TILE_NEAR else "") + (f"f{TILE_FAR}-{
             + (f"s{SNAP_WHERE[0]}{SNAP_VALUE[0]}{SNAP_BOX if SNAP_VALUE == 'point' else ''}" if SNAP else "")
             + (f"B{BEND:g}-{BEND_TOL:g}" if BEND and not SURF else "")
             + ("G" if GAPCOPY and not SURF else "") + ("X" if PARALLAX else "") + (f"LW{LCT_MAX}" if LCW and not SURF else f"LT{LCT_MAX}" if LCT and not SURF else "LC" if LCOL and not SURF else "")
-            + (f"A{ADAPT}t{ADAPT_T:g}n{ADAPT_N}w{ADAPT_W}d{ADAPT_D}" + ("s" if ADAPT_SHARE else "") + (f"c{SHARE_COLOR}" if SHARE_COLOR else "") if ADAPT and not SURF else "")
+            + (f"A{ADAPT}t{ADAPT_T:g}n{ADAPT_N}w{ADAPT_W}d{ADAPT_D}" + (f"b{ADAPT_BUDGET:g}" if ADAPT_BUDGET else "") + ("s" if ADAPT_SHARE else "") + (f"c{SHARE_COLOR}" if SHARE_COLOR else "") if ADAPT and not SURF else "")
             + (f"L{LDI_STEP}c{LDI_CUT:g}t{LDI_THICK:g}" if LDI and not SURF else "")
             + ("R" + os.path.basename(os.environ["SURF_REGION"]).split(".")[0] if SURF_REGION is not None else "")
             + (f"S{SURF_SPAN}g{SURF_GAP}j{SURF_JOIN:g}" + (f"v{SURF_VIS:g}" if SURF_VIS else "") + ("a" if SURF_ALIGN else "") + f"f{SURF_FILL}" + (f"L{SURF_LINK:g}" if SURF_LINK_PLANE else "") + (f"o{OVERLAP:g}" if OVERLAP else "") + ("c" if SURF_GROUP == "chain" else "") + (f"x{SURF_SPLIT:g}-{SURF_SPLIT_GAIN:g}" if SURF_SPLIT else "") + (f"M{SURF_MAXMOVE:g}" if SURF_MAXMOVE else "") + (f"J{SURF_JOIN_VIS:g}" if SURF_JOIN_VIS < 1 else "") + (f"D{SURF_DMAP:g}-{SURF_DMAP_GAP:g}" if SURF_DMAP else "") + (f"H{SURF_HYBRID:g}" if SURF_HYBRID else "") + ("V" + "-".join(f"{j:g}" for j in SURF_VG_JOINS) + (f"m{SURF_VG_MARGIN:g}" if SURF_VG_MARGIN else "") if SURF_VISGLUE else "") if SURF else ""))
@@ -1189,7 +1192,22 @@ def run(scene: Path):
             if ADAPT_D:                                       # or dense strip edges (a steep surface), any contrast
                 dens = torch.nn.functional.pad(E.float(), (0, nx * cell - Wc, 0, ny * cell - Hc)).reshape(ny, cell, nx, cell).sum((1, 3))
                 flag = flag | (dens >= ADAPT_D)
-            flag = torch.nn.functional.max_pool2d(flag.float()[None, None], 3, 1, 1)[0, 0] > 0
+            grow = lambda f_: torch.nn.functional.max_pool2d(f_.float()[None, None], 3, 1, 1)[0, 0] > 0
+            flag = grow(flag)
+            if ADAPT_BUDGET > 0 and flag.float().mean().item() > ADAPT_BUDGET:
+                # raise the strip-edge count needed until the grown flags fit the budget (binary search)
+                vals = torch.unique(cnt[cnt >= ADAPT_N]).tolist()
+                lo_i, hi_i = 0, len(vals)                 # answer in (lo_i, hi_i]: vals[hi_i - 1] .. none
+                while lo_i < hi_i:
+                    mid = (lo_i + hi_i) // 2
+                    if grow(cnt >= vals[mid]).float().mean().item() <= ADAPT_BUDGET:
+                        hi_i = mid
+                    else:
+                        lo_i = mid + 1
+                n_need = vals[hi_i] if hi_i < len(vals) else float("inf")
+                flag = grow(cnt >= n_need)
+                print(f"  adaptive: over the budget ({ADAPT_BUDGET:.0%}): cells need {n_need} textured strip-edge px",
+                      flush=True)
             BF = BINS * ADAPT
             edges_f = lo + np.arange(1, BF) / BF * (hi - lo)
             centers_f = lo + (np.arange(BF) + 0.5) / BF * (hi - lo)

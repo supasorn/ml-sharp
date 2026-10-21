@@ -205,3 +205,27 @@ One panorama went from ~240 s to ~100 s (`R0011227`, 20 ico views, splats bit-id
   default (hotel_room +0.2 / +0.1 / +0.3 dB vs mono, R0011227 within 0.08 dB, ~2 s faster).
 Timings (GB10): predict + spz 38 s (was 138 + 6), MSI 19-21 s (was 91), files written alongside the next
 panorama: ~60 s per panorama in a batch (was ~240), ~75 s for the first (model load, imports).
+
+## 360 depth instead of stitching (UniK3D, experiment, 2026-10-21)
+
+The stitched pass-1 depth fixes only one scale per view, but perspective monodepth gets each view's *shape* wrong
+in its own way (tilts, bends), so straight or flat things come out piecewise: on `R0010963_20160720193830_78855`
+a straight railing ~1 m away became three pieces at different angles, with a ~30 cm jump and an S-kink at the
+view 13 -> 11/17 boundary (top-down plot of the stitched distance along the rail).
+
+`pano_predict.py --depth unik3d` replaces the stitched map with **UniK3D** (Piccinelli et al., CVPR 2025; ViT-L;
+**CC BY-NC 4.0**): one prediction for the whole equirect (`Spherical` camera `[1, 1, 1, 1, W, H, pi, pi/2]`,
+2048x1024), 2.4 s (+29 s model load once per process) vs ~10 s for the 20 views. Pass 1 still runs SHARP's
+monodepth (pass 2 reuses its features); pass 2 aligns to the UniK3D distance. Result on the railing panorama: the
+depth map is coherent (table a smooth gradient instead of per-view lobes, the near forearm one shape, the ceiling
+fan resolved) and the rail in the final splats is straight, with two ~10 cm steps left at SHARP view boundaries
+(pass-2 alignment, Voronoi ownership).
+
+Setup (outside the repo): `git clone https://github.com/lpiccinelli-eth/UniK3D ~/.local/opt/UniK3D` (no
+`pip install -e`: it would change torch); `pip install einops tabulate termcolor` in `sharp_dgx`; its training code
+imports `wandb` and `pkg_resources` (gone from recent setuptools, which gsplat's build needs): empty stand-ins in
+`~/.local/opt/unik3d_stubs/`. `UNIK3D_HOME` overrides the location. Weights: `lpiccinelli/unik3d-vitl` (Hugging
+Face). Depth Any Camera (CVPR 2025, MIT) was the alternative: smaller indoor/outdoor models, torch 1.13 pins.
+
+Not the watcher's default yet: the railing panorama has the experiment as MSI variant `out_uk_photo4` ("UniK3D
+depth (photo detail v4)", `?pvariant=out_uk_photo4`) next to the default `out_ico2_photo4`.

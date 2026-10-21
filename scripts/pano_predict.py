@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import time
 from pathlib import Path
 
@@ -173,6 +174,33 @@ def predict_aligned(model, image, disparity_factor: float, depth: torch.Tensor |
 # ---------------------------------------------------------------- depth stitching
 
 
+# ---------------------------------------------------------------- 360 depth (UniK3D)
+
+UNIK3D_HOME = Path(os.environ.get("UNIK3D_HOME", Path.home() / ".local/opt/UniK3D"))
+_UNIK3D = {}
+
+
+def unik3d_distance(pano: np.ndarray, eq_w: int, device) -> torch.Tensor:
+    """Distance map (eq_w / 2, eq_w) of the whole panorama from UniK3D (CVPR 2025, ViT-L; CC BY-NC 4.0), one 360
+    prediction: no per-view shape disagreements to stitch (the 20 views' monodepth gave flat or straight surfaces
+    piecewise, e.g. a railing in three pieces at different angles). Code in UNIK3D_HOME (git clone of
+    lpiccinelli-eth/UniK3D; imports wandb / pkg_resources only for training: stand-ins in <UNIK3D_HOME>_stubs)."""
+    import sys
+    if "model" not in _UNIK3D:
+        for p_ in (UNIK3D_HOME, Path(str(UNIK3D_HOME) + "_stubs"), UNIK3D_HOME.parent / "unik3d_stubs"):
+            if p_.is_dir() and str(p_) not in sys.path:
+                sys.path.append(str(p_))
+        from unik3d.models import UniK3D
+        _UNIK3D["model"] = UniK3D.from_pretrained("lpiccinelli/unik3d-vitl").to(device).eval()
+    from unik3d.utils.camera import Spherical
+    eq_h = eq_w // 2
+    rgb = torch.from_numpy(cv2.resize(pano, (eq_w, eq_h), interpolation=cv2.INTER_AREA)).permute(2, 0, 1).to(device)
+    cam = Spherical(params=torch.tensor([1.0, 1.0, 1.0, 1.0, eq_w, eq_h, math.pi, math.pi / 2]))
+    with torch.no_grad():
+        pts = _UNIK3D["model"].infer(rgb, cam)["points"][0].float()          # (3, H, W), same pixels as the input
+    return pts.norm(dim=0).clamp(min=0.05)
+
+
 def weighted_median(x: torch.Tensor, w: torch.Tensor) -> float:
     order = torch.argsort(x)
     cw = torch.cumsum(w[order], 0)
@@ -315,8 +343,14 @@ def run(args):
         depths, mono_outs = zip(*[monodepth(model, v, factor) for v in views])
     depths = [z.float() for z in depths]
     eq_w = args.depth_width
-    logd, s, stats = stitch_depth(depths, rots, f, size, eq_w, eq_w // 2, device)
-    LOGGER.info("depth stitch: %s", json.dumps(stats))
+    if args.depth == "unik3d":                 # one 360 prediction; pass 1 still gives pass 2 its monodepth features
+        logd = torch.log(unik3d_distance(pano, eq_w, device))
+        stats = {"depth": "unik3d"}
+        LOGGER.info("depth: UniK3D 360, distance %.2f .. %.2f m (median %.2f)", *torch.exp(logd).quantile(
+            torch.tensor([0.001, 0.999, 0.5], device=device)).tolist())
+    else:
+        logd, s, stats = stitch_depth(depths, rots, f, size, eq_w, eq_w // 2, device)
+        LOGGER.info("depth stitch: %s", json.dumps(stats))
     dist = torch.exp(logd)
     np.save(out / f"{name}_dist.npy", dist.cpu().numpy())
     vis = (1 / dist).cpu().numpy()
@@ -379,6 +413,9 @@ def main(argv=None):
     p.add_argument("--fov", type=float, default=None, help="View FOV in degrees (default per layout).")
     p.add_argument("--checkpoint", default="sharp_2572gikvuh.pt")
     p.add_argument("--depth-width", type=int, default=2048, help="Stitched distance map width.")
+    p.add_argument("--depth", choices=["stitch", "unik3d"], default="stitch",
+                   help="the 360 distance map pass 2 aligns to: the 20 views' monodepth stitched, or UniK3D on the "
+                        "whole panorama (see unik3d_distance)")
     p.add_argument("--no-align", action="store_true", help="Skip pass 2 alignment (baseline).")
     p.add_argument("--min-opacity", type=float, default=0.0)
     p.add_argument("--no-spz", action="store_true", help="don't also write <name>.spz (scripts/pano_spz.py)")

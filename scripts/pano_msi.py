@@ -421,6 +421,7 @@ def run(args, writer=None):
     pages.append(cur)
 
     out_glb = Path(args.output or ply.parent) / f"{ply.stem}_msi.glb"
+    out_glb.parent.mkdir(parents=True, exist_ok=True)
     meshes, texels = [], 0
     for pg, ids in enumerate(pages):
         img = np.zeros((PAGE, PAGE, 4), np.uint8)

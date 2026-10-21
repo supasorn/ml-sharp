@@ -66,6 +66,7 @@ function sortedSceneNames(outDir) {
 // MSI variants, best first: the viewer shows the first one a pano has (the others are selectable).
 const PANO_VARIANTS = [
   { id: 'out_ico2_photo4', label: 'Photo detail v4' },
+  { id: 'out_uk_photo4', label: 'UniK3D depth (photo detail v4)' },   // experiment: 360 depth instead of stitching
   { id: 'out_ico2_photo2', label: 'Photo detail v2' },
   { id: 'out_ico2_photo3', label: 'Photo detail v3 (dark specks)' },
   { id: 'out_ico2_hires', label: 'High-res' },

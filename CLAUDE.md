@@ -35,6 +35,10 @@ Quick facts:
 - Keep AR on three's stock `ARButton` (dom-overlay) or the Quest switches to
   roomscale.
 - Work on `main` (the `quest-xr-hybrid` work was merged into it); commit/push when asked.
+- MPI-only variants (`bake_mpi.py --mpionly --variant X`, viewer `?lod=X`, gallery buttons): `ad12sep` (adaptive
+  planes), `photo` / `photo2` (the photo's lost detail painted back, 2048 px / photo resolution; baked for all public
+  scenes), `people` (finer planes on people: baked on request, gallery "People" toggle -> `POST /request` -> the
+  MPI-only watcher). Findings doc §4c.
 - 360 panoramas (equirect -> splats -> multi-sphere image; in the main gallery/viewer as
   `pano:<name>`, also a separate comparison viewer
   `node scripts/pano_server.js` on 3100/3543, data in git-ignored `pano/`): `docs/pano-360.md`.

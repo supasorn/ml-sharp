@@ -50,7 +50,10 @@ import eval_alpha_surfaces as s1  # noqa: E402
 import eval_alpha_surfaces2 as s2  # noqa: E402
 from eval_alpha_layers import cast, dev, psnr, raster, splat_tensors  # noqa: E402
 
-GW, SS = int(os.environ.get("GW", ev.GW)), ev.SS   # GW: render grid width (render px = GW * SS across the photo)
+# GW: render grid width (render px = GW * SS across the photo); GW=auto: the photo's own resolution (at least ev.GW,
+# at most 2048, i.e. 4096 px) with TILE scaled alike (multiple of 4), so the cell count stays that of TILE 16 at GW 1024.
+GW_AUTO = os.environ.get("GW") == "auto"
+GW, SS = (ev.GW if GW_AUTO else int(os.environ.get("GW", ev.GW))), ev.SS
 TILE = int(os.environ.get("TILE", 16))
 PX = float(os.environ.get("PX", 0.5))
 MOVE = float(os.environ.get("MOVE", 0.3))
@@ -133,6 +136,11 @@ ADAPT_W = int(os.environ.get("ADAPT_W", 2))                   # contrast window 
 # ADAPT_BUDGET: at most this fraction of cells refined (0 = no limit): above it, the cells with the most textured strip
 # edges keep the finer bins (busy scenes flagged 60%+ of their cells: 2x fill, 8 atlas pages, ~22 fps on the Quest)
 ADAPT_BUDGET = float(os.environ.get("ADAPT_BUDGET", 0))
+# ADAPT_MASK=people: flag the cells covering people instead of the strip-edge detector: Mask R-CNN (torchvision) on the
+# photo, the mask grown by ADAPT_MASK_GROW x the photo width (hair, silhouette) and then by one cell; saved as
+# <EXPORT_DIR>/<scene>_people.png. Any other value: a mask image (white = refine) at the photo's size.
+ADAPT_MASK = os.environ.get("ADAPT_MASK", "")
+ADAPT_MASK_GROW = float(os.environ.get("ADAPT_MASK_GROW", 0.01))
 # LDI=1 (MPI, not SURF): layered depth image. A front layer (per pixel, the slices composited near to far until
 # LDI_OPAQUE opaque) on one continuous grid mesh (a vertex every LDI_STEP render px on the median-depth map),
 # cut only where its depth jumps by more than LDI_CUT parallax px at MOVE; MPI-only slices behind it for
@@ -426,6 +434,40 @@ _PLY_T = {"float": "f4", "float32": "f4", "double": "f8", "uchar": "u1", "uint8"
           "ushort": "u2", "short": "i2", "uint": "u4", "uint32": "u4", "int": "i4", "int32": "i4"}
 
 
+def load_photo(photo, W, H):
+    """The scene's photo as a W x H RGB PIL image, EXIF-rotated or not, whichever matches SHARP's width / height;
+    None (with a message) if neither does."""
+    from PIL import Image, ImageOps
+    im = Image.open(photo)
+    im = min((ImageOps.exif_transpose(im), im), key=lambda x: abs(x.width / x.height - W / H))
+    if abs(im.width / im.height - W / H) > 0.01 * W / H:
+        print(f"  {Path(photo).name} is {im.width}x{im.height}, the scene {W}x{H}: not used", flush=True)
+        return None
+    return im.convert("RGB").resize((W, H), Image.LANCZOS)
+
+
+_PEOPLE_MODEL = []
+
+
+def people_mask(im):
+    """Person pixels (H, W bool tensor) of a PIL image: Mask R-CNN v2 (torchvision, COCO), instances scoring > 0.5,
+    mask > 0.5. The model loads once per process (the bake worker)."""
+    import torchvision
+    from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
+    if not _PEOPLE_MODEL:
+        _PEOPLE_MODEL.append(maskrcnn_resnet50_fpn_v2(weights=MaskRCNN_ResNet50_FPN_V2_Weights.DEFAULT).eval().to(dev))
+    with torch.no_grad():
+        o = _PEOPLE_MODEL[0]([torchvision.transforms.functional.to_tensor(im).to(dev)])[0]
+    keep = (o["labels"] == 1) & (o["scores"] > 0.5)
+    if not keep.any():
+        return torch.zeros(im.height, im.width, dtype=torch.bool, device=dev), 0
+    return (o["masks"][keep, 0] > 0.5).any(0), int(keep.sum())
+
+
+def photo_path(scene, meta):
+    return PHOTO or str(Path(EXPORT_DIR or scene.parent).parent / "images" / meta["image"])
+
+
 def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H):
     """PHOTO_DETAIL: the residual photo - composite (from the photo's camera, at render resolution), put onto each
     pixel's dominant surface: the bins within PD_BAND relative disparity (>= 1.5 bins) of the bin with the largest
@@ -433,9 +475,10 @@ def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H):
     rims, whose painted colour would slide off the object as the eye moves (halos; docs/pano-360.md). Spread over
     the surface's bins in proportion to their alpha, i.e. the surface's colour shifts by D / its weight.
     Returns apply(k, rgb, a) -> bin k's premultiplied rgb with the detail (clamped to a valid colour)."""
-    from PIL import Image, ImageOps
     F_ = torch.nn.functional
-    im = ImageOps.exif_transpose(Image.open(photo)).convert("RGB").resize((W, H), Image.LANCZOS)
+    im = load_photo(photo, W, H)
+    if im is None:
+        return None
     P = torch.zeros(Hc, Wc, 3, device=dev)
     P[MARGIN:MARGIN + H, MARGIN:MARGIN + W] = torch.from_numpy(np.asarray(im)).to(dev).float() / 255
     inside = torch.zeros(Hc, Wc, device=dev, dtype=torch.bool)
@@ -926,9 +969,13 @@ def surface_pieces(surf_l, crops, crops_b, rect_l, cen_l, cd_l, cell, nx, lo, hi
 
 
 def run(scene: Path):
-    global T0
+    global T0, GW, TILE
     t0 = T0 = time.time()
     meta = json.loads(scene.with_suffix(".json").read_text())
+    if GW_AUTO:
+        GW = max(ev.GW, min(int(meta["width"]) // SS, 2048))
+        TILE = 4 * max(1, round(4 * GW / ev.GW))
+        print(f"  GW auto: {GW} ({GW * SS} px across), TILE {TILE}", flush=True)
     Hg = int(round(GW * meta["height"] / meta["width"]))
     fg = meta["focal_length_px"] * GW / meta["width"]
     W, H, f = GW * SS, Hg * SS, fg * SS
@@ -1279,6 +1326,22 @@ def run(scene: Path):
                 flag = grow(cnt >= n_need)
                 print(f"  adaptive: over the budget ({ADAPT_BUDGET:.0%}): cells need {n_need} textured strip-edge px",
                       flush=True)
+            if ADAPT_MASK:                                # people (or a given mask) instead of the detector
+                from PIL import Image
+                if ADAPT_MASK == "people":
+                    im_ = load_photo(photo_path(scene, meta), W, H)
+                    pm, npeople = people_mask(im_) if im_ is not None else (torch.zeros(H, W, dtype=torch.bool, device=dev), 0)
+                    Image.fromarray(pm.cpu().numpy().astype(np.uint8) * 255).save(
+                        Path(EXPORT_DIR or scene.parent) / f"{scene.stem}_people.png")
+                    print(f"  people: {npeople} found, {pm.float().mean().item():.1%} of the photo", flush=True)
+                else:
+                    pm = torch.from_numpy(np.asarray(Image.open(ADAPT_MASK).convert("L").resize((W, H))) > 127).to(dev)
+                mfull = torch.zeros(Hc, Wc, device=dev)
+                mfull[MARGIN:MARGIN + H, MARGIN:MARGIN + W] = pm.float()
+                r_ = max(1, round(ADAPT_MASK_GROW * W))
+                mfull = torch.nn.functional.max_pool2d(mfull[None, None], 2 * r_ + 1, 1, r_)[0, 0]
+                mpad = torch.nn.functional.pad(mfull, (0, nx * cell - Wc, 0, ny * cell - Hc))
+                flag = grow(mpad.reshape(ny, cell, nx, cell).amax((1, 3)) > 0)
             BF = BINS * ADAPT
             edges_f = lo + np.arange(1, BF) / BF * (hi - lo)
             centers_f = lo + (np.arange(BF) + 0.5) / BF * (hi - lo)
@@ -1392,8 +1455,11 @@ def run(scene: Path):
         pd_apply = None
         if PHOTO_DETAIL:
             assert FASTWIN and not ADAPT, "PHOTO_DETAIL needs plain MPI-only bins"
-            photo = PHOTO or str(Path(EXPORT_DIR or scene.parent).parent / "images" / meta["image"])
-            pd_apply = photo_detail_mpi(photo, kept, passes_[0][0], passes_[0][1], Kc, Wc, Hc, W, H)
+            photo = photo_path(scene, meta)
+            if Path(photo).exists():
+                pd_apply = photo_detail_mpi(photo, kept, passes_[0][0], passes_[0][1], Kc, Wc, Hc, W, H)
+            else:
+                print(f"  photo detail: {photo} not found: skipped", flush=True)
             tick("photo detail")
         tick("adaptive detection (and earlier)")
         lvl_prev = 0

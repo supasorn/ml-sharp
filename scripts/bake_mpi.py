@@ -57,7 +57,17 @@ MPI_ENV = {"MPI": "1", "BINS": "128", "TILE": "16", "TEXDS": "2", "REFINE": "1",
 VARIANTS = {"ad12sep": {"BINS": "64", "ADAPT": "3", "ADAPT_T": "12", "ADAPT_W": "6", "ADAPT_N": "2",
                         "ADAPT_BUDGET": "0.5", "UNPREM": "1", "MAXPAGES": "6"},
             "ad12q": {"ADAPT": "4", "ADAPT_T": "12", "ADAPT_W": "6", "ADAPT_N": "2", "ADAPT_BUDGET": "0.3",
-                      "UNPREM": "1", "SEPA": "1", "MAXPAGES": "6"}}
+                      "UNPREM": "1", "SEPA": "1", "MAXPAGES": "6"},
+            # photo / photo2: the photo's detail the splats lost, put back onto opaque surfaces (PHOTO_DETAIL), at the
+            # usual 2048 px across or at the photo's own resolution (GW auto, up to 4096 px; same quad count)
+            "photo": {"PHOTO_DETAIL": "1", "MAXPAGES": "8", "TEXFULL_THR": "0.0015"},
+            "photo2": {"PHOTO_DETAIL": "1", "GW": "auto", "MAXPAGES": "12", "TEXFULL_THR": "0.0015"},
+            # people: 4x finer planes only on the cells covering people (Mask R-CNN on the photo, grown to cover
+            # the silhouette), plain MPI-only elsewhere; baked on request (gallery "People" toggle, see watch())
+            "people": {"ADAPT": "4", "ADAPT_MASK": "people", "UNPREM": "1", "MAXPAGES": "6"}}
+# Variants the gallery may request for a scene (<collection>/renderings/requests/<scene>.<variant>, written by web.js):
+# the watcher bakes them before anything else and removes the request (renamed .failed if the bake fails).
+REQUESTABLE = ("people",)
 
 
 def scene_plys(folder: Path, names):
@@ -80,11 +90,14 @@ class Worker:
     def _read(self):
         for line in self.p.stdout:
             kind, _, rest = line.rstrip("\n").partition(" ")
-            ply, _, msg = rest.partition(" ")
+            # the ply path may contain spaces ("x~2 (2).ply"): match it against the scenes being waited for
+            # (splitting at the first space lost such a scene's answer and its bake waited forever)
             with self.lock:
+                ply = next((k for k in self.waiting if rest == k or rest.startswith(k + " ")), None)
                 w = self.waiting.get(ply)
             if w is None:
                 continue
+            msg = rest[len(ply) + 1:]
             if kind == "gpu-done":
                 w[0].set()
             else:
@@ -185,7 +198,28 @@ def watch(args):
     oom = {}                                                   # key -> (retries so far, retry not before)
     print(f"watching {args.input} for {'MPI-only' if args.mpionly else 'MPI-only + Hybrid-MPI'} "
           f"(GPU {gpu}, every {args.poll:.0f} s)", flush=True)
+    reqdir = args.work.parent / "requests"
     while True:
+        if args.mpionly and reqdir.is_dir():
+            for req in sorted(reqdir.iterdir(), key=lambda q: q.stat().st_mtime):
+                name, _, variant = req.name.rpartition(".")
+                ply = args.input / f"{name}.ply"
+                if variant not in REQUESTABLE or not ply.exists():
+                    continue
+                t0 = time.time()
+                saved = args.variant, args.overwrite
+                args.variant, args.overwrite = variant, True
+                try:
+                    with open(args.work / f"{name}{out_suffix(args, True)}.log", "w") as log:
+                        status = bake(ply, gpu, args, log)
+                    req.unlink(missing_ok=True)
+                    print(f"{time.strftime('%H:%M:%S')} {name} {variant} (requested): {status} in {time.time() - t0:.0f}s",
+                          flush=True)
+                except (subprocess.CalledProcessError, OSError) as e:
+                    req.replace(req.with_name(req.name + ".failed"))
+                    print(f"{time.strftime('%H:%M:%S')} {name} {variant} (requested): FAILED ({e})", flush=True)
+                finally:
+                    args.variant, args.overwrite = saved
         for mpionly in ((True,) if args.mpionly else (True, False)):
             for ply in scene_plys(args.input, set()):
                 sfx = out_suffix(args, mpionly)

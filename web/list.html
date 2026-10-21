@@ -88,6 +88,14 @@
       background: #990000 !important;
       box-shadow: 0 2px 12px rgba(255, 0, 0, 0.10);
     }
+    /* People mode: a click asks for the people bake instead of opening the scene. */
+    .scene-item.people-pick {
+      background: #1d4f91 !important;
+      box-shadow: 0 2px 12px rgba(79, 140, 255, 0.25);
+      cursor: crosshair;
+    }
+    /* People mode: photos already processed (or queued) are not offered again. */
+    .scene-item.people-done { opacity: 0.45; pointer-events: none; }
 
     .scene-item a {
       padding: 5px;
@@ -408,6 +416,11 @@
     <span class="slider"></span>
   </label>
   <span class="toggle-label" id="toggleDeleteLabel">Delete: Off</span>
+  <label class="toggle-switch" title="Click photos to have them processed for the People view: finer planes on the people in the photo (takes ~20 s each; a chip shows progress)">
+    <input type="checkbox" id="togglePeople">
+    <span class="slider"></span>
+  </label>
+  <span class="toggle-label" id="togglePeopleLabel">People: Off</span>
   <div id="options">
     <div class="opt-group">
       <span class="opt-label">View</span>
@@ -418,6 +431,9 @@
         <button type="button" data-lod="mpionly" title="All splats as a sparse multi-plane image, no mesh (scripts/bake_mpi.py --mpionly)">MPI-only</button>
         <button type="button" data-lod="surf" title="MPI-only made of connected surface pieces instead of depth slices: smoother up close, lighter (SURF=1 bake)">MPI-surf</button>
         <button type="button" data-lod="ad12sep" title="MPI-only with 64 base planes, 3x finer where stacking shows: fewer stacking artifacts at about MPI-only speed (bake_mpi.py --mpionly --variant ad12sep); falls back to the original splats when not baked">Adaptive</button>
+        <button type="button" data-lod="people" title="MPI-only with 4x finer planes on the people in the photo (silhouette included), plain elsewhere; baked on request: turn on People and click a photo">People</button>
+        <button type="button" data-lod="photo" title="MPI-only with the photo's detail the splats lost painted back onto solid surfaces, textures up to 2048 px across (bake_mpi.py --mpionly --variant photo)">Photo detail</button>
+        <button type="button" data-lod="photo2" title="Photo detail at the photo's own resolution (up to 4096 px across): sharpest, ~3x the texture memory of MPI-only (bake_mpi.py --mpionly --variant photo2)">Photo detail (full res)</button>
       </div>
     </div>
     <div class="opt-group" title="Texture files of the MPI views: Auto = plain ASTC (_astc.glb) where the GPU supports it (Quest, Mac, phones), else Basis UASTC (_ktx2.glb), else PNG; UASTC = the _ktx2.glb files (older bakes); PNG = uncompressed">
@@ -743,9 +759,37 @@
       $('#presetFull').on('click', function () { setOpts(FULL_QUALITY); });
       $('#presetSmooth').on('click', function () { setOpts(SMOOTH); });
 
+      // People switch: clicking a photo requests its people bake (POST /request). Kept on across the page's
+      // reloads (the gallery reloads when a chip changes), so several photos can be picked in a row.
+      function setPeopleMode(on) {
+        $('#togglePeople').prop('checked', on);
+        $('#togglePeopleLabel').text(on ? 'People: On' : 'People: Off');
+        // already baked (its view modes include "people") or queued (a "people" chip, unless failed: retry allowed)
+        const done = $('.scene-item').filter(function () {
+          return (($(this).data('modes') || '') + '').split(' ').includes('people')
+            || $(this).find('.chip:not(.stalled)').filter(function () { return $(this).text().trim().endsWith('people'); }).length > 0;
+        });
+        $('.scene-item').not('.pano, .pending').not(done).toggleClass('people-pick', on);
+        done.not('.pano, .pending').toggleClass('people-done', on);
+        try { sessionStorage.setItem('peopleMode', on ? '1' : ''); } catch (e) {}
+        if (on && $('#toggleDelete').is(':checked')) $('#toggleDelete').prop('checked', false).trigger('change');
+      }
+      $('#togglePeople').on('change', function () { setPeopleMode($(this).is(':checked')); });
+      try { if (sessionStorage.getItem('peopleMode')) setPeopleMode(true); } catch (e) {}
+      $(document).on('click', '.scene-item.people-pick', function (e) {
+        e.preventDefault();
+        const m = $(this).find('a').attr('href').match(/scene=([^&]+)/);
+        if (!m) return;
+        const $item = $(this);
+        $.post('/request', { scene: decodeURIComponent(m[1]), variant: 'people' })
+          .done(() => { $item.removeClass('people-pick').addClass('people-done'); })
+          .fail((x) => alert('Could not queue it: ' + (x.responseJSON?.error || x.statusText)));
+      });
+
       // Toggle delete switch
       $('#toggleDelete').on('change', function() {
         if ($(this).is(':checked')) {
+          if ($('#togglePeople').is(':checked')) setPeopleMode(false);
           $('#toggleDeleteLabel').text('Delete: On');
           $('.scene-item').not('.pano').addClass('deletable');   // panoramas are managed in pano/
         } else {

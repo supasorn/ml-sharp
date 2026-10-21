@@ -650,7 +650,9 @@
     let mpivarCur = (getQueryParam('mpivar') || '').replace(/[^a-z0-9]/gi, '');   // ?mpivar (benchmarks switch it)
     const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
                         { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'mpionly', label: 'MPI-only' },
-                        { id: 'ad12sep', label: 'MPI adaptive' }, { id: 'surf', label: 'MPI-surf' }];
+                        { id: 'ad12sep', label: 'MPI adaptive' }, { id: 'surf', label: 'MPI-surf' },
+                        { id: 'photo', label: 'Photo detail' }, { id: 'photo2', label: 'Photo full-res' },
+                        { id: 'people', label: 'People' }];
     async function splatUrlFor(scene) {
       const full = `${sceneBase(scene)}.ply`;
       if (lodMode !== 'quest') return full;

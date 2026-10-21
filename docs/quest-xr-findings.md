@@ -307,6 +307,12 @@ gsplat renders of the splats, me_small + `20260102_153205_63202`, 5 moved eyes, 
 
   64 planes alone lose 1.1-1.2 dB (0.67x fill); SEPA is worth only 0.1-0.2 dB over un-premultiplied single tiles
   with ASTC, so `ad12sep` uses the plain one-lookup shader (MPI-only's cost per fragment). Bake ~5.7 s per scene.
+- **People** (`--variant people`: `ADAPT=4 ADAPT_MASK=people`, UNPREM): 4x finer planes only on the cells covering
+  people (torchvision Mask R-CNN v2 on the photo, instances > 0.5, mask grown by 1% of the photo width + one cell),
+  plain 128-bin MPI-only elsewhere; mask saved as `<scene>_people.png`. On request only: the gallery's People toggle
+  -> click a photo -> `POST /request` writes `<collection>/renderings/requests/<scene>.people`, which the MPI-only
+  watcher bakes first (~20-30 s; `.failed` on failure; chip "people" meanwhile). Mall `20260111_171635_95533`:
+  33 people, 14% of the photo, fill 7.3x -> 10.6x; `me_small` (person = half the photo) 8.9x -> 14.7x.
 - **Photo detail** (`PHOTO_DETAIL=1`, MPI-only plain bins; `photo_detail_mpi`): composite the bins from the photo's
   camera, put the residual photo - composite onto each pixel's front opaque surface (panorama v4 rules: opacity
   >= 0.95, eroded 2 px, spread over the surface's bins). 2.2 mm ultrawide `20260523_140013_30959`, input view vs

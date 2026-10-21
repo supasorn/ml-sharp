@@ -360,12 +360,48 @@ function buildCards(req) {
     cards.push({ key: `${p.coll}/${p.file}`, pending: p, states });
   }
   for (const s of allSceneEntries(visible(req))) {
-    const states = s.pano ? stageStates(buildStages(s.coll, s.name, true), panoNext(s.coll, s.name))
+    let states = s.pano ? stageStates(buildStages(s.coll, s.name, true), panoNext(s.coll, s.name))
       : stageStates(buildStages(s.coll, s.name, false), photoNext(s.mtime));
+    if (!s.pano) {                         // models baked on request (gallery "People"): a chip while asked for
+      for (const v of REQUESTABLE) {
+        const st = requestState(s.coll, s.name, v);
+        if (st) states = [...(states ?? buildStages(s.coll, s.name, false).map(([l]) => [l, 'done'])),
+                          [v, st === 'pending' ? (states ? 'queued' : 'building') : 'stalled']];
+      }
+    }
     if (states) cards.push({ key: s.id, scene: s, states });
   }
   return cards;
 }
+// Bakes the gallery can request for a scene (scripts/bake_mpi.py REQUESTABLE): <collection>/renderings/requests/
+// <name>.<variant>, which the MPI-only watcher bakes before anything else and removes (renamed .failed on failure).
+const REQUESTABLE = ['people'];
+const requestFile = (coll, name, v) => path.join(dir(coll, 'renderings'), 'requests', `${name}.${v}`);
+function requestState(coll, name, v) {
+  if (fs.existsSync(requestFile(coll, name, v))) return 'pending';
+  if (fs.existsSync(requestFile(coll, name, v) + '.failed')) return 'failed';
+  return null;
+}
+app.post('/request', express.urlencoded({ extended: true }), (req, res) => {
+  const s = parseId(req.body.scene);
+  const v = String(req.body.variant || '');
+  if (!s || s.pano || !REQUESTABLE.includes(v)) return res.status(400).send({ success: false, error: 'bad request' });
+  if (!allow(req, res, s.coll)) return;
+  const out = dir(s.coll, 'output2'), ply = path.join(out, `${s.name}.ply`);
+  if (!fs.existsSync(ply)) return res.status(404).send({ success: false, error: 'scene not predicted yet' });
+  const f = requestFile(s.coll, s.name, v);
+  if (fs.existsSync(f)) return res.status(409).send({ success: false, error: 'already queued' });
+  // Already baked from the current splats (and compressed, as the watcher counts it done): nothing to do.
+  const glb = path.join(out, `${s.name}_mpionly_${v}.glb`);
+  if (fs.existsSync(glb) && fs.statSync(glb).mtimeMs >= fs.statSync(ply).mtimeMs
+      && ['_astc', '_ktx2'].some((k) => fs.existsSync(glb.replace(/\.glb$/, `${k}.glb`)))) {
+    return res.status(409).send({ success: false, error: 'already processed' });
+  }
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  try { fs.unlinkSync(f + '.failed'); } catch (e) {}
+  fs.writeFileSync(f, new Date().toISOString() + '\n');
+  res.send({ success: true });
+});
 const buildKey = (cards) => cards.map((c) => `${c.key}:${c.states.map((x) => x[1]).join(',')}`).sort().join('|');
 app.get('/build-status', (req, res) => {
   try { res.json({ key: buildKey(buildCards(req)) }); } catch (e) { res.status(500).send('Cannot read directory'); }
@@ -507,7 +543,7 @@ app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
   // from it (bake-hybrid / bake-layers / quest-lod outputs and previews).
   // Exact suffixes, so deleting "foo" never touches "foo_2".
   const derived = ['_hybrid.glb', '_hybrid.ply', '_surfaces.glb', '_patches.glb', '_mpi.glb', '_mpionly.glb', '_mpi_ktx2.glb', '_mpionly_ktx2.glb', '_mpi_astc.glb', '_mpionly_astc.glb', '_surfaces_mesh.glb', '_patches_mesh.glb', '_mpi_mesh.glb', '_layers.glb', '_quest.ply',
-                   '_hybrid_vs_splats.jpg', '_hybrid_coverage.jpg', '_layers_vs_splats.jpg']
+                   '_hybrid_vs_splats.jpg', '_hybrid_coverage.jpg', '_layers_vs_splats.jpg', '_people.png']
     .map(suffix => scene + suffix);
   const files = fs.readdirSync(outputDir);
   files.forEach(f => {
@@ -515,6 +551,9 @@ app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
       fs.unlinkSync(path.join(outputDir, f));
     }
   });
+  for (const v of REQUESTABLE) for (const f of [requestFile(s.coll, scene, v), requestFile(s.coll, scene, v) + '.failed']) {
+    try { fs.unlinkSync(f); } catch (e) {}
+  }
   // Cached thumbnail too (a private one must not outlive its scene).
   try { fs.unlinkSync(path.join(thumbDir(s.coll), `${scene}_${THUMB_PX}.jpg`)); } catch (e) {}
 

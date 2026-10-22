@@ -165,7 +165,7 @@
     const isVariant = (lod) => !!lod && /^[a-z0-9]+$/i.test(lod) && !BASE_LODS.includes(lod);
     // ?lod=a,b[,c,d]: compare view modes on the desktop, side by side (two or three) or in a 2x2 grid (four),
     // all seen through the one camera (synced). The first mode is the scene's mode otherwise (and in XR).
-    const lodList = (getQueryParam('lod') || 'mpionly').split(',').filter(Boolean).slice(0, 4);
+    const lodList = (getQueryParam('lod') || 'photo').split(',').filter(Boolean).slice(0, 4);
     const cmpCols = lodList.length === 4 ? 2 : lodList.length, cmpRows = lodList.length === 4 ? 2 : 1;
     // Files of a scene: public scenes under /output2/, private ones ("private:<name>", served only after
     // logging in) under /c/private/output2/ (collections.js, web.js).
@@ -589,6 +589,7 @@
     controls.rotateSpeed = 800 / cc;
     controls.enabled = !isPano;
     const panoLook = isPano ? new PanoLook(camera, renderer.domElement, { fov: 75 }) : null;
+    window.__dbg.panoLook = panoLook;          // scripted panorama views (tests): yaw, pitch, pos
     if (isPano) {
       addEventListener('resize', () => {
         const c = document.getElementById('container');
@@ -644,8 +645,8 @@
     // All fall back to the full splats when missing.
     // ?variant=_hybrid_s2 (etc.) loads a hybrid baked with another --name-suffix.
     const hybridName = /^_[A-Za-z0-9_]+$/.test(getQueryParam('variant') || '') ? getQueryParam('variant') : '_hybrid';
-    // Default view: MPI-only (all splats as a sparse multi-plane image), the fastest and best-looking mode on
-    // the Quest 3 (docs/quest-xr-findings.md §4b); falls back to the original splats when not baked.
+    // Default view: Photo detail (MPI-only, all splats as a sparse multi-plane image, with the photo's detail
+    // painted back; docs/quest-xr-findings.md §4b, §4c); falls back to plain MPI-only, then the original splats.
     let lodMode = lodList[0];  // changeable in XR (gallery, secondary thumbstick)
     let mpivarCur = (getQueryParam('mpivar') || '').replace(/[^a-z0-9]/gi, '');   // ?mpivar (benchmarks switch it)
     const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
@@ -681,9 +682,11 @@
       if (mode === 'splats') {
         const s = createSplat(info.spz);
         await s.initialized;
+        loadedAs = '360 splats';
         return s;
       }
       const v = info.variants.find((x) => x.id === panoVariant) || info.variants[0];
+      loadedAs = `360 MSI · ${v.label}`;
       // ASTC where the GPU samples it (Quest), else Basis UASTC, else PNG (as for photo scenes; ?tex=ktx2 skips ASTC)
       const astcOk = getQueryParam('tex') !== 'ktx2' && renderer.extensions.has('WEBGL_compressed_texture_astc');
       const url = (texKtx2 && astcOk && v.msiAstc) || (texKtx2 && v.msi) || v.msiPng || v.msi || v.msiAstc;
@@ -1000,7 +1003,7 @@
       if (lodMode === 'hybrid') {
         const url = `${sceneBase(scene)}${hybridName}.glb`;
         try {
-          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadHybrid(scene);
+          if ((await fetch(url, { method: 'HEAD' })).ok) { loadedAs = 'Hybrid'; return await loadHybrid(scene); }
         } catch (e) {
           console.error(`Failed to load ${url}:`, e);
         }
@@ -1015,7 +1018,15 @@
         const suffix = (isVariant(lodMode) ? '_mpionly' : `_${lodMode}`) + (mpivar ? `_${mpivar}` : '');
         const url = `${sceneBase(scene)}${suffix}.glb`;
         try {
-          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadSurfaces(scene, suffix, lodMode !== 'mpionly' && !isVariant(lodMode));
+          if ((await fetch(url, { method: 'HEAD' })).ok) {
+            loadedAs = modeLabel(lodMode) + (lodMode === 'mpionly' && mpivar ? ` · ${mpivar}` : '');
+            return await loadSurfaces(scene, suffix, lodMode !== 'mpionly' && !isVariant(lodMode));
+          }
+          // A variant not baked (yet: the watcher bakes Photo detail after MPI-only): plain MPI-only.
+          if (isVariant(lodMode) && (await fetch(`${sceneBase(scene)}_mpionly.glb`, { method: 'HEAD' })).ok) {
+            loadedAs = `MPI-only (no ${modeLabel(lodMode)} bake)`;
+            return await loadSurfaces(scene, '_mpionly', false);
+          }
         } catch (e) {
           console.error(`Failed to load ${url}:`, e);
         }
@@ -1024,7 +1035,7 @@
       if (lodMode === 'layers') {
         const url = `${sceneBase(scene)}_layers.glb`;
         try {
-          if ((await fetch(url, { method: 'HEAD' })).ok) return await loadLayers(url);
+          if ((await fetch(url, { method: 'HEAD' })).ok) { loadedAs = 'Layers'; return await loadLayers(url); }
         } catch (e) {
           console.error(`Failed to load ${url}:`, e);
         }
@@ -1032,6 +1043,7 @@
       }
       const s = createSplat(await splatUrlFor(scene));
       await s.initialized;
+      loadedAs = lodMode === 'full' || lodMode === 'quest' ? modeLabel(lodMode) : `Original splats (no ${modeLabel(lodMode)} bake)`;
       return s;
     }
 
@@ -1057,7 +1069,51 @@
       });
     }
 
+    // Model loading status: whenever a model loads (page load, scene, view mode, 360 view, MSI variant), a pill at
+    // the top of the page and, in AR/VR, the in-headset message box: "Loading <what>…", then "✓ <what was loaded>"
+    // (or the failure) for a few seconds.
+    let loadedAs = '';                          // set by the loaders: what was actually loaded (after fallbacks)
+    let statusToast = null;                     // the XR message box, once created (further below)
+    const modeLabel = (id) => ([...VIEW_MODES, ...PANO_MODES].find((m) => m.id === id) || { label: id }).label;
+    const loadStatus = (() => {
+      const css = document.createElement('style');
+      css.textContent = '#loadStatus{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:2000;' +
+        'font:13px sans-serif;color:#fff;background:rgba(20,22,28,.88);border:1px solid #555;border-radius:999px;' +
+        'padding:5px 12px;display:flex;align-items:center;gap:8px;pointer-events:none;transition:opacity .4s;opacity:0}' +
+        '#loadStatus .sp{width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;' +
+        'border-radius:50%;animation:lsSpin .8s linear infinite}#loadStatus.done .sp,#loadStatus.fail .sp{display:none}' +
+        '#loadStatus.fail{background:rgba(140,30,30,.9)}@keyframes lsSpin{to{transform:rotate(360deg)}}';
+      document.head.appendChild(css);
+      const el = document.createElement('div');
+      el.id = 'loadStatus';
+      el.innerHTML = '<span class="sp"></span><span class="tx"></span>';
+      document.body.appendChild(el);
+      let hide = null;
+      function show(text, cls, seconds) {
+        el.className = cls; el.querySelector('.tx').textContent = text; el.style.opacity = 1;
+        clearTimeout(hide);
+        if (seconds) hide = setTimeout(() => { el.style.opacity = 0; }, seconds * 1000);
+        // (not during a headset benchmark: it labels its own phases in the same box)
+        if (statusToast && renderer.xr.isPresenting && !benchName) statusToast.show(text, seconds || 60);
+      }
+      return {
+        start: (what) => show(`Loading ${what}…`, 'busy', 0),
+        done: (t0) => show(`✓ ${loadedAs} · ${((performance.now() - t0) / 1000).toFixed(1)} s`, 'done', 4),
+        fail: (what) => show(`Could not load ${what}`, 'fail', 6),
+      };
+    })();
+    // What is about to load, for the "Loading …" message (the loaders report what it turned out to be).
+    function pendingLabel(scene) {
+      if (!isPanoScene(scene)) return modeLabel(lodMode) + (lodMode === 'mpionly' && mpivarCur ? ` · ${mpivarCur}` : '');
+      if (panoMode === 'splats') return '360 splats';
+      const vs = panoInfo?.variants ?? [];
+      const v = vs.find((x) => x.id === panoVariant) || vs[0];
+      return `360 MSI${v ? ` · ${v.label}` : ''}`;
+    }
+
     let splat;
+    const loadT0 = performance.now();
+    loadStatus.start(pendingLabel(file));
     if (hybrid === "true") {
       splat = createSplat(splatURL);
     } else if (isPano || ['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
@@ -1066,6 +1122,8 @@
       splat = createSplat(splatURL);  // shows progressively while loading
     }
     xrContent.add(splat);
+    if (splat.initialized) splat.initialized.then(() => { if (!loadedAs) loadedAs = modeLabel(lodMode); loadStatus.done(loadT0); });
+    else loadStatus.done(loadT0);
 
     // --- Per-scene view settings: size in XR, depth scale and offset (web/js/depthWarp.js; left controller
     // trigger / grip in XR, sliders on the desktop). Saved per scene on the server (/view-config, inside the
@@ -1172,6 +1230,7 @@
     const initialScene = file;
     let sceneList = null;
     let switching = false;
+    let stepT0 = 0, stepWhat = '';
     async function stepScene(delta, name = null) {
       if (switching) return;
       switching = true;
@@ -1186,6 +1245,9 @@
         }
         // Keep the old scene visible until the next one is loaded.
         const wasPano = isPanoScene(splat?.userData?.scene ?? initialScene);
+        stepT0 = performance.now();
+        stepWhat = pendingLabel(file);
+        loadStatus.start(stepWhat);
         const next = await loadContent(file);
         next.userData.scene = file;
         await prepareView(next, file);
@@ -1203,8 +1265,10 @@
         else url.searchParams.set('lod', lodMode);
         history.replaceState(null, '', url);
         if (hzAuto && renderer.xr.isPresenting) requestHz(120, false);   // re-check the rate for the new scene
+        loadStatus.done(stepT0);
       } catch (e) {
         console.error('Scene switch failed:', e);
+        loadStatus.fail(stepWhat);
       } finally {
         switching = false;
       }
@@ -1238,22 +1302,18 @@
     // View-mode switching in XR (gallery buttons):
     // reload the current scene in the new mode and show its name briefly.
     const xrToast = new XRToast(renderer, scene);
-    const modeLabel = (id) => ([...VIEW_MODES, ...PANO_MODES].find((m) => m.id === id) || { label: id }).label;
+    statusToast = xrToast;                      // loading status in the headset (loadStatus)
     async function switchPanoMode(id) {
       if (id === panoMode || switching) return;
       panoMode = id;
       xrGallery.refresh();
-      xrToast.show(`${modeLabel(id)}…`, 30);
-      await stepScene(0);
-      xrToast.show(modeLabel(panoMode));
+      await stepScene(0);                       // shows "Loading …" / "✓ …" (loadStatus)
     }
     async function switchLod(id) {
       if (id === lodMode || switching) return;
       lodMode = id;
       xrGallery.refresh();
-      xrToast.show(`${modeLabel(id)}…`, 30);
       await stepScene(0);
-      xrToast.show(modeLabel(lodMode));
     }
 
     // Delete the current scene from the XR menu: switch to the next scene

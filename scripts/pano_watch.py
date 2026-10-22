@@ -1,8 +1,9 @@
 """Watch a collection's pano/inputs and turn each new 360 panorama (equirectangular .jpg/.jpeg/.png) into what
 the gallery shows (docs/pano-360.md):
-  1. scripts/pano_predict.py  -> pano/out_ico2/<name>.ply (SHARP splats; ~2 min on the GB10)
-  2. scripts/pano_spz.py      -> pano/out_ico2/<name>.spz (the viewer's "360 splats")
-  3. scripts/pano_msi.py      -> pano/out_ico2_photo4/<name>_msi[_astc].glb (photo-detail v4 multi-sphere image,
+  1. scripts/pano_predict.py  -> pano/out_dr/<name>.ply (SHARP splats on DAP-corrected depth, --depth dap_ratio,
+                                 up-view layout; ~1 min on the GB10)
+  2. scripts/pano_spz.py      -> pano/out_dr/<name>.spz (the viewer's "360 splats")
+  3. scripts/pano_msi.py      -> pano/out_dr_photo4/<name>_msi[_astc].glb (photo-detail v4 multi-sphere image,
                                  the viewer's default "360 MSI")
 web.js puts uploaded panoramas into pano/inputs (scripts/start_server.sh runs this watcher next to the others).
 
@@ -22,7 +23,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CHECKPOINT = ROOT / "sharp_2572gikvuh.pt"
 EXTS = (".jpg", ".jpeg", ".png")
-MSI_DIR = "out_ico2_photo4"
+SPLAT_DIR, MSI_DIR = "out_dr", "out_dr_photo4"
+PREDICT_ARGS = ["--layout", "icoup", "--depth", "dap_ratio"]   # docs/pano-360.md
 MSI_ARGS = ["--maxpages", "16", "--texfull-thr", "0.0015", "--detail-alpha", "0.95", "--detail-erode", "2",
             "--tex", "astc", "--cull", "0.05"]   # cull: 23% fewer cells, renders within 61+ dB from moved eyes
 
@@ -42,10 +44,10 @@ def process(img: Path, pano: Path, status, writer):
     `writer`), or None."""
     import pano_msi, pano_predict, pano_spz
     name = img.stem
-    ply, spz = pano / "out_ico2" / f"{name}.ply", pano / "out_ico2" / f"{name}.spz"
+    ply, spz = pano / SPLAT_DIR / f"{name}.ply", pano / SPLAT_DIR / f"{name}.spz"
     msi = pano / MSI_DIR / f"{name}_msi_astc.glb"
     steps = [("splats", ply, lambda: pano_predict.main([str(img), "-o", str(ply.parent),
-                                                        "--checkpoint", str(CHECKPOINT)])),
+                                                        "--checkpoint", str(CHECKPOINT), *PREDICT_ARGS])),
              ("spz", spz, lambda: pano_spz.main([str(ply)])),
              ("msi", msi, lambda: pano_msi.main([str(ply), "-o", str(msi.parent), *MSI_ARGS,
                                                  "--photo-detail", str(img)], writer=writer))]

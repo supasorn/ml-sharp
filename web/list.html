@@ -551,7 +551,7 @@
     // Viewer defaults (web/index.html). Presets set every XR option (not the view).
     // xrscale 'auto': the viewer picks 1.4 for the MPI views and 1.0 for the splat views (no xrscale in the link).
     const XR_DEFAULTS = { xrscale: 'auto', foveation: 0, xrstddev: 2.24, xrmaxpx: 512, adaptive: false };
-    const DEFAULT_OPTS = { lod: 'mpionly', pmode: 'msi', tex: 'auto', optsVersion: 4, ...XR_DEFAULTS };
+    const DEFAULT_OPTS = { lod: 'photo', pmode: 'msi', tex: 'auto', optsVersion: 5, ...XR_DEFAULTS };
     const FULL_QUALITY = { ...XR_DEFAULTS, foveation: 0, xrstddev: 2.83 };
     const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96, adaptive: true };
     let opts = { ...DEFAULT_OPTS };
@@ -564,6 +564,8 @@
       if (saved.optsVersion < 3) { saved.xrscale = 1; saved.foveation = 0; saved.optsVersion = 3; }
       // One-time switch to automatic resolution (1.4 for MPI views), the new default.
       if (saved.optsVersion < 4) { saved.xrscale = 'auto'; saved.optsVersion = 4; }
+      // One-time switch of MPI-only to Photo detail, the new default (MPI-only until it is baked).
+      if (saved.optsVersion < 5) { if (saved.lod === 'mpionly') saved.lod = 'photo'; saved.optsVersion = 5; }
       // Removed experimental view modes (Surf2-9, Bent, Regions): back to the default view.
       if (/^surf(?:[2-9]|1[0-4])$/.test(saved.lod || '')) saved.lod = 'mpionly';
       opts = { ...opts, ...saved };

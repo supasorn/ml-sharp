@@ -168,8 +168,9 @@ of all variants.
 first; `web.js` moves an equirectangular image (2:1 within 1%, ≥ 2000 px wide, or tagged
 `equirectangular` in its XMP) to `pano/inputs/` (name sanitised to `[\w.-]`) and anything else to
 `images/`. `scripts/pano_watch.py` (started by `scripts/start_server.sh`, log `logs/pano.log`) then runs
-`pano_predict.py` → `pano_spz.py` → `pano_msi.py --tex astc` (photo detail v4) for each input without
-`out_ico2_photo4/<name>_msi_astc.glb` (or an older `_msi_ktx2.glb`), ~60 s per panorama on the GB10; the gallery
+`pano_predict.py --layout icoup --depth dap_ratio` (below) → `pano_spz.py` → `pano_msi.py --tex astc` (photo
+detail v4) for each input without `out_dr_photo4/<name>_msi_astc.glb` (splats in `out_dr/`), ~75 s per panorama on
+the GB10; the gallery
 shows it as
 "Processing 360°…" until the splats exist. `python scripts/pano_watch.py --root data/public --once [names]`
 does the same by hand.
@@ -229,3 +230,100 @@ Face). Depth Any Camera (CVPR 2025, MIT) was the alternative: smaller indoor/out
 
 Not the watcher's default yet: the railing panorama has the experiment as MSI variant `out_uk_photo4` ("UniK3D
 depth (photo detail v4)", `?pvariant=out_uk_photo4`) next to the default `out_ico2_photo4`.
+
+## Cracks along view boundaries (overlap, 2026-10-21)
+
+From an eye moved off-centre (20 cm), thin black cracks opened on ceilings in straight lines forming triangles:
+the boundaries of the 20 ico views' ownership regions (spherical triangles). Each splat was kept by exactly one
+view, cut exactly at the boundary, so any depth disagreement between neighbouring views opened a crack there with
+nothing behind it (the ceiling is the farthest surface). Worse with UniK3D depth (SHARP's pass 2 follows it less
+exactly): `pano_9000`, six straight-up views, black 0-0.20% (stitched), 0-0.96% (UniK3D).
+
+`pano_predict.py --overlap-deg 5` (default): a view keeps its splats up to 5 degrees past its boundary (angle
+to its axis <= the nearest axis's + 5 degrees). Measured in the real viewer (`window.__dbg.panoLook` set to look up
+from eyes 20-25 cm off-centre, 8 views, near-black pixels): `pano_9000` hard boundaries + stitched depth 15356,
+UniK3D 2 degrees 943, UniK3D 5 degrees 0. (An offline check with `glb_render.py` first suggested 2 degrees was enough:
+it had not reproduced the viewer's eye positions; three.js `(x, y, z)` = OpenCV `(x, -y, -z)`.) Cost: +37% splats
+(7.6M -> 10.4M; the "360 splats" file), MSI cells about the same (131k vs 133k at 2 degrees: culling drops the
+hidden duplicates). The UniK3D versions (`out_uk*`) were rebuilt with it; the stitched versions (`out_ico2*`,
+still the viewer's default) keep hard boundaries for comparison; the first UniK3D build (hard) is in
+`pano/_old_uk_hard/`.
+
+## Ceiling flatness and 360 depth models (2026-10-21/22)
+
+Measured instead of eyeballed (scripts in the session scratchpad, numbers here): `pano_9000`'s ceiling (points above
+45 deg elevation, robust plane fit, |distance to the plane|) and `R0010963`'s straight railing (nearest surface per
+column in its image band, distance from a straight line seen from above).
+
+- **The layout split the ceiling.** With `ico` no view looks up: the two highest (69 deg) own 64% of the ceiling,
+  their boundary runs across its middle, four 35-deg views own the rest; each sees it obliquely. `--layout icoup`
+  (the same 20 views rotated so one looks straight up and one down; every direction >= 13 px inside its owner's
+  image): stitched depth's ceiling p90 off-plane 16.6 -> 3.0 cm, the splats follow (patches and steps gone).
+- **Gradient-domain stitching** (`--depth poisson`: the views' log-depth gradients blended by feather weight,
+  integrated by conjugate gradient on the 2048x1024 map, cos(lat)-weighted, u wraps; ~1 s): removes steps between
+  views (no per-view scales at all) but only averages slope disagreements. With `icoup`: ceiling p90 2.6 cm (splats),
+  railing rms 6.8 cm (current 7.3): the rail's hump is a bend inside one view's own prediction. Pulling towards
+  UniK3D (`poisson_uk`, also faded towards the poles, `--uk-fade`) straightens the rail (5.8-6.0 cm) but bends the
+  ceiling again (13.7-18.5 cm): UniK3D's overall room shape conflicts with the views' globally.
+- **360 depth models**, depth maps evaluated directly (scale-free: % of the distance; all 15 panoramas inspected):
+
+  | Method | ceiling off-plane median / p90 | railing off straight rms / max |
+  |---|---|---|
+  | stitched, `ico` (current) | 1.6% / 15.1% | 6.2% / 14.5% |
+  | Poisson, `icoup` | 1.1% / 2.1% | 5.5% / 10.6% |
+  | UniK3D (CC BY-NC) | 3.6% / 19.6% | 4.5% / 12.1% |
+  | **DAP** (Insta360, "Depth Any Panoramas", arXiv 2512.16913, CC BY-NC) | **0.7% / 1.3%** | **2.4% / 8.3%** |
+  | PanDA-Large (CVPR 2025, Apache-2.0) | 63% / 566% | 29% / 74% (relative depth with an unknown offset: not distance) |
+  | Depth Anywhere, UniFuse student (NeurIPS 2024, Apache-2.0) | 11% / 40% | 27% / 56% (sky nearest outdoors, blotches) |
+
+  `pano_predict.py --depth dap` (`dap_distance`): DAP at 1024x512, metres, masked sky = 100 m; with `--layout icoup`
+  the final splats' ceiling is p90 1.6 cm, tilt 0.4 deg (`pano_9000`). Setup outside the repo: `git clone
+  https://github.com/Insta360-Research-Team/DAP ~/.local/opt/DAP`, `weights/model.pth` from Hugging Face
+  `Insta360-Research/DAP-weights`, `pip install --no-deps torchmetrics lightning-utilities` (its bundled DINOv3 code
+  imports torchmetrics); `DAP_HOME` overrides the location. PanDA / Depth Anywhere are in `~/.local/opt` too.
+- Viewer variants for comparison (`?pvariant=`): `out_dr_photo4` (default since 2026-10-22, below), `out_ico2_photo4`
+  (the previous default, stitched), `out_uk_photo4` (UniK3D),
+  `out_gd_photo4` (Poisson + `icoup`), `out_dap_photo4` (DAP + `icoup`), `out_pdap_photo4` (Poisson + DAP +
+  `icoup`, below); all with the 5-degree overlap except the current one. Batch: `logs/pano_variant_batch.py TAG [pano_predict options]`.
+- DAP alone is too smooth for cluttered scenes (seen in the headset): `hotel_room`'s desk chair merges into the
+  desk, the armchair's edges and the table corner are pulled towards the wall, `yaowarat`'s traffic-light pole and
+  lamp arm are lost; pass 2 bends SHARP's sharp per-view geometry towards that target. `--depth poisson_dap`:
+  the gradient-domain solve (detail from the views) with DAP as the reference at `--dap-weight 1e-3` (only shapes
+  wider than ~30 px of the 2048 map follow DAP). DAP's sky (a flat 100 m) is replaced in the reference by the
+  views' own (views-only Poisson + the median offset to DAP): with 100 m the sky's jump disagreed with the views'
+  and dragged building edges next to it towards the eye. Ceiling p90 1.5 cm (`pano_9000`), railing rms 4.8 cm
+  (DAP 2.4, current 7.3); depth crops keep the chair, desk corner, pole and signal as the current version.
+  Weight 1e-2: railing 3.4 cm but small objects (the signal) already flattened towards DAP.
+
+## Default since 2026-10-22: DAP-corrected views (`--depth dap_ratio`, `out_dr*`)
+
+`dap_ratio_targets()`: each view's own SHARP depth times a smooth correction towards DAP: the log ratio DAP / view,
+blurred over 10 degrees (`--ratio-deg`) with weights (normalized convolution): 0 in DAP's sky, low on depth edges
+of either map (DAP's are blurred), and robust (Cauchy, 3 rounds: where the two disagree by far more than ~10%
+beyond the smooth correction, DAP is taken to be wrong). The corrected views are feather-blended into one shared
+360 map, which every view is aligned to (as the stitched map before). Why each piece:
+- Detail stays SHARP's: Poisson + DAP and this keep `hotel_room`'s desk chair, `yaowarat`'s traffic-light pole;
+  DAP alone loses them. Simpler than Poisson + DAP (no stitch, no Poisson solve, no sky special case).
+- Blur 10 deg, robust: at 5 deg and without robust weights a sky opening (`R0011338`, the roof edge) got a halo pulled
+  towards the eye and mirrors / glass doors (`hotel_room`, `R0011338`) were half-flattened onto the wall; 15 deg no
+  longer straightened the railing. Depth maps: ceiling p90 1.4 cm (`pano_9000`; stitched 16.6), railing rms
+  4.9 cm (`R0010963`; stitched 7.6, DAP alone 2.4); final splats: ceiling 1.4-1.8 cm, railing 4.9 cm (stitched
+  7.3; its worst point 16.9 vs 13.1 cm).
+- Shared map, not per-view targets: views aligned to their own corrected depth disagreed on thin objects
+  (`pano_9000`'s lamp heads, ~30%) and showed them twice (overlap pixels > 5% apart in the final splats: 4.4%,
+  shared 0.55%, stitched 0.49%).
+
+Fixes found on the way (all panoramas):
+- **bf16 depth was quantized**: under `--bf16` the monodepth head's output had an 8-bit mantissa: 90% of
+  neighbouring depth pixels equal (fp32 25%), 10% off on average; contour stripes across buildings (`yaowarat`).
+  `load_model()` runs the disparity head in fp32 (+0.04 s a view). The earlier bf16 check scored renders from the
+  centre, which hide depth errors. Photos (`sharp predict`) were never affected (fp32).
+- **Overlap only on smooth surfaces** (`--overlap-tol 0.05`, `--overlap-edge 0.1`): past its boundary a view keeps
+  only splats within 5% of the shared map and away from its depth edges; the full 5-degree overlap gave
+  `pano_9000`'s lamp head a blurred black double from the neighbouring view (every eye, even the centre). Ceiling
+  cracks still 0 in the viewer (8 eyes).
+- **Views far off before alignment**: the alignment net only corrects moderate factors; a street panorama's
+  downward views had SHARP's road at 0.33x / 0.42x the target, stayed at 0.59x / 0.77x and floated as a big
+  triangle. Pass 2 aligns each view to the target divided by its median factor and scales its splats by it after.
+- Not fixed: a very near object (a selfie head at 0.5 m, `R0011166`) is only a front shell; moving the eye 10 cm
+  or more shows its edge (same in the stitched version).

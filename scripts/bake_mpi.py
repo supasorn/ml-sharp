@@ -68,6 +68,8 @@ VARIANTS = {"ad12sep": {"BINS": "64", "ADAPT": "3", "ADAPT_T": "12", "ADAPT_W": 
 # Variants the gallery may request for a scene (<collection>/renderings/requests/<scene>.<variant>, written by web.js):
 # the watcher bakes them before anything else and removes the request (renamed .failed if the bake fails).
 REQUESTABLE = ("people",)
+# Baked for every new scene by the MPI-only watcher (--watch --mpionly), after plain MPI-only.
+WATCH_VARIANTS = ("photo",)
 
 
 def scene_plys(folder: Path, names):
@@ -188,15 +190,19 @@ def compress(glb: Path, args, log):
 
 
 def watch(args):
-    """Bake scenes that lack their MPI outputs, forever: MPI-only first (the default view), then Hybrid-MPI
-    (not with --mpionly).
+    """Bake scenes that lack their MPI outputs, forever: MPI-only first, then (--mpionly) the WATCH_VARIANTS (photo:
+    the viewer's default view; MPI-only is its fallback until then), or (without --mpionly) Hybrid-MPI.
     A scene is picked up once its .ply and .json have been unchanged for a few seconds; a failed scene is
     retried only after its .ply changes, except that running out of GPU memory (shared GPUs) is retried up to
     6 times, waiting 30 s, 1 min, 2 min, ... up to 10 min in between (a scene too big for the GPU never fits)."""
     gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
     failed = {}
     oom = {}                                                   # key -> (retries so far, retry not before)
-    print(f"watching {args.input} for {'MPI-only' if args.mpionly else 'MPI-only + Hybrid-MPI'} "
+    base = args.variant
+    stages = ([(True, base)] + [(True, v) for v in WATCH_VARIANTS if v != base]) if args.mpionly \
+        else [(True, base), (False, base)]
+    print(f"watching {args.input} for "
+          f"{' + '.join(('MPI-only' + (f' {v}' if v else '')) if m else 'Hybrid-MPI' for m, v in stages)} "
           f"(GPU {gpu}, every {args.poll:.0f} s)", flush=True)
     reqdir = args.work.parent / "requests"
     while True:
@@ -220,7 +226,8 @@ def watch(args):
                     print(f"{time.strftime('%H:%M:%S')} {name} {variant} (requested): FAILED ({e})", flush=True)
                 finally:
                     args.variant, args.overwrite = saved
-        for mpionly in ((True,) if args.mpionly else (True, False)):
+        for mpionly, variant in stages:
+            args.variant = variant
             for ply in scene_plys(args.input, set()):
                 sfx = out_suffix(args, mpionly)
                 out = args.input / f"{ply.stem}{sfx}.glb"

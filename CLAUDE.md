@@ -14,7 +14,7 @@ Quick facts:
   never commit it). Gallery at `/list`, viewer at `/?scene=<name>&lod=hybrid`.
   `scripts/start_server.sh` runs it together with the SHARP prediction watcher
   and the MPI-only watcher (`scripts/bake_mpi.py --watch --mpionly`; new scenes
-  get only MPI-only, not Hybrid / Hybrid-MPI) and the panorama watcher
+  get MPI-only, then its `photo` variant, the default view; not Hybrid / Hybrid-MPI) and the panorama watcher
   (`scripts/pano_watch.py`; uploaded 2:1 equirect images go to `pano/inputs/`,
   not `images/`); stop it with Ctrl+C or
   `scripts/stop_server.sh` (pids in `logs/stack.pids`).
@@ -40,7 +40,8 @@ Quick facts:
   scenes), `people` (finer planes on people: baked on request, gallery "People" toggle -> `POST /request` -> the
   MPI-only watcher). Findings doc §4c.
 - 360 panoramas (equirect -> splats -> multi-sphere image; in the main gallery/viewer as
-  `pano:<name>`, also a separate comparison viewer
+  `pano:<name>`; default `pano_predict.py --layout icoup --depth dap_ratio` -> `out_dr` / `out_dr_photo4`;
+  also a separate comparison viewer
   `node scripts/pano_server.js` on 3100/3543, data in git-ignored `pano/`): `docs/pano-360.md`.
 - Data lives in collections (`collections.js`): `data/public/{images,output2,pano,renderings}`
   (the old top-level `images/`, `output2/`, `pano/`, `renderings/` are symlinks into it) and

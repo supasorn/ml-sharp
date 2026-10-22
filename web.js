@@ -62,11 +62,16 @@ function sortedSceneNames(outDir) {
 
 // --- 360 panoramas (docs/pano-360.md) ---
 // Scene id "[private:]pano:<name>" for <collection>/pano/inputs/<name>.jpg. Content: multi-sphere images
-// (scripts/pano_msi.py) in pano/<variant dir>/<name>_msi[_ktx2].glb and splats pano/out_ico2/<name>.spz.
+// (scripts/pano_msi.py) in pano/<variant dir>/<name>_msi[_ktx2].glb and splats pano/out_dr/<name>.spz (older
+// panoramas: pano/out_ico2/).
 // MSI variants, best first: the viewer shows the first one a pano has (the others are selectable).
 const PANO_VARIANTS = [
-  { id: 'out_ico2_photo4', label: 'Photo detail v4' },
+  { id: 'out_dr_photo4', label: 'DAP-corrected depth (photo detail v4)' },   // default: scripts/pano_watch.py
+  { id: 'out_ico2_photo4', label: 'Stitched depth (photo detail v4)' },   // the previous default
   { id: 'out_uk_photo4', label: 'UniK3D depth (photo detail v4)' },   // experiment: 360 depth instead of stitching
+  { id: 'out_gd_photo4', label: 'Poisson depth, up view (photo detail v4)' },   // experiment: gradient-domain stitching
+  { id: 'out_dap_photo4', label: 'DAP depth, up view (photo detail v4)' },   // experiment: DAP 360 depth
+  { id: 'out_pdap_photo4', label: 'Poisson + DAP depth, up view (photo detail v4)' },   // views' detail, DAP's overall shape
   { id: 'out_ico2_photo2', label: 'Photo detail v2' },
   { id: 'out_ico2_photo3', label: 'Photo detail v3 (dark specks)' },
   { id: 'out_ico2_hires', label: 'High-res' },
@@ -89,7 +94,8 @@ function panoInfo(coll, name) {
                     msiPng: fs.existsSync(png) ? url(`${v.id}/${name}_msi.glb`) : null });
     mtime = Math.max(mtime, fs.statSync(fs.existsSync(ktx2) ? ktx2 : png).mtimeMs);
   }
-  const spz = fs.existsSync(path.join(panoDir, 'out_ico2', `${name}.spz`)) ? url(`out_ico2/${name}.spz`) : null;
+  const spzDir = ['out_dr', 'out_ico2'].find((d) => fs.existsSync(path.join(panoDir, d, `${name}.spz`)));
+  const spz = spzDir ? url(`${spzDir}/${name}.spz`) : null;
   if (!variants.length && !spz) return null;
   return { id: makeId(coll, name, true), name, input, mtime, variants, spz };
 }
@@ -315,17 +321,19 @@ app.get('/scenes', (req, res) => {
   }
 });
 // Models the watchers build for a scene, in build order: [label, done]. Photos: SHARP splats, then the MPI-only
-// bake (with its compressed copy); panoramas (scripts/pano_watch.py): splats, .spz, multi-sphere image.
+// bake and its photo-detail variant (each with its compressed copy); panoramas (scripts/pano_watch.py): splats,
+// .spz, multi-sphere image.
 function buildStages(coll, name, pano) {
   const has = (...p) => fs.existsSync(path.join(...p));
   if (pano) {
     const d = dir(coll, 'pano');
-    return [['splats', has(d, 'out_ico2', `${name}.ply`)], ['spz', has(d, 'out_ico2', `${name}.spz`)],
-            ['msi', has(d, 'out_ico2_photo4', `${name}_msi_astc.glb`) || has(d, 'out_ico2_photo4', `${name}_msi_ktx2.glb`)]];
+    return [['splats', has(d, 'out_dr', `${name}.ply`)], ['spz', has(d, 'out_dr', `${name}.spz`)],
+            ['msi', has(d, 'out_dr_photo4', `${name}_msi_astc.glb`) || has(d, 'out_dr_photo4', `${name}_msi_ktx2.glb`)]];
   }
   const o = dir(coll, 'output2');
   return [['splats', has(o, `${name}.ply`) && has(o, `${name}.json`)],
-          ['mpionly', has(o, `${name}_mpionly.glb`) && (has(o, `${name}_mpionly_astc.glb`) || has(o, `${name}_mpionly_ktx2.glb`))]];
+          ['mpionly', has(o, `${name}_mpionly.glb`) && (has(o, `${name}_mpionly_astc.glb`) || has(o, `${name}_mpionly_ktx2.glb`))],
+          ['photo', has(o, `${name}_mpionly_photo.glb`) && (has(o, `${name}_mpionly_photo_astc.glb`) || has(o, `${name}_mpionly_photo_ktx2.glb`))]];
 }
 // Chip states: done, then for the first missing model `next` (building / queued / stalled), queued after it.
 // null when everything is built.
@@ -356,8 +364,8 @@ function buildCards(req) {
   const cards = [];
   for (const p of allPending(req)) {
     const coll = COLLECTIONS[p.coll], name = p.file.replace(/\.[^.]+$/, '');
-    const states = p.pano ? stageStates(buildStages(coll, name, true), panoNext(coll, name))
-                          : stageStates([['splats', false], ['mpionly', false]], photoNext(p.mtime));
+    // Same stages as a built scene (none of the files exist yet), so the chips match.
+    const states = stageStates(buildStages(coll, name, p.pano), p.pano ? panoNext(coll, name) : photoNext(p.mtime));
     cards.push({ key: `${p.coll}/${p.file}`, pending: p, states });
   }
   for (const s of allSceneEntries(visible(req))) {

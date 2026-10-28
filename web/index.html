@@ -281,7 +281,8 @@
 
     const scene = new THREE.Scene();
     // const camera = new THREE.PerspectiveCamera(54.88, ratio, 0.1, 1000);
-    const camera = new THREE.PerspectiveCamera(meta.vertical_fov_degrees, ratio, 0.1, 1000);
+    // near 1 cm (was 10 cm): close-up content isn't clipped; also the XR session's depthNear (three copies it)
+    const camera = new THREE.PerspectiveCamera(meta.vertical_fov_degrees, ratio, 0.01, 1000);
 
     // const renderer = new THREE.WebGLRenderer({ alpha: true });
     // alpha is needed so the Quest passthrough shows behind the splats in AR;
@@ -566,7 +567,7 @@
 
     let center = new THREE.Vector3(0, 0, -center_depth);
     const controls = new OrbitControls(camera, renderer.domElement);
-    window.__dbg = { camera, controls, scene };   // for scripted views (tests): camera pose, orbit target, depthWarp
+    window.__dbg = { camera, controls, scene, renderer };   // for scripted views (tests): camera pose, orbit target, depthWarp
 
     function resetView() {
       camera.position.set(0, 0, 0);
@@ -1059,12 +1060,50 @@
       });
     }
 
+    // Upload a scene's textures now (not at its first frame), checking WebGL for errors; failed ones (out of
+    // memory) are retried a few times after a pause (garbage collection, the freed scene) and reported to the server
+    // log (logs/xr_perf.jsonl, event "texture-upload").
+    async function uploadTextures(obj, name) {
+      const gl = renderer.getContext();
+      const texs = new Set();
+      obj.traverse((c) => {
+        if (!c.isMesh || !c.material) return;
+        for (const m of Array.isArray(c.material) ? c.material : [c.material]) {
+          if (m.map?.isTexture) texs.add(m.map);
+          for (const u of Object.values(m.uniforms ?? {})) if (u?.value?.isTexture) texs.add(u.value);
+        }
+      });
+      let failed = [...texs];
+      for (let attempt = 0; attempt < 4 && failed.length; attempt++) {
+        if (attempt) await new Promise((r) => setTimeout(r, 400 * attempt));
+        const again = [];
+        for (const t of failed) {
+          while (gl.getError() !== gl.NO_ERROR) {}           // earlier errors are not this texture's
+          if (attempt) t.needsUpdate = true;
+          renderer.initTexture(t);
+          const err = gl.getError();
+          if (err !== gl.NO_ERROR) again.push(t);
+        }
+        if (again.length) {
+          console.warn(`${again.length} of ${texs.size} textures failed to upload (attempt ${attempt + 1})`);
+          fetch('/fps', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ event: 'texture-upload', scene: name, failed: again.length,
+                                                 textures: texs.size, attempt: attempt + 1 }) }).catch(() => {});
+        }
+        failed = again;
+      }
+      return failed.length;                                   // pages still missing
+    }
+
     function disposeContent(obj) {
       obj.traverse((child) => {
         if (child instanceof SplatMesh) { child.dispose(); return; }
         if (!child.isMesh) return;
         child.geometry.dispose();
         child.material.map?.dispose();
+        // The MPI / MSI page shaders hold their textures in uniforms (map, cmap): material.dispose() leaves
+        // textures alone, so each scene switch kept the previous scene's pages on the GPU (64-341 MB).
+        for (const u of Object.values(child.material.uniforms ?? {})) if (u?.value?.isTexture) u.value.dispose();
         child.material.dispose();
       });
     }
@@ -1223,6 +1262,7 @@
       renderer.setViewport(0, 0, panelSize.x, panelSize.y);
     }
 
+    window.__dbg.stepScene = (d, name) => stepScene(d, name);   // tests: scene switching (GPU memory)
     // --- Scene stepping in XR (A = next, B = previous; see XRSceneController) ---
     // The page can't reload without ending the XR session, so swap the splat in
     // place; when the session ends on a different scene, reload into it so the
@@ -1252,11 +1292,15 @@
         next.userData.scene = file;
         await prepareView(next, file);
         applyVisibility(next);
-        xrContent.add(next);
+        // The old scene leaves the GPU before the new one's textures go up (the peak was both scenes): on the Quest
+        // a switch sometimes left the new scene's front planes missing until it was loaded again, as when the last
+        // pages uploaded (the nearest, drawn last) run out of memory. Then upload them now, checked, retried.
         xrContent.remove(splat);
         depthWarp.detach(splat);
         disposeContent(splat);
         splat = next;
+        xrContent.add(next);
+        const lostPages = await uploadTextures(next, file);
         // A panorama is centred on your head (and a photo scene back in front of you after one).
         if (renderer.xr.isPresenting && (isPanoScene(file) || wasPano)) xrController.resetPlacement();
         const url = new URL(window.location);
@@ -1265,7 +1309,8 @@
         else url.searchParams.set('lod', lodMode);
         history.replaceState(null, '', url);
         if (hzAuto && renderer.xr.isPresenting) requestHz(120, false);   // re-check the rate for the new scene
-        loadStatus.done(stepT0);
+        if (lostPages) loadStatus.fail(`${lostPages} texture page(s) (out of GPU memory?)`);
+        else loadStatus.done(stepT0);
       } catch (e) {
         console.error('Scene switch failed:', e);
         loadStatus.fail(stepWhat);

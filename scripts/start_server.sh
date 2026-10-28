@@ -27,6 +27,11 @@
 set -u
 cd "$(dirname "$0")/.."
 if [ "$(uname -m)" = aarch64 ]; then ENV="${SHARP_ENV:-/conda_envs/sharp_dgx}"; else ENV="${SHARP_ENV:-/conda_envs/sharp}"; fi
+if [ ! -x "$ENV/bin/python" ] || [ ! -x "$ENV/bin/sharp" ]; then   # the watchers would all exit at once
+  echo "No SHARP conda env at $ENV (its bin/python and bin/sharp). Set SHARP_ENV to its path in this container," >&2
+  echo "e.g. SHARP_ENV=/path/to/sharp_dgx $0 $*" >&2
+  exit 1
+fi
 export SHARP_ENV="$ENV"                         # web.js makes thumbnails with this env's Python
 export PATH="$ENV/bin:$PATH"                    # its node, if the system has none
 NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)

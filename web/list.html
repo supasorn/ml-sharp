@@ -72,11 +72,10 @@
       display: none; margin: 8px; padding: 10px 14px; border-radius: 4px; background: #b8860b; color: #fff;
       font-size: 16px; font-weight: 600; vertical-align: middle;
     }
-    .scene-item.unavailable {
-      opacity: 0.3;
-      filter: grayscale(1);
-      pointer-events: none;
-    }
+    /* Selected view mode not baked (yet): only the thumbnail is greyed (chips and badges stay readable); the card
+       still opens when the viewer can show plain MPI-only instead (an MPI-only variant such as Photo detail). */
+    .scene-item.unavailable img { opacity: 0.3; filter: grayscale(1); }
+    .scene-item.no-open { pointer-events: none; }
     .scene-item {
       width: 250px;
       background: #23272e;
@@ -195,17 +194,21 @@
       cursor: pointer;
     }
 
-     #browse_file {
+    #browse_file {
+      display: inline-flex; align-items: center; gap: 8px; vertical-align: middle;
       background-color: #0066cc;
       border: none;
       color: white;
-      padding: 12px 12px;
+      padding: 12px 16px 12px 12px;
       text-decoration: none;
       margin: 8px;
       cursor: pointer;
       border-radius: 4px;
       font-size: 18px;
+      font-weight: 600;
     }
+    #browse_file:hover { background-color: #0a74e0; }
+    #browse_file svg { width: 22px; height: 22px; }
     /* Import from Google Photos (google_photos.js) */
     #google_import {
       background: #fff;
@@ -403,8 +406,13 @@
     <div id="dropOverlayText">Drop files here</div>
   </div>
 
-  <input type="file" id="fileInput" multiple style="display: none;" />
-  <button id="browse_file" onclick="$('#fileInput').click();">Select Files</button>
+  <!-- Upload (photos and 360° panoramas; drag and drop works too on a desktop). A label for the file input, not a
+       scripted click: opens the photo library / camera on phones. -->
+  <input type="file" id="fileInput" multiple accept="image/*" style="display: none;" />
+  <label id="browse_file" for="fileInput" title="Upload photos or 360° panoramas (or drop them on the page)">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11 16V7.8l-3.6 3.6L6 10l6-6 6 6-1.4 1.4L13 7.8V16zm-6 4v-5h2v3h10v-3h2v5z"/></svg>
+    Upload
+  </label>
   <button id="google_import" type="button" title="Pick photos in Google Photos; they are downloaded and processed like dropped photos">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285f4" d="M12 12V2a5 5 0 0 1 0 10z"/><path fill="#34a853" d="M12 12h10a5 5 0 0 1-10 0z"/><path fill="#fbbc04" d="M12 12v10a5 5 0 0 1 0-10z"/><path fill="#ea4335" d="M12 12H2a5 5 0 0 1 10 0z"/></svg>
     Import from Google
@@ -614,11 +622,16 @@
         else url.searchParams.set('tex', opts.tex);
         $(this).attr('href', url.pathname + url.search);
       });
-      // Grey out scenes that don't have the selected view mode (not baked yet).
+      // Grey out scenes that don't have the selected view mode (not baked yet); an MPI-only variant falls back to
+      // plain MPI-only in the viewer, so those still open.
+      const BASE_LODS = ['full', 'hybrid', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
       $('.scene-item').not('.pending').each(function () {
         const pano = $(this).data('kind') === 'pano';
         const modes = ($(this).data('modes') || (pano ? 'msi' : 'full')).split(' ');
-        $(this).toggleClass('unavailable', !modes.includes(pano ? opts.pmode : opts.lod));
+        const want = pano ? opts.pmode : opts.lod;
+        const has = modes.includes(want);
+        const fallback = !pano && !BASE_LODS.includes(want) && modes.includes('mpionly');
+        $(this).toggleClass('unavailable', !has).toggleClass('no-open', !has && !fallback);
       });
     }
 
@@ -851,7 +864,8 @@
       // Handle file selection
       $('#fileInput').change(function () {
         let files = this.files;
-        uploadFiles(files);
+        if (files.length) uploadFiles(files);
+        this.value = '';                      // the same file can be picked again
       });
     });
   </script>

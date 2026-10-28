@@ -474,7 +474,9 @@ def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H):
     weight T * alpha. Only where that surface is opaque (alpha >= PD_ALPHA at every px within PD_ERODE): away from
     rims, whose painted colour would slide off the object as the eye moves (halos; docs/pano-360.md). Spread over
     the surface's bins in proportion to their alpha, i.e. the surface's colour shifts by D / its weight.
-    Returns apply(k, rgb, a) -> bin k's premultiplied rgb with the detail (clamped to a valid colour)."""
+    Returns apply(d, rgb, a) -> the premultiplied rgb of the bin at disparity d with the detail (clamped to a valid
+    colour). By disparity, not bin index: ADAPT's finer bins (e.g. on people) get it too, from the same surface band
+    (their alpha-weighted sum over the band adds up to the plain bins', so the composite still gains D)."""
     F_ = torch.nn.functional
     im = load_photo(photo, W, H)
     if im is None:
@@ -523,8 +525,8 @@ def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H):
           f"px): residual |D| mean {ins.abs().mean():.4f}, applied on {weight[inside].mean():.1%} of the photo, "
           f"residual left {(D * (1 - weight[..., None]))[inside].abs().mean():.4f}", flush=True)
 
-    def apply(k, rgb, a):
-        inb = (cen[k] - d_best).abs() <= band
+    def apply(d, rgb, a):
+        inb = (float(d) - d_best).abs() <= band
         new = rgb + torch.where(inb[..., None], a[..., None] * shift, 0)
         return torch.minimum(new.clamp(min=0), a[..., None])                    # valid premultiplied colour
     return apply
@@ -1454,7 +1456,7 @@ def run(scene: Path):
                    and not os.environ.get("NOFASTWIN"))
         pd_apply = None
         if PHOTO_DETAIL:
-            assert FASTWIN and not ADAPT, "PHOTO_DETAIL needs plain MPI-only bins"
+            assert FASTWIN, "PHOTO_DETAIL needs plain MPI-only bins (ADAPT's finer bins are fine)"
             photo = photo_path(scene, meta)
             if Path(photo).exists():
                 pd_apply = photo_detail_mpi(photo, kept, passes_[0][0], passes_[0][1], Kc, Wc, Hc, W, H)
@@ -1488,7 +1490,7 @@ def run(scene: Path):
             out, alpha, _ = ev.gs.rendering.rasterization(**sub, viewmats=torch.eye(4, device=dev)[None], Ks=Kc,
                                                           width=Wc, height=Hc, eps2d=ev.EPS, render_mode="RGB+D")
             if pd_apply is not None:
-                out = torch.cat([pd_apply(k, out[..., :3].clamp(0, 1)[0], alpha[0, ..., 0].clamp(0, 1))[None],
+                out = torch.cat([pd_apply(centers[k], out[..., :3].clamp(0, 1)[0], alpha[0, ..., 0].clamp(0, 1))[None],
                                  out[..., 3:]], -1)
             sec(f"raster L{lvl_}")
             rgb, a, dacc = out[0, ..., :3], alpha[0, ..., 0], out[0, ..., 3]

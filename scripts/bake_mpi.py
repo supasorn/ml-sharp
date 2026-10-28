@@ -63,8 +63,11 @@ VARIANTS = {"ad12sep": {"BINS": "64", "ADAPT": "3", "ADAPT_T": "12", "ADAPT_W": 
             "photo": {"PHOTO_DETAIL": "1", "MAXPAGES": "8", "TEXFULL_THR": "0.0015"},
             "photo2": {"PHOTO_DETAIL": "1", "GW": "auto", "MAXPAGES": "12", "TEXFULL_THR": "0.0015"},
             # people: 4x finer planes only on the cells covering people (Mask R-CNN on the photo, grown to cover
-            # the silhouette), plain MPI-only elsewhere; baked on request (gallery "People" toggle, see watch())
-            "people": {"ADAPT": "4", "ADAPT_MASK": "people", "UNPREM": "1", "MAXPAGES": "6"}}
+            # the silhouette), otherwise as photo (its detail and texture budget, premultiplied colour): without them
+            # People looked soft and blocky next to Photo detail (me_small's person 35.9 dB vs the photo; now 43.9,
+            # Photo detail 44.1); baked on request (gallery "People" toggle, see watch())
+            "people": {"ADAPT": "4", "ADAPT_MASK": "people", "PHOTO_DETAIL": "1", "MAXPAGES": "8",
+                       "TEXFULL_THR": "0.0015"}}
 # Variants the gallery may request for a scene (<collection>/renderings/requests/<scene>.<variant>, written by web.js):
 # the watcher bakes them before anything else and removes the request (renamed .failed if the bake fails).
 REQUESTABLE = ("people",)

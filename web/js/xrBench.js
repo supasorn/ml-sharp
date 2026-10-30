@@ -16,6 +16,23 @@
  * bench=ldi -- MPI-only vs its layered-depth-image bake (mpivar=ldi), compressed textures, alternating
  * (A B A B) per scene of ?benchscenes (default: the four test scenes), same timing as bench=views.
  *
+ * bench=profile -- where a scene's frame time goes (default scene: the one opened). Phases on one scene: Original
+ * splats; Mesh hybrid (all regions, ?lod=meshall) whole, mesh only, splats only, splats only with the splat size
+ * capped at 32 px (fill-bound if this is much faster), whole with maximum foveation (fill again); Photo detail
+ * (MPI) for reference; Mesh hybrid whole again (drift). Same timing as bench=views; each phase also logs frame-time
+ * percentiles, GPU time (EXT_disjoint_timer_query_webgl2, if the browser has it), triangles and draw calls per
+ * frame, CPU time and Spark sorts / rebuilds.
+ *
+ * bench=backdrop -- Mesh hybrid (meshall) vs Mesh hybrid + backdrop (meshback, its big background splats meshed),
+ * alternating twice, then the backdrop model's mesh only and splats only; same logging as bench=profile.
+ *
+ * bench=bgmpi -- Mesh hybrid (meshall) vs Mesh + background MPI (meshbg: meshall's mesh, its background splats as a
+ * sparse MPI, its foreground splats), alternating twice, then meshbg without splats and splats only; Photo detail for
+ * reference. Same logging as bench=profile.
+ *
+ * bench=meshmpi -- Mesh-MPI (meshall's mesh + all its leftover splats as a sparse MPI, no splats) vs Mesh hybrid
+ * (meshall) and Mesh + background MPI (meshbg), Mesh-MPI twice; Photo detail for reference. Same logging as bench=profile.
+ *
  * bench=vars -- MPI-only variant bakes of ?benchvars=a,b,c (compressed; "mpionly" = the plain MPI-only bake),
  * run twice in turn (a b c a b c) on ?benchscenes (default: the scene opened), same timing as bench=views.
  */
@@ -24,6 +41,25 @@ const VIEW_PHASES = [
   { lod: "full", tex: "png" }, { lod: "hybrid", tex: "png" },
   { lod: "mpi", tex: "png" }, { lod: "mpi", tex: "ktx2" },
   { lod: "mpionly", tex: "png" }, { lod: "mpionly", tex: "ktx2" },
+];
+const PROFILE_PHASES = [
+  { lod: "full" },
+  { lod: "meshall" }, { lod: "meshall", show: "mesh" }, { lod: "meshall", show: "splats" },
+  { lod: "meshall", show: "splats", maxPx: 32 }, { lod: "meshall", foveation: 1 },
+  { lod: "photo", tex: "ktx2" }, { lod: "meshall" },
+];
+const BACKDROP_PHASES = [
+  { lod: "meshall" }, { lod: "meshback" }, { lod: "meshall" }, { lod: "meshback" },
+  { lod: "meshback", show: "mesh" }, { lod: "meshback", show: "splats" },
+];
+const BGMPI_PHASES = [
+  { lod: "meshall" }, { lod: "meshbg", tex: "ktx2" }, { lod: "meshall" }, { lod: "meshbg", tex: "ktx2" },
+  { lod: "meshbg", tex: "ktx2", show: "mesh" }, { lod: "meshbg", tex: "ktx2", show: "splats" },
+  { lod: "photo", tex: "ktx2" },
+];
+const MESHMPI_PHASES = [
+  { lod: "meshall" }, { lod: "meshmpi", tex: "ktx2" }, { lod: "meshbg", tex: "ktx2" }, { lod: "meshmpi", tex: "ktx2" },
+  { lod: "photo", tex: "ktx2" },
 ];
 const DEFAULT_SCENES = ["20260914_113455_56657", "20200927_161631"];
 const LDI_PHASES = [
@@ -39,7 +75,19 @@ const LDI_SCENES = ["20250810_134957_16671", "20260914_113455_56657", "me_small"
  * returns a promise resolved once that content is shown; onPhase(text) shows
  * a label in the headset; scenes is the list of scenes.
  */
-export function setupBench(name, { renderer, flatSplats, report, loadView, onPhase, scenes, currentScene }) {
+export function setupBench(name, { renderer, flatSplats, report, loadView, onPhase, scenes, currentScene, stats }) {
+  if (name === "profile" && loadView) return viewsBench(renderer, report, loadView, onPhase,
+                                                        scenes && scenes.length ? scenes : [currentScene],
+                                                        PROFILE_PHASES, "profile", stats);
+  if (name === "backdrop" && loadView) return viewsBench(renderer, report, loadView, onPhase,
+                                                         scenes && scenes.length ? scenes : [currentScene],
+                                                         BACKDROP_PHASES, "backdrop", stats);
+  if (name === "bgmpi" && loadView) return viewsBench(renderer, report, loadView, onPhase,
+                                                      scenes && scenes.length ? scenes : [currentScene],
+                                                      BGMPI_PHASES, "bgmpi", stats);
+  if (name === "meshmpi" && loadView) return viewsBench(renderer, report, loadView, onPhase,
+                                                        scenes && scenes.length ? scenes : [currentScene],
+                                                        MESHMPI_PHASES, "meshmpi", stats);
   if (name === "views" && loadView) return viewsBench(renderer, report, loadView, onPhase, scenes);
   if (name === "ldi" && loadView) return viewsBench(renderer, report, loadView, onPhase,
                                                     scenes && scenes.length ? scenes : LDI_SCENES, LDI_PHASES, "ldi");
@@ -89,11 +137,15 @@ export function setupBench(name, { renderer, flatSplats, report, loadView, onPha
   return { step };
 }
 
-function viewsBench(renderer, report, loadView, onPhase, scenes, phases = VIEW_PHASES, test = "views") {
+function viewsBench(renderer, report, loadView, onPhase, scenes, phases = VIEW_PHASES, test = "views", stats = null) {
   const list = (scenes && scenes.length ? scenes : DEFAULT_SCENES)
     .flatMap((scene) => phases.map((p) => ({ scene, ...p })));
-  const label = (p) => `${{ full: "Original splats", hybrid: "Hybrid", mpi: "Hybrid-MPI", mpionly: "MPI-only" }[p.lod]}`
-    + (p.mpivar ? ` ${p.mpivar}` : "") + (p.tex === "ktx2" ? " · compressed" : "");
+  const label = (p) => `${{ full: "Original splats", hybrid: "Hybrid", mpi: "Hybrid-MPI", mpionly: "MPI-only",
+                            meshall: "Mesh hybrid", meshback: "Mesh + backdrop", meshbg: "Mesh + bg MPI", meshmpi: "Mesh-MPI", photo: "Photo detail" }[p.lod] ?? p.lod}`
+    + (p.mpivar ? ` ${p.mpivar}` : "") + (p.tex === "ktx2" ? " · compressed" : "")
+    + (p.show ? ` · ${p.show} only` : "") + (p.maxPx ? ` · max ${p.maxPx} px` : "")
+    + (p.foveation !== undefined ? ` · foveation ${p.foveation}` : "");
+  const pct = (a, q) => a.length ? +a[Math.min(a.length - 1, Math.floor(q * a.length))].toFixed(2) : null;
   // state: idle -> loading -> settle (2 s) -> measure (8 s) -> next phase
   const st = { i: -1, state: "idle", presentingSince: 0, t0: 0, frames: 0, measureStart: 0 };
 
@@ -128,16 +180,23 @@ function viewsBench(renderer, report, loadView, onPhase, scenes, phases = VIEW_P
     if (st.state === "loading") return;
     if (st.state === "settle") {
       if (now - st.t0 < 2000) return;
-      Object.assign(st, { state: "measure", t0: now, frames: 0, measureStart: now });
+      Object.assign(st, { state: "measure", t0: now, frames: 0, measureStart: now, last: now, dts: [] });
+      stats?.(true);   // reset the viewer's counters
       return;
     }
     if (st.state === "measure") {
       st.frames++;
+      st.dts.push(now - st.last);
+      st.last = now;
       if (now - st.t0 < 8000) return;
       const fps = (st.frames - 1) * 1000 / (now - st.measureStart);
       const p = list[st.i];
+      const dts = st.dts.slice(1).sort((a, b) => a - b);
       report({ test: `bench-${test}`, phase: st.i, fps: +fps.toFixed(1), scene: p.scene, lod: p.lod, tex: p.tex,
-               mpivar: p.mpivar || null });
+               mpivar: p.mpivar || null, show: p.show || "both", maxPx: p.maxPx ?? null,
+               foveation: p.foveation ?? null, label: label(p),
+               dtMs: { p10: pct(dts, 0.1), p50: pct(dts, 0.5), p90: pct(dts, 0.9), p99: pct(dts, 0.99) },
+               ...(stats?.(false) ?? {}) });
       st.state = "next";
     }
     if (st.state === "next") {

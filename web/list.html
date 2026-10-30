@@ -436,6 +436,7 @@
         <button type="button" data-lod="full">Original splats</button>
         <button type="button" data-lod="hybrid">Hybrid</button>
         <button type="button" data-lod="mpi" title="Hybrid mesh + the remaining splats as a sparse multi-plane image (scripts/bake_mpi.py); falls back to the original splats when not baked">Hybrid-MPI</button>
+        <button type="button" data-lod="meshmpi" title="Multi-region mesh (scripts/mesh_regions.py) + all its leftover splats as a sparse multi-plane image, no splats; only where baked">Mesh-MPI</button>
         <button type="button" data-lod="mpionly" title="All splats as a sparse multi-plane image, no mesh (scripts/bake_mpi.py --mpionly)">MPI-only</button>
         <button type="button" data-lod="surf" title="MPI-only made of connected surface pieces instead of depth slices: smoother up close, lighter (SURF=1 bake)">MPI-surf</button>
         <button type="button" data-lod="ad12sep" title="MPI-only with 64 base planes, 3x finer where stacking shows: fewer stacking artifacts at about MPI-only speed (bake_mpi.py --mpionly --variant ad12sep); falls back to the original splats when not baked">Adaptive</button>
@@ -625,7 +626,7 @@
       });
       // Grey out scenes that don't have the selected view mode (not baked yet); an MPI-only variant falls back to
       // plain MPI-only in the viewer, so those still open.
-      const BASE_LODS = ['full', 'hybrid', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
+      const BASE_LODS = ['full', 'hybrid', 'mpi', 'meshmpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
       $('.scene-item').not('.pending').each(function () {
         const pano = $(this).data('kind') === 'pano';
         const modes = ($(this).data('modes') || (pano ? 'msi' : 'full')).split(' ');

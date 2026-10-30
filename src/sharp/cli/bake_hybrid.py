@@ -265,24 +265,26 @@ def hidden_behind_mesh(mdepth, means, sigma, eyes, W, H, f, std, max_radius=64):
     `std` sigmas). Conservative: the mesh is shrunk by 1 px at its border and
     projected into each view without filling gaps, the quad is bounded by a
     square window, and splats with a quad over `max_radius` px or a centre
-    off-screen (but quad partly on-screen) are kept.
+    off-screen (but quad partly on-screen) are kept. `mdepth` may also be a list
+    of depth maps (several mesh layers, all W x H): together they occlude.
     """
     import torch
     import torch.nn.functional as F
 
     dev = "cuda"
-    md = torch.tensor(np.where(np.isfinite(mdepth), mdepth, np.inf), device=dev, dtype=torch.float32)
-    present = torch.isfinite(md)
-    interior = -F.max_pool2d(-present.float()[None, None], 3, 1, 1)[0, 0] > 0.5
-    md = torch.where(interior, md, torch.full_like(md, float("inf")))
-    ys, xs = torch.nonzero(torch.isfinite(md), as_tuple=True)
-    d = md[ys, xs]
     src = []
-    for dy in (-1 / 3, 0.0, 1 / 3):
-        for dx in (-1 / 3, 0.0, 1 / 3):
-            u = xs.float() + 0.5 + dx
-            v = ys.float() + 0.5 + dy
-            src.append(torch.stack([(u - W / 2) / f * d, (v - H / 2) / f * d, d], -1))
+    for layer in (mdepth if isinstance(mdepth, list) else [mdepth]):
+        md = torch.tensor(np.where(np.isfinite(layer), layer, np.inf), device=dev, dtype=torch.float32)
+        present = torch.isfinite(md)
+        interior = -F.max_pool2d(-present.float()[None, None], 3, 1, 1)[0, 0] > 0.5
+        md = torch.where(interior, md, torch.full_like(md, float("inf")))
+        ys, xs = torch.nonzero(torch.isfinite(md), as_tuple=True)
+        d = md[ys, xs]
+        for dy in (-1 / 3, 0.0, 1 / 3):
+            for dx in (-1 / 3, 0.0, 1 / 3):
+                u = xs.float() + 0.5 + dx
+                v = ys.float() + 0.5 + dy
+                src.append(torch.stack([(u - W / 2) / f * d, (v - H / 2) / f * d, d], -1))
     src = torch.cat(src)
 
     M = torch.tensor(means, device=dev, dtype=torch.float32)

@@ -161,7 +161,7 @@
     // MPI-surf view modes (surf, surf2, ...): <scene>_mpionly_<mode>.glb, no mesh.
     // Any other ?lod is an MPI-only variant bake: <scene>_mpionly_<lod>.glb (surf*, ldi, ad25, u512, p256, ...;
     // listed in the model picker), no mesh. So every bake can be compared with ?lod=a,b,c.
-    const BASE_LODS = ['full', 'hybrid', 'meshflood', 'meshall', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
+    const BASE_LODS = ['full', 'hybrid', 'meshflood', 'meshall', 'meshback', 'bgsplats', 'fgsplats', 'meshbg', 'meshmpi', 'meshmpi-d1', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
     const isVariant = (lod) => !!lod && /^[a-z0-9]+$/i.test(lod) && !BASE_LODS.includes(lod);
     // ?lod=a,b[,c,d]: compare view modes on the desktop, side by side (two or three) or in a 2x2 grid (four),
     // all seen through the one camera (synced). The first mode is the scene's mode otherwise (and in XR).
@@ -287,7 +287,16 @@
     // const renderer = new THREE.WebGLRenderer({ alpha: true });
     // alpha is needed so the Quest passthrough shows behind the splats in AR;
     // the page background is black, so desktop looks unchanged.
-    const renderer = new THREE.WebGLRenderer({ alpha: true });
+    // ?aa=1 / 2: 4x multisampling (desktop canvas and the XR framebuffer): smooths the hard silhouettes of opaque
+    // meshes (mesh hybrids); splats and MPI layers are soft already. aa=1: three's XR projection layer with its own
+    // multisampled target (cheap only with WEBGL_multisampled_render_to_texture, else a resolve blit per frame);
+    // aa=2: hides XRWebGLBinding so three falls back to an XRWebGLLayer({ antialias }), multisampled by the browser.
+    const aaMode = new URLSearchParams(window.location.search).get('aa');
+    if (aaMode === '2' && typeof XRWebGLBinding !== 'undefined') {
+      try { Object.defineProperty(window, 'XRWebGLBinding', { value: undefined, configurable: true }); }
+      catch (e) { console.warn('aa=2: cannot hide XRWebGLBinding', e); }
+    }
+    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: aaMode === '1' || aaMode === '2' });
     renderer.setClearColor(0x000000, 0);
     // renderer.setClearColor(0xFF0000, 1); // 0 alpha for full transparency
     renderer.setPixelRatio(2);
@@ -404,6 +413,7 @@
     }
 
     // 3) Add SparkRenderer to the scene
+    spark.renderOrder = 1000;   // splats after any semi-transparent layers (MPI planes: renderOrder <= 100)
     scene.add(spark);
     scene.add(xrRoot);
     xrContent.add(sortCamera);
@@ -464,6 +474,7 @@
     const flatSplats = splatDraw === 'instanced' ? null
       : createFlatSplats(THREE, spark, { corners: splatDraw === 'quads' ? 4 : 3 });
     if (flatSplats) {
+      flatSplats.mesh.renderOrder = spark.renderOrder;
       scene.add(flatSplats.mesh);
       flatSplats.set(true);
     }
@@ -479,6 +490,8 @@
         device,
         xrMode: s ? (s.environmentBlendMode === 'opaque' ? 'vr' : 'ar') : null,
         refreshHz: s?.frameRate ?? null,
+        aa: aaMode, msrtt: renderer.extensions.has('WEBGL_multisampled_render_to_texture'),
+        xrLayer: layer ? ('textureWidth' in layer ? 'projection' : 'webgl') : null,
         fb: (layer?.framebufferWidth ?? layer?.textureWidth)
           ? `${layer.framebufferWidth ?? layer.textureWidth}x${layer.framebufferHeight ?? layer.textureHeight}` : null,
       };
@@ -487,6 +500,30 @@
     // Self-running XR benchmark (?bench=<name>, see web/js/xrBench.js); its
     // phases are logged instead of the periodic FPS reports.
     const benchName = getQueryParam('bench');
+    // GPU time per frame (both eyes) for the benchmarks, where the browser exposes timer queries.
+    const gpuTimer = (() => {
+      const gl = renderer.getContext();
+      const ext = benchName && gl.getExtension('EXT_disjoint_timer_query_webgl2');
+      if (!ext) return null;
+      const pending = [];
+      let q = null, samples = [];
+      return {
+        begin() { if (q || pending.length > 8) return; q = gl.createQuery(); gl.beginQuery(ext.TIME_ELAPSED_EXT, q); },
+        end() { if (!q) return; gl.endQuery(ext.TIME_ELAPSED_EXT); pending.push(q); q = null; },
+        poll() {
+          const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);
+          while (pending.length && gl.getQueryParameter(pending[0], gl.QUERY_RESULT_AVAILABLE)) {
+            const r = pending.shift();
+            if (!disjoint) samples.push(gl.getQueryParameter(r, gl.QUERY_RESULT) / 1e6);
+            gl.deleteQuery(r);
+          }
+        },
+        take() { const t = samples; samples = []; return t; },
+      };
+    })();
+    // Per-phase counters for bench=profile (filled in the frame loop).
+    const benchAcc = { cpu: [], tris: 0, calls: 0, n: 0, sorts0: 0, rebuilds0: 0 };
+    const pctOf = (a, q) => a.length ? +a.sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(q * a.length))].toFixed(2) : null;
     const xrBench = benchName ? setupBench(benchName, {
       renderer, flatSplats,
       report: (fields) => fetch('/fps', {
@@ -495,12 +532,40 @@
                                xrScale, ...deviceInfo(), ...fields }),
       }).catch(() => {}),
       // bench=views: show one (scene, lod, tex) in place, re-centred in front of the viewer.
-      loadView: async ({ scene, lod, tex, mpivar }) => {
+      loadView: async ({ scene, lod, tex, mpivar, show, maxPx, foveation }) => {
         lodMode = lod;
         texKtx2 = tex === 'ktx2';
         mpivarCur = mpivar || '';
+        guiParams.showMesh = show !== 'splats';     // bench=profile: one part of a hybrid only
+        guiParams.showSplat = show !== 'mesh';
+        guiParams.showMPI = true;
         await stepScene(0, scene);
+        applyVisibility(splat);
+        spark.maxPixelRadius = maxPx ?? xrMaxPx;
+        renderer.xr.setFoveation(foveation ?? xrFoveation);
         xrController.resetPlacement();
+      },
+      stats: (reset) => {
+        if (reset) {
+          gpuTimer?.take();
+          Object.assign(benchAcc, { cpu: [], tris: 0, calls: 0, n: 0, sorts0: sparkStats.sorts,
+                                    rebuilds0: sparkStats.rebuilds });
+          return null;
+        }
+        const g = gpuTimer ? gpuTimer.take() : null;
+        let meshTris = 0;
+        splat.traverse((c) => {
+          if (c.isMesh && !(c instanceof SplatMesh) && !c.userData.isWire && c.geometry?.index) meshTris += c.geometry.index.count / 3;
+        });
+        return {
+          splats: countSplats(splat), meshTris,
+          gpuMs: g ? (g.length ? { p50: pctOf(g, 0.5), p90: pctOf(g, 0.9), n: g.length } : 'no samples') : 'no timer extension',
+          cpuMs: { p50: pctOf(benchAcc.cpu, 0.5), p90: pctOf(benchAcc.cpu, 0.9) },
+          trisPerFrame: benchAcc.n ? Math.round(benchAcc.tris / benchAcc.n) : null,
+          callsPerFrame: benchAcc.n ? +(benchAcc.calls / benchAcc.n).toFixed(1) : null,
+          sorts: sparkStats.sorts - benchAcc.sorts0, rebuilds: sparkStats.rebuilds - benchAcc.rebuilds0,
+          maxPxSet: spark.maxPixelRadius, stdDev: +spark.maxStdDev.toFixed(2),
+        };
       },
       onPhase: (text, seconds) => xrToast.show(text, seconds),
       scenes: (getQueryParam('benchscenes') || '').split(',').filter(Boolean),
@@ -602,6 +667,27 @@
     controls.target.copy(center);
     controls.enablePan = true;
     controls.update();
+    // ?cam=px,py,pz,tx,ty,tz,fov (desktop): camera position, orbit target (world = the photo camera's frame: y up,
+    // -z forward, metres) and vertical FOV; kept in the URL as the view changes, so a view can be shared and
+    // reproduced offline (the splats' OpenCV coordinates are (x, -y, -z)).
+    const camParam = getQueryParam('cam');
+    if (camParam && !isPano) {
+      const c = camParam.split(',').map(Number);
+      if (c.length >= 6 && c.every(Number.isFinite)) {
+        camera.position.set(c[0], c[1], c[2]);
+        controls.target.set(c[3], c[4], c[5]);
+        if (c[6]) { camera.fov = c[6]; camera.updateProjectionMatrix(); }
+        controls.update();
+      }
+    }
+    function saveCamToUrl() {
+      if (renderer.xr.isPresenting || isPano) return;
+      const p = camera.position, t = controls.target, f = (v) => String(Number(v.toPrecision(9)));   // the orbit target can be < 1 mm away
+      const url = new URL(window.location);
+      url.searchParams.set('cam', [f(p.x), f(p.y), f(p.z), f(t.x), f(t.y), f(t.z), camera.fov.toFixed(3)].join(','));
+      history.replaceState(null, '', url);
+    }
+    controls.addEventListener('end', saveCamToUrl);
 
 
     const target = controls.target;
@@ -632,6 +718,7 @@
       e.preventDefault();
       if (isPano) return;   // PanoLook zooms (FOV)
       dollyZoom(e.deltaY * 0.01);
+      saveCamToUrl();
     }, { passive: false });
 
 
@@ -644,7 +731,14 @@
     // ?lod=mpi the same with <scene>_mpi.glb (its MPI=1 sparse multi-plane mode);
     // ?lod=mpionly loads only <scene>_mpionly.glb (MPI from all splats, no mesh).
     // ?lod=meshflood loads <scene>_mesh.glb + <scene>_pruned.ply (flood-filled surface mesh, scripts/mesh_hybrid.py);
-    // ?lod=meshall <scene>_meshall.glb + <scene>_prunedall.ply (all smooth regions, scripts/mesh_regions.py).
+    // ?lod=meshall <scene>_meshall.glb + <scene>_prunedall.ply (all smooth regions, scripts/mesh_regions.py);
+    // ?lod=meshback <scene>_meshback.glb + <scene>_prunedback.ply (the same plus a backdrop mesh, --backdrop);
+    // ?lod=bgsplats / fgsplats: <scene>_bgsplats.ply / _fgsplats.ply, meshall's leftover splats split into background
+    // and foreground soft-boundary splats (scripts/split_splats.py), splats only;
+    // ?lod=meshbg: meshall's mesh (<scene>_bgmpi_mesh.glb) + the background splats as a sparse MPI (<scene>_bgmpi.glb,
+    // eval_alpha_patches.py on _bgsplats.ply) + the foreground splats (_fgsplats.ply), drawn in that order;
+    // ?lod=meshmpi (Mesh-MPI): meshall's mesh (<scene>_meshmpi_mesh.glb) + all its leftover splats as a sparse MPI
+    // (<scene>_meshmpi.glb, eval_alpha_patches.py with that mesh), no splats. Not Hybrid-MPI (?lod=mpi, bake-hybrid's mesh).
     // All fall back to the full splats when missing.
     // ?variant=_hybrid_s2 (etc.) loads a hybrid baked with another --name-suffix.
     const hybridName = /^_[A-Za-z0-9_]+$/.test(getQueryParam('variant') || '') ? getQueryParam('variant') : '_hybrid';
@@ -653,13 +747,18 @@
     let lodMode = lodList[0];  // changeable in XR (gallery, secondary thumbstick)
     let mpivarCur = (getQueryParam('mpivar') || '').replace(/[^a-z0-9]/gi, '');   // ?mpivar (benchmarks switch it)
     const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
-                        { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'mpionly', label: 'MPI-only' },
+                        { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'meshmpi', label: 'Mesh-MPI' },
+                        { id: 'mpionly', label: 'MPI-only' },
                         { id: 'ad12sep', label: 'MPI adaptive' }, { id: 'surf', label: 'MPI-surf' },
                         { id: 'photo', label: 'Photo detail' }, { id: 'photo2', label: 'Photo full-res' },
                         { id: 'people', label: 'People' }];
     // Experimental modes: ?lod only (not in the XR gallery's mode row).
     const EXTRA_MODES = [{ id: 'meshflood', label: 'Mesh hybrid (flood fill)' },
-                         { id: 'meshall', label: 'Mesh hybrid (all regions)' }];
+                         { id: 'meshall', label: 'Mesh hybrid (all regions)' },
+                         { id: 'meshback', label: 'Mesh hybrid + backdrop' },
+                         { id: 'bgsplats', label: 'Background splats' }, { id: 'fgsplats', label: 'Foreground splats' },
+                         { id: 'meshbg', label: 'Mesh + background MPI' },
+                         { id: 'meshmpi-d1', label: 'Mesh-MPI · debug: splat-coloured mesh' }];
     async function splatUrlFor(scene) {
       const full = `${sceneBase(scene)}.ply`;
       if (lodMode !== 'quest') return full;
@@ -748,6 +847,31 @@
     // mesh sits slightly in front of its surface, so splats on it are hidden
     // (the texture already contains them) while border splats still draw
     // where they extend past it.
+    // Unlit material of an opaque textured mesh. Meshes from scripts/mesh_regions.py carry a vertex attribute
+    // _edge, the distance (texels) to the nearest depth edge in the texture: the mipmap level is capped by it
+    // (level log2(d) - 1 averages blocks that stay clear of the edge), so a surface's edge never blends in the
+    // nearer object next to it in the photo (a fringe of that object's colour once the head moves).
+    // ?meshbias=<b>: added to the mesh texture's mip level (> 0 blurs: less flicker on the photo's fine detail).
+    const meshLodBias = Number(getQueryParam('meshbias') ?? 0) || 0;
+    function opaqueMeshMaterial(map, geometry) {
+      const mat = new THREE.MeshBasicMaterial({ map, side: THREE.DoubleSide });
+      if (!map || !geometry?.attributes?._edge) return mat;
+      mat.onBeforeCompile = (shader) => {
+        shader.vertexShader = 'attribute float _edge;\nvarying float vEdge;\n' +
+          shader.vertexShader.replace('#include <uv_vertex>', '#include <uv_vertex>\nvEdge = _edge;');
+        shader.fragmentShader = 'varying float vEdge;\n' + shader.fragmentShader.replace('#include <map_fragment>',
+          THREE.ShaderChunk.map_fragment.replace('texture2D( map, vMapUv )', 'edgeCappedMap()'))
+          .replace('void main() {', 'vec4 edgeCappedMap() {\n' +
+            '  vec2 t = vMapUv * vec2(textureSize(map, 0));\n' +
+            '  vec2 dx = dFdx(t), dy = dFdy(t);\n' +
+            `  float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-8)) + ${meshLodBias.toFixed(3)};\n` +
+            '  return textureLod(map, vMapUv, clamp(lod, 0.0, max(log2(max(vEdge, 1.0)) - 1.0, 0.0)));\n' +
+            '}\nvoid main() {');
+      };
+      mat.customProgramCacheKey = () => `edgeCappedMap${meshLodBias}`;
+      return mat;
+    }
+
     async function loadHybrid(scene, meshSuffix = `${hybridName}.glb`, splatSuffix = `${hybridName}.ply`) {
       const gltf = await new GLTFLoader().loadAsync(`${sceneBase(scene)}${meshSuffix}`);
       const mesh = gltf.scene;
@@ -758,7 +882,7 @@
         const map = child.material.map;
         if (map) map.colorSpace = THREE.SRGBColorSpace;
         child.material.dispose();
-        child.material = new THREE.MeshBasicMaterial({ map, side: THREE.DoubleSide });
+        child.material = opaqueMeshMaterial(map, child.geometry);
       });
       const s = createSplat(`${sceneBase(scene)}${splatSuffix}`);
       await s.initialized;
@@ -871,7 +995,7 @@
             map.needsUpdate = true;
           }
           if (!k) {
-            child.material = new THREE.MeshBasicMaterial({ map, side: THREE.DoubleSide });
+            child.material = opaqueMeshMaterial(map, child.geometry);
             return;
           }
           // The textures hold premultiplied display-space (sRGB-encoded) colour. Use them raw: as an sRGB
@@ -1027,6 +1151,7 @@
       return n;
     }
 
+    const MESH_SFX = { meshflood: '', meshall: 'all', meshback: 'back' };   // scripts/mesh_hybrid.py, mesh_regions.py
     async function loadContent(scene) {
       if (isPanoScene(scene)) return loadPano(scene);
       setSortPano(false);
@@ -1039,8 +1164,53 @@
         }
         console.warn(`No ${url}; using full splats.`);
       }
-      if (lodMode === 'meshflood' || lodMode === 'meshall') {
-        const sfx = lodMode === 'meshall' ? 'all' : '';
+      // meshmpi-d1 (debug): the same MPI with the mesh textured by SHARP's splat colours only (mesh_regions.py
+      // --suffix d1 --no-photo-detail): files <scene>_meshmpid1[_astc].glb (= meshmpi's) + _meshmpid1_mesh.glb.
+      const MESHMPI_SFX = { meshmpi: '_meshmpi', 'meshmpi-d1': '_meshmpid1' };
+      if (lodMode in MESHMPI_SFX) {
+        const url = `${sceneBase(scene)}${MESHMPI_SFX[lodMode]}.glb`;
+        try {
+          if ((await fetch(url, { method: 'HEAD' })).ok) {
+            loadedAs = modeLabel(lodMode);
+            return await loadSurfaces(scene, MESHMPI_SFX[lodMode], true);
+          }
+        } catch (e) {
+          console.error(`Failed to load ${url}:`, e);
+        }
+        console.warn(`No ${url}; using full splats.`);
+      }
+      if (lodMode === 'meshbg') {
+        const url = `${sceneBase(scene)}_bgmpi.glb`;
+        try {
+          if ((await fetch(url, { method: 'HEAD' })).ok) {
+            const [group, s] = await Promise.all([loadSurfaces(scene, '_bgmpi', true),
+                                                  (async () => { const s = createSplat(`${sceneBase(scene)}_fgsplats.ply`);
+                                                                 await s.initialized; return s; })()]);
+            group.add(s);
+            loadedAs = modeLabel(lodMode);
+            return group;
+          }
+        } catch (e) {
+          console.error(`Failed to load ${url}:`, e);
+        }
+        console.warn(`No ${url}; using full splats.`);
+      }
+      if (lodMode === 'bgsplats' || lodMode === 'fgsplats') {
+        const url = `${sceneBase(scene)}_${lodMode}.ply`;
+        try {
+          if ((await fetch(url, { method: 'HEAD' })).ok) {
+            const s = createSplat(url);
+            await s.initialized;
+            loadedAs = modeLabel(lodMode);
+            return s;
+          }
+        } catch (e) {
+          console.error(`Failed to load ${url}:`, e);
+        }
+        console.warn(`No ${url}; using full splats.`);
+      }
+      if (lodMode in MESH_SFX) {
+        const sfx = MESH_SFX[lodMode];
         const url = `${sceneBase(scene)}_mesh${sfx}.glb`;
         try {
           if ((await fetch(url, { method: 'HEAD' })).ok) {
@@ -1134,14 +1304,20 @@
     function applyVisibility(obj) {
       if (!obj) return;
       applyInspect(obj);
+      // Parts: splats, opaque meshes, semi-transparent layers (MPI planes; GUI showMPI). Hidden helper meshes
+      // (ldicolor_* colour pages) and wireframe overlays are left alone.
+      const kind = (c) => c instanceof SplatMesh ? 'splat'
+        : (!c.isMesh || c.userData.isWire || /ldicolor_/.test(c.name || '')) ? null
+        : (c.userData.texMat ?? c.material)?.transparent ? 'layer' : 'mesh';
       if (hybrid !== "true") {
-        let splats = false, meshes = false;
-        obj.traverse((c) => { if (c instanceof SplatMesh) splats = true; else if (c.isMesh) meshes = true; });
-        if (!splats || !meshes) return;
+        const kinds = new Set();
+        obj.traverse((c) => { const k = kind(c); if (k) kinds.add(k); });
+        if (kinds.size < 2) return;
       }
+      const show = { splat: guiParams.showSplat, mesh: guiParams.showMesh, layer: guiParams.showMPI };
       obj.traverse((child) => {
-        if (child instanceof SplatMesh) child.visible = guiParams.showSplat;
-        else if (child.isMesh && !child.userData.isWire) child.visible = guiParams.showMesh;
+        const k = kind(child);
+        if (k) child.visible = show[k];
       });
     }
 
@@ -1240,7 +1416,7 @@
     loadStatus.start(pendingLabel(file));
     if (hybrid === "true") {
       splat = createSplat(splatURL);
-    } else if (isPano || ['layers', 'hybrid', 'meshflood', 'meshall', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
+    } else if (isPano || ['layers', 'hybrid', 'meshflood', 'meshall', 'meshback', 'bgsplats', 'fgsplats', 'meshbg', 'meshmpi', 'meshmpi-d1', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
       splat = await loadContent(file);
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading
@@ -1328,6 +1504,7 @@
               ps = new SparkRenderer({ renderer, autoUpdate: false, preUpdate: true,
                                        view: { sort32: true, sortRadial: false } });
               ps.visible = false;
+              ps.renderOrder = spark.renderOrder;
               scene.add(ps);
             }
             cmpPanels.push({ content: c, lod, spark: ps });
@@ -1591,6 +1768,7 @@
       center: 50,
       showMesh: true,
       showSplat: true,
+      showMPI: true,
       shaded: false,
       wireframe: false,
       sortOnce: true
@@ -1743,6 +1921,10 @@
       applyVisibility(splat);
       cmpPanels.forEach((p) => applyVisibility(p.content));
     });
+    gui.add(guiParams, 'showMPI').onChange(() => {
+      applyVisibility(splat);
+      cmpPanels.forEach((p) => applyVisibility(p.content));
+    });
     const inspect = () => [splat, meshObj, ...cmpPanels.map((p) => p.content)].forEach((o) => o && applyInspect(o));
     gui.add(guiParams, 'shaded').onChange(inspect);
     gui.add(guiParams, 'wireframe').onChange(inspect);
@@ -1891,8 +2073,18 @@
         controls.update();
       }
       if (!isPano) controls.update();
+      const timing = xrBench && renderer.xr.isPresenting;
+      if (timing) gpuTimer?.begin();
       if (cmpLabels.length && !renderer.xr.isPresenting) renderPanels();
       else renderer.render(scene, camera);
+      if (timing) {
+        gpuTimer?.end();
+        gpuTimer?.poll();
+        benchAcc.cpu.push(performance.now() - frameStart);
+        benchAcc.tris += renderer.info.render.triangles;
+        benchAcc.calls += renderer.info.render.calls;
+        benchAcc.n++;
+      }
       // splat.rotation.y += 0.01;
       stats.end();
       if (renderer.xr.isPresenting) {

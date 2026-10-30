@@ -292,6 +292,7 @@ function sceneModes(outDir, name) {
   if (has('_hybrid.glb') && has('_hybrid.ply')) modes.push('hybrid');
   if (has('_mpi.glb')) modes.push('mpi');
   if (has('_mpionly.glb')) modes.push('mpionly');
+  if (has('_meshmpi.glb') && has('_meshmpi_mesh.glb')) modes.push('meshmpi');   // Mesh-MPI (scripts/mesh_regions.py + MPI bake)
   // MPI-only variant bakes (<name>_mpionly_<tag>.glb, e.g. surf*, ldi, ad25): view modes named by their tag.
   const pre = `${name}_mpionly_`;
   try {

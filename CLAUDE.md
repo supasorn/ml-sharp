@@ -11,7 +11,7 @@ Quick facts:
 - Python env: `/conda_envs/sharp` (`sharp ...` CLI). gsplat needs the CUDA 13
   runtime preload handled by `load_gsplat()` in `src/sharp/cli/bake_layers.py`.
 - Server: `node web.js` (HTTPS on 3443 for WebXR; `certs/` holds the key —
-  never commit it). Gallery at `/list`, viewer at `/?scene=<name>&lod=hybrid`.
+  never commit it). Gallery at `/list`, viewer at `/?scene=<name>&lod=photo`.
   `scripts/start_server.sh` runs it together with the SHARP prediction watcher
   and the MPI-only watcher (`scripts/bake_mpi.py --watch --mpionly`; new scenes
   get MPI-only, then its `photo` variant, the default view; not Hybrid / Hybrid-MPI) and the panorama watcher
@@ -22,7 +22,9 @@ Quick facts:
   how-to with options and troubleshooting: `docs/hybrid-baking.md`.
 - Default view is **MPI-only** (`?lod=mpionly`): all splats as a sparse
   multi-plane image with compressed (KTX2/UASTC) textures — fastest and best
-  quality on the Quest 3. Hybrid-MPI (`?lod=mpi`) = hybrid mesh + MPI of the
+  quality on the Quest 3. Gallery modes: Original splats, Mesh-MPI, MPI-only, Photo detail, People; Hybrid,
+  Hybrid-MPI, MPI-surf, Adaptive and Photo full-res were retired 2026-10-30 (files deleted, how to re-bake:
+  findings doc §10). Hybrid-MPI (`?lod=mpi`) = hybrid mesh + MPI of the
   remaining splats. Bake with `python scripts/bake_mpi.py` (Hybrid-MPI) and
   `--mpionly`; both also write `_ktx2.glb` (needs KTX-Software in
   `~/.local/opt/ktx-4.4.2`). Not automatic for new scenes. Design, headset
@@ -52,3 +54,5 @@ Quick facts:
   that collection only). Private scene ids are `private:<name>` / `private:pano:<name>` under
   `/c/private/...`. Anything derived from a private scene (thumbnails, bake work files, logs) must
   stay inside `data/private`.
+- Mesh-MPI (`?lod=meshmpi`): multi-region mesh (`scripts/mesh_regions.py`) + all its leftover splats as a sparse
+  MPI; batch bake `scripts/bake_meshmpi.py` (baked for a few scenes so far).

@@ -307,44 +307,6 @@
     .preset:hover {
       background: #4a525e;
     }
-    /* Performance tests */
-    #perfTests {
-      margin: 8px;
-      padding: 12px 16px;
-      background: #23272e;
-      border-radius: 12px;
-    }
-    #perfScene {
-      width: 260px;
-      max-width: 100%;
-      padding: 6px 10px;
-      margin: 0;
-      font-size: 14px;
-      border-radius: 6px;
-      border: 1px solid #3a414b;
-      background: #181c20;
-      color: #eee;
-    }
-    .perf-links {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin: 10px 0 6px;
-    }
-    .perf-links a {
-      background: #3a414b;
-      color: #fff;
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-size: 14px;
-    }
-    .perf-links a:hover {
-      background: #4a525e;
-    }
-    .perf-hint {
-      color: #8a94a3;
-      font-size: 13px;
-    }
     /* Toggle Switch Styles */
     .toggle-switch {
       position: relative;
@@ -434,15 +396,10 @@
       <span class="opt-label">View</span>
       <div class="seg" id="lodSeg">
         <button type="button" data-lod="full">Original splats</button>
-        <button type="button" data-lod="hybrid">Hybrid</button>
-        <button type="button" data-lod="mpi" title="Hybrid mesh + the remaining splats as a sparse multi-plane image (scripts/bake_mpi.py); falls back to the original splats when not baked">Hybrid-MPI</button>
         <button type="button" data-lod="meshmpi" title="Multi-region mesh (scripts/mesh_regions.py) + all its leftover splats as a sparse multi-plane image, no splats; only where baked">Mesh-MPI</button>
         <button type="button" data-lod="mpionly" title="All splats as a sparse multi-plane image, no mesh (scripts/bake_mpi.py --mpionly)">MPI-only</button>
-        <button type="button" data-lod="surf" title="MPI-only made of connected surface pieces instead of depth slices: smoother up close, lighter (SURF=1 bake)">MPI-surf</button>
-        <button type="button" data-lod="ad12sep" title="MPI-only with 64 base planes, 3x finer where stacking shows: fewer stacking artifacts at about MPI-only speed (bake_mpi.py --mpionly --variant ad12sep); falls back to the original splats when not baked">Adaptive</button>
         <button type="button" data-lod="people" title="MPI-only with 4x finer planes on the people in the photo (silhouette included), plain elsewhere; baked on request: turn on People and click a photo">People</button>
         <button type="button" data-lod="photo" title="MPI-only with the photo's detail the splats lost painted back onto solid surfaces, textures up to 2048 px across (bake_mpi.py --mpionly --variant photo)">Photo detail</button>
-        <button type="button" data-lod="photo2" title="Photo detail at the photo's own resolution (up to 4096 px across): sharpest, ~3x the texture memory of MPI-only (bake_mpi.py --mpionly --variant photo2)">Photo detail (full res)</button>
       </div>
     </div>
     <div class="opt-group" title="Texture files of the MPI views: Auto = plain ASTC (_astc.glb) where the GPU supports it (Quest, Mac, phones), else Basis UASTC (_ktx2.glb), else PNG; UASTC = the _ktx2.glb files (older bakes); PNG = uncompressed">
@@ -466,11 +423,6 @@
       <button type="button" class="opt-auto" id="xrscaleAuto" title="1.4 for the MPI views, 1.0 for the splat views">auto</button>
       <span class="opt-value" id="valXrscale"></span>
     </div>
-    <div class="opt-group" title="Quest fixed foveated rendering (0 = off, 1 = max; blurs the view's edges)">
-      <span class="opt-label">foveation</span>
-      <input type="range" id="optFoveation" min="0" max="1" step="0.1">
-      <span class="opt-value" id="valFoveation"></span>
-    </div>
     <div class="opt-group" title="Splat extent in sigmas in AR/VR (2.24 = faster, 2.83 = Spark default, smoother)">
       <span class="opt-label">xrstddev</span>
       <input type="range" id="optXrstddev" min="1.8" max="3" step="0.01">
@@ -481,25 +433,11 @@
       <input type="range" id="optXrmaxpx" min="16" max="512" step="8">
       <span class="opt-value" id="valXrmaxpx"></span>
     </div>
-    <div class="opt-group" title="Adaptive quality: when frames drop, lower splat extent, size cap and foveation; restore them when there's headroom">
-      <label class="opt-label" for="optAdaptive">adaptive</label>
-      <input type="checkbox" id="optAdaptive">
-    </div>
     <div class="opt-group">
       <button type="button" class="preset" id="presetDefault">Defaults</button>
       <button type="button" class="preset" id="presetFull">Full quality</button>
-      <button type="button" class="preset" id="presetSmooth" title="Steady frame rate in close-up scenes">Smooth</button>
+      <button type="button" class="preset" id="presetSmooth" title="Splat size cap 96 px: steadier frame rate in close-up splat scenes">Smooth</button>
     </div>
-  </div>
-
-  <div id="perfTests">
-    <div class="opt-group">
-      <span class="opt-label">Performance tests</span>
-      <input type="text" id="perfScene" value="20260104_122019_7039" spellcheck="false">
-    </div>
-    <div class="perf-links" id="perfLinks"></div>
-    <div class="perf-hint">Open it, tap START AR, and look at the scene from one spot until it exits by itself.
-      Results are logged on the server (logs/xr_perf.jsonl).</div>
   </div>
 
   <div id="progressContainer" style="display:none;">
@@ -559,10 +497,11 @@
     // --- View options: applied to every scene link ---
     // Viewer defaults (web/index.html). Presets set every XR option (not the view).
     // xrscale 'auto': the viewer picks 1.4 for the MPI views and 1.0 for the splat views (no xrscale in the link).
-    const XR_DEFAULTS = { xrscale: 'auto', foveation: 0, xrstddev: 2.24, xrmaxpx: 512, adaptive: false };
+    // Foveation and adaptive quality are no longer offered (viewer defaults: off; still ?foveation= / ?adaptive=1).
+    const XR_DEFAULTS = { xrscale: 'auto', xrstddev: 2.24, xrmaxpx: 512 };
     const DEFAULT_OPTS = { lod: 'photo', pmode: 'msi', tex: 'auto', optsVersion: 5, ...XR_DEFAULTS };
-    const FULL_QUALITY = { ...XR_DEFAULTS, foveation: 0, xrstddev: 2.83 };
-    const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96, adaptive: true };
+    const FULL_QUALITY = { ...XR_DEFAULTS, xrstddev: 2.83 };
+    const SMOOTH = { ...XR_DEFAULTS, xrmaxpx: 96 };
     let opts = { ...DEFAULT_OPTS };
     try {
       const saved = JSON.parse(localStorage.getItem('sceneViewOpts') || '{}');
@@ -578,10 +517,14 @@
       if (saved.lod === 'people2') saved.lod = 'people';   // People 2 became People
       // Removed experimental view modes (Surf2-9, Bent, Regions): back to the default view.
       if (/^surf(?:[2-9]|1[0-4])$/.test(saved.lod || '')) saved.lod = 'mpionly';
+      // Retired view modes (2026-10-30; docs/quest-xr-findings.md §10): back to the default view.
+      if (['hybrid', 'mpi', 'surf', 'ad12sep', 'photo2'].includes(saved.lod)) saved.lod = 'photo';
       opts = { ...opts, ...saved };
       delete opts.nearclip;
       delete opts.xrsize;
       delete opts.prepass;
+      delete opts.foveation;
+      delete opts.adaptive;
       delete opts.xrpush;   // removed: scenes always start at the capture camera
     } catch (e) {}
 
@@ -603,10 +546,8 @@
       $('#optXrscale').val(autoScale ? (['full', 'hybrid'].includes(opts.lod) ? 1 : 1.4) : opts.xrscale);
       $('#valXrscale').text(autoScale ? 'auto' : Number(opts.xrscale).toFixed(2));
       $('#xrscaleAuto').toggleClass('active', autoScale);
-      $('#optFoveation').val(opts.foveation); $('#valFoveation').text(Number(opts.foveation).toFixed(1));
       $('#optXrstddev').val(opts.xrstddev); $('#valXrstddev').text(Number(opts.xrstddev).toFixed(2));
       $('#optXrmaxpx').val(opts.xrmaxpx); $('#valXrmaxpx').text(Math.round(opts.xrmaxpx));
-      $('#optAdaptive').prop('checked', !!opts.adaptive);
       // Rewrite each scene link, keeping scene (first) and ui as they are.
       $('.scene-item a').each(function () {
         const url = new URL($(this).attr('href'), window.location.href);
@@ -615,11 +556,11 @@
         else url.searchParams.set('lod', opts.lod);
         if (opts.xrscale === 'auto') url.searchParams.delete('xrscale');
         else url.searchParams.set('xrscale', opts.xrscale);
-        url.searchParams.set('foveation', opts.foveation);
+        url.searchParams.delete('foveation');
         url.searchParams.set('xrstddev', opts.xrstddev);
         url.searchParams.set('xrmaxpx', opts.xrmaxpx);
         url.searchParams.delete('xrpush');
-        url.searchParams.set('adaptive', opts.adaptive ? '1' : '0');
+        url.searchParams.delete('adaptive');
         if ((opts.tex || 'auto') === 'auto') url.searchParams.delete('tex');   // viewer default: ASTC > UASTC > PNG
         else url.searchParams.set('tex', opts.tex);
         $(this).attr('href', url.pathname + url.search);
@@ -641,37 +582,6 @@
       opts = { ...opts, ...changes };
       saveOpts();
       applyOpts();
-    }
-
-    // Fixed-settings performance tests (foveation and adaptive off, so only
-    // the tested variable changes). `test` labels the run in the server log.
-    // Splat count is what limits the Quest (resolution barely matters), so
-    // these compare hybrid variants at full resolution.
-    // Tests currently needed (the panel hides when there are none). A benchmark
-    // link runs all its variants in one XR session and exits by itself.
-    const PERF_TESTS = [
-      // Self-running: Original splats, Hybrid, Hybrid-MPI (+ compressed), MPI-only (+ compressed) for
-      // 20260914_113455_56657 and 20200927_161631, ~4 min; hold still facing the scene. Ends the session itself.
-      { label: 'Bench: view modes + compressed textures (2 scenes, ~4 min)', lod: 'full', xrscale: 1,
-        test: 'bench-views', bench: 'views' },
-      // Same at 120 Hz (if granted) with the largest scene added, ~6 min.
-      { label: 'Bench: view modes + compressed, 120 Hz (3 scenes, ~6 min)', lod: 'full', xrscale: 1,
-        test: 'bench-views-120', bench: 'views', hz: 120,
-        benchscenes: '20260914_113455_56657,20200927_161631,20250101_140017' },
-    ];
-    function renderPerfLinks() {
-      $('#perfTests').toggle(PERF_TESTS.length > 0);
-      const scene = $('#perfScene').val().trim();
-      const $links = $('#perfLinks').empty();
-      for (const t of PERF_TESTS) {
-        const params = new URLSearchParams({ scene, ui: 'true', lod: t.lod, xrscale: t.xrscale, foveation: 0,
-                                             xrstddev: 2.24, xrmaxpx: 512, adaptive: 0, test: t.test });
-        if (t.variant) params.set('variant', t.variant);
-        if (t.bench) params.set('bench', t.bench);
-        if (t.hz) params.set('hz', t.hz);
-        if (t.benchscenes) params.set('benchscenes', t.benchscenes);
-        $('<a>').attr('href', '/?' + params.toString()).text(t.label).appendTo($links);
-      }
     }
 
     // --- Import from Google Photos (server: google_photos.js) ---
@@ -761,17 +671,13 @@
       $('#gModal').on('click', '#gClose', gClose)
         .on('click', function (e) { if (e.target === this) gClose(); });
       applyOpts();
-      renderPerfLinks();
-      $('#perfScene').on('input', renderPerfLinks);
       $('#lodSeg').on('click', 'button', function () { setOpts({ lod: $(this).data('lod') }); });
       $('#pmodeSeg').on('click', 'button', function () { setOpts({ pmode: $(this).data('pmode') }); });
       $('#texSeg').on('click', 'button', function () { setOpts({ tex: $(this).data('tex') }); });
       $('#optXrscale').on('input', function () { setOpts({ xrscale: parseFloat(this.value) }); });
       $('#xrscaleAuto').on('click', function () { setOpts({ xrscale: 'auto' }); });
-      $('#optFoveation').on('input', function () { setOpts({ foveation: parseFloat(this.value) }); });
       $('#optXrstddev').on('input', function () { setOpts({ xrstddev: parseFloat(this.value) }); });
       $('#optXrmaxpx').on('input', function () { setOpts({ xrmaxpx: parseFloat(this.value) }); });
-      $('#optAdaptive').on('change', function () { setOpts({ adaptive: this.checked }); });
       $('#presetDefault').on('click', function () { setOpts(XR_DEFAULTS); });
       $('#presetFull').on('click', function () { setOpts(FULL_QUALITY); });
       $('#presetSmooth').on('click', function () { setOpts(SMOOTH); });

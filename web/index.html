@@ -315,11 +315,11 @@
     // fill-rate bound, so cut pixels: lower eye-buffer resolution, fixed foveated
     // rendering, and a tighter Gaussian cutoff (sqrt(8) -> sqrt(5) shrinks each
     // splat quad's area by ~37% while dropping only its faintest tail).
-    // Eye-buffer resolution: default 1.4x for the MPI views (the Quest 3 grants 2352x2464 per eye and holds 120 Hz;
+    // Eye-buffer resolution: default 1.4x for the MPI views (Mesh-MPI included) (the Quest 3 grants 2352x2464 per eye and holds 120 Hz;
     // the extra pixels remove texture aliasing without softening), 1.0 for the splat views (splat-count bound).
     // It can't change mid-session. No fixed foveation by default.
     const xrScale = parseFloat(getQueryParam('xrscale')
-      || ((isPano ? panoMode === 'msi' : (['mpi', 'mpionly'].includes(lodList[0]) || isVariant(lodList[0]))) ? '1.4' : '1'));
+      || ((isPano ? panoMode === 'msi' : (['mpi', 'mpionly', 'meshmpi', 'meshmpi-d1'].includes(lodList[0]) || isVariant(lodList[0]))) ? '1.4' : '1'));
     const xrFoveation = parseFloat(getQueryParam('foveation') || '0');
     const xrStdDev = parseFloat(getQueryParam('xrstddev') || String(Math.sqrt(5)));
     // Close-up scenes cost more: their photos are wider-angle (the scene fills
@@ -746,12 +746,14 @@
     // painted back; docs/quest-xr-findings.md §4b, §4c); falls back to plain MPI-only, then the original splats.
     let lodMode = lodList[0];  // changeable in XR (gallery, secondary thumbstick)
     let mpivarCur = (getQueryParam('mpivar') || '').replace(/[^a-z0-9]/gi, '');   // ?mpivar (benchmarks switch it)
-    const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'hybrid', label: 'Hybrid' },
-                        { id: 'mpi', label: 'Hybrid-MPI' }, { id: 'meshmpi', label: 'Mesh-MPI' },
-                        { id: 'mpionly', label: 'MPI-only' },
-                        { id: 'ad12sep', label: 'MPI adaptive' }, { id: 'surf', label: 'MPI-surf' },
-                        { id: 'photo', label: 'Photo detail' }, { id: 'photo2', label: 'Photo full-res' },
+    const VIEW_MODES = [{ id: 'full', label: 'Original splats' }, { id: 'meshmpi', label: 'Mesh-MPI' },
+                        { id: 'mpionly', label: 'MPI-only' }, { id: 'photo', label: 'Photo detail' },
                         { id: 'people', label: 'People' }];
+    // Retired view modes (2026-10-30; docs/quest-xr-findings.md §10): out of the galleries, files deleted, still
+    // viewable with ?lod= when re-baked.
+    const RETIRED_MODES = [{ id: 'hybrid', label: 'Hybrid' }, { id: 'mpi', label: 'Hybrid-MPI' },
+                           { id: 'ad12sep', label: 'MPI adaptive' }, { id: 'surf', label: 'MPI-surf' },
+                           { id: 'photo2', label: 'Photo full-res' }];
     // Experimental modes: ?lod only (not in the XR gallery's mode row).
     const EXTRA_MODES = [{ id: 'meshflood', label: 'Mesh hybrid (flood fill)' },
                          { id: 'meshall', label: 'Mesh hybrid (all regions)' },
@@ -1374,7 +1376,7 @@
     // (or the failure) for a few seconds.
     let loadedAs = '';                          // set by the loaders: what was actually loaded (after fallbacks)
     let statusToast = null;                     // the XR message box, once created (further below)
-    const modeLabel = (id) => ([...VIEW_MODES, ...EXTRA_MODES, ...PANO_MODES].find((m) => m.id === id) || { label: id }).label;
+    const modeLabel = (id) => ([...VIEW_MODES, ...RETIRED_MODES, ...EXTRA_MODES, ...PANO_MODES].find((m) => m.id === id) || { label: id }).label;
     const loadStatus = (() => {
       const css = document.createElement('style');
       css.textContent = '#loadStatus{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:2000;' +

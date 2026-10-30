@@ -23,7 +23,7 @@ original: 1.18M). Quality test scene: `20251023_155037` (palm trees, people).
 | XR controls | `web/js/XRSceneController.js` | Ported from `/projects/img3dviewer`'s `XRMeshController`. Secondary X opens the in-XR gallery (`web/js/XRGallery.js`: thumbnails from `/thumb/<scene>`, view-mode buttons, scenes without the mode greyed out via `/scene-modes`). |
 | Splat drawing | `web/js/splatFlat.js` | Non-instanced, one triangle per splat (default). See §3. |
 | Benchmarks | `web/js/xrBench.js` | Self-running in-headset benchmarks (`?bench=<name>`). |
-| Gallery | `web/list.html` | Original / Hybrid / Hybrid-MPI switch (scenes without the mode greyed out), XR options, presets, Performance tests panel (hidden when no test is pending). |
+| Gallery | `web/list.html` | Original / Mesh-MPI / MPI-only / People / Photo detail switch (retired modes: §10; scenes without the mode greyed out), XR options, presets, Performance tests panel (hidden when no test is pending). |
 
 **GPU environment quirk:** the cached gsplat CUDA extension was built with the
 system CUDA 13 toolkit while PyTorch is cu128. `load_gsplat()` in
@@ -467,3 +467,21 @@ The harness renders splats with gsplat and meshes with pyvista/VTK:
   (`renderings/thumbs/`, Pillow + pillow_heif), used by both galleries.
 - **Hybrid-MPI files** are only partly refreshed with mipmaps (~23 scenes);
   MPI-only (all 85 scenes as of 2026-10-17) is the maintained mode.
+
+## 10. Retired view modes (2026-10-30)
+
+The galleries (`web/list.html`, the in-XR mode row) now offer **Original splats, Mesh-MPI, MPI-only, Photo detail
+(default) and People**. The modes below were taken out: inferior to those or never shown to help. Their findings
+stay in the sections cited; the viewer still opens them with `?lod=<id>` (labels in `RETIRED_MODES`,
+`web/index.html`) once their files exist again. Their files (1,179, 64 GB, public collection) were
+deleted on 2026-10-30 (list: `logs/removed_modes_2026-10-30_manifest.txt`); re-bake a mode as below. Private
+scenes were not touched.
+
+| Mode (`?lod=`) | What it was | Why retired | Re-bake |
+|---|---|---|---|
+| Hybrid (`hybrid`) | Hybrid mesh on view-consistent planar blocks + the remaining splats (§4) | 37-80 fps on the 3-scene benchmark vs 95-120 for compressed MPI views (§4b table); MPI-only also beats it in quality | `sharp bake-hybrid -i output2` -> `<scene>_hybrid.glb/.ply` (`docs/hybrid-baking.md`) |
+| Hybrid-MPI (`mpi`) | That mesh + the remaining splats as a sparse MPI (§4b) | MPI-only is 4-6 dB better at 10 cm (the mesh was the largest error) and faster (no mesh triangles / uncompressed mesh texture) | `python scripts/bake_mpi.py -i output2` (no `--mpionly`) -> `<scene>_mpi_mesh.glb`, `_mpi.glb`, `_mpi_ktx2.glb` |
+| MPI adaptive (`ad12sep`) | MPI-only with 64 base planes, 3x finer where stacking shows (§4c) | +0.65-1.15 dB over MPI-only at 1.0-1.2x fill, but no photo detail: softer than Photo detail; its finer-planes mechanism lives on in People | `python scripts/bake_mpi.py --mpionly --variant ad12sep` |
+| MPI-surf (`surf`, `surf2`-`surf14`, `surf9a/b`) | MPI-only made of surface pieces: runs of occupied bins per cell merged into one plane, corners glued across cells (`SURF=1`, commit e26e565; option notes at `SURF` in `scripts/eval_alpha_patches.py`) | No recorded gain offline or on the headset; settings either tore faces or stripped foreheads like plain MPI (notes at `SURF`) | `SURF=1` (+ `SURF_*` options) with the MPI-only bake env of `scripts/bake_mpi.py`; the per-variant option sets were not recorded (their bake logs: `logs/bakevar_<scene>_surf*.log`) |
+| Photo full-res (`photo2`) | Photo detail at the photo's own resolution (§4c) | +1 dB over `photo` at the input view for ~2.3x texture memory (7 pages vs 3); headset speed never measured | `python scripts/bake_mpi.py --mpionly --variant photo2` |
+| Experimental MPI-only bakes (`ad12*`, `ad15`, `ad25`, `adlc*`, `base`, `c32/64`, `f*`, `lc*`, `ldi`, `m64`, `p128-512`, `s*`, `u*`, `v128*`) | One-off option sweeps on a few test scenes (budgets, bin counts, tile sizes, colour layers, LDI, parallax; §4c, §5) | Results recorded in §4c / §5; only clutter in the viewer's model picker | `scripts/eval_alpha_patches.py` with the env options of §4c; logs `logs/bakevar_<scene>_<tag>.log` |

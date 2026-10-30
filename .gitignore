@@ -181,6 +181,7 @@ pano/
 data/public/
 data/private/
 data/private.cipher/
+data/archive/
 /images
 /output2
 /renderings

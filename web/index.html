@@ -161,7 +161,7 @@
     // MPI-surf view modes (surf, surf2, ...): <scene>_mpionly_<mode>.glb, no mesh.
     // Any other ?lod is an MPI-only variant bake: <scene>_mpionly_<lod>.glb (surf*, ldi, ad25, u512, p256, ...;
     // listed in the model picker), no mesh. So every bake can be compared with ?lod=a,b,c.
-    const BASE_LODS = ['full', 'hybrid', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
+    const BASE_LODS = ['full', 'hybrid', 'meshflood', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
     const isVariant = (lod) => !!lod && /^[a-z0-9]+$/i.test(lod) && !BASE_LODS.includes(lod);
     // ?lod=a,b[,c,d]: compare view modes on the desktop, side by side (two or three) or in a 2x2 grid (four),
     // all seen through the one camera (synced). The first mode is the scene's mode otherwise (and in XR).
@@ -643,6 +643,7 @@
     // ?lod=patches loads <scene>_hybrid.glb + <scene>_patches.glb (scripts/eval_alpha_patches.py);
     // ?lod=mpi the same with <scene>_mpi.glb (its MPI=1 sparse multi-plane mode);
     // ?lod=mpionly loads only <scene>_mpionly.glb (MPI from all splats, no mesh).
+    // ?lod=meshflood loads <scene>_mesh.glb + <scene>_pruned.ply (flood-filled surface mesh, scripts/mesh_hybrid.py).
     // All fall back to the full splats when missing.
     // ?variant=_hybrid_s2 (etc.) loads a hybrid baked with another --name-suffix.
     const hybridName = /^_[A-Za-z0-9_]+$/.test(getQueryParam('variant') || '') ? getQueryParam('variant') : '_hybrid';
@@ -655,6 +656,8 @@
                         { id: 'ad12sep', label: 'MPI adaptive' }, { id: 'surf', label: 'MPI-surf' },
                         { id: 'photo', label: 'Photo detail' }, { id: 'photo2', label: 'Photo full-res' },
                         { id: 'people', label: 'People' }];
+    // Experimental modes: ?lod only (not in the XR gallery's mode row).
+    const EXTRA_MODES = [{ id: 'meshflood', label: 'Mesh hybrid (flood fill)' }];
     async function splatUrlFor(scene) {
       const full = `${sceneBase(scene)}.ply`;
       if (lodMode !== 'quest') return full;
@@ -743,8 +746,8 @@
     // mesh sits slightly in front of its surface, so splats on it are hidden
     // (the texture already contains them) while border splats still draw
     // where they extend past it.
-    async function loadHybrid(scene) {
-      const gltf = await new GLTFLoader().loadAsync(`${sceneBase(scene)}${hybridName}.glb`);
+    async function loadHybrid(scene, meshSuffix = `${hybridName}.glb`, splatSuffix = `${hybridName}.ply`) {
+      const gltf = await new GLTFLoader().loadAsync(`${sceneBase(scene)}${meshSuffix}`);
       const mesh = gltf.scene;
       mesh.quaternion.set(1, 0, 0, 0);
       mesh.position.set(offset[0], offset[1], offset[2]);
@@ -755,7 +758,7 @@
         child.material.dispose();
         child.material = new THREE.MeshBasicMaterial({ map, side: THREE.DoubleSide });
       });
-      const s = createSplat(`${sceneBase(scene)}${hybridName}.ply`);
+      const s = createSplat(`${sceneBase(scene)}${splatSuffix}`);
       await s.initialized;
       const group = new THREE.Group();
       group.add(mesh, s);
@@ -1034,6 +1037,18 @@
         }
         console.warn(`No ${url}; using full splats.`);
       }
+      if (lodMode === 'meshflood') {
+        const url = `${sceneBase(scene)}_mesh.glb`;
+        try {
+          if ((await fetch(url, { method: 'HEAD' })).ok) {
+            loadedAs = modeLabel(lodMode);
+            return await loadHybrid(scene, '_mesh.glb', '_pruned.ply');
+          }
+        } catch (e) {
+          console.error(`Failed to load ${url}:`, e);
+        }
+        console.warn(`No ${url}; using full splats.`);
+      }
       if (['surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
         // MPI-surf (?lod=surf): MPI-only made of surface pieces, <scene>_mpionly_surf.glb (bake: SURF=1, see
         // surface_pieces() in scripts/eval_alpha_patches.py). ?mpivar=<tag>: an experimental MPI-only bake,
@@ -1076,8 +1091,15 @@
     // SplatMeshes follow showSplat, every other mesh (hybrid mesh, baked
     // layers) follows showMesh. Set per object, not on the parent group, so
     // hiding one part of a hybrid scene leaves the other visible.
+    // Only hybrids (meshes + splats) follow them; Original splats and MPI views stay as they are. The old
+    // ?hybrid=true page loads its splats and mesh separately, so there they always apply.
     function applyVisibility(obj) {
       if (!obj) return;
+      if (hybrid !== "true") {
+        let splats = false, meshes = false;
+        obj.traverse((c) => { if (c instanceof SplatMesh) splats = true; else if (c.isMesh) meshes = true; });
+        if (!splats || !meshes) return;
+      }
       obj.traverse((child) => {
         if (child instanceof SplatMesh) child.visible = guiParams.showSplat;
         else if (child.isMesh) child.visible = guiParams.showMesh;
@@ -1137,7 +1159,7 @@
     // (or the failure) for a few seconds.
     let loadedAs = '';                          // set by the loaders: what was actually loaded (after fallbacks)
     let statusToast = null;                     // the XR message box, once created (further below)
-    const modeLabel = (id) => ([...VIEW_MODES, ...PANO_MODES].find((m) => m.id === id) || { label: id }).label;
+    const modeLabel = (id) => ([...VIEW_MODES, ...EXTRA_MODES, ...PANO_MODES].find((m) => m.id === id) || { label: id }).label;
     const loadStatus = (() => {
       const css = document.createElement('style');
       css.textContent = '#loadStatus{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:2000;' +
@@ -1179,7 +1201,7 @@
     loadStatus.start(pendingLabel(file));
     if (hybrid === "true") {
       splat = createSplat(splatURL);
-    } else if (isPano || ['layers', 'hybrid', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
+    } else if (isPano || ['layers', 'hybrid', 'meshflood', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
       splat = await loadContent(file);
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading
@@ -1235,12 +1257,15 @@
 
     // Comparison panels (?lod=a,b,...): the other modes' content of this scene, warped like the first, each
     // drawn alone into its part of the canvas (renderPanels). Desktop only; XR shows the first mode.
-    const cmpPanels = [];                    // [{ content, lod }] after the first mode's
+    // Spark draws one splat set per SparkRenderer, gathered after the frame from what is visible then (the
+    // first panel's content), so a panel with splats of its own gets its own SparkRenderer, updated from its
+    // content only and drawn only in its panel.
+    const cmpPanels = [];                    // [{ content, lod, spark? }] after the first mode's
     const cmpLabels = [];
     if (!isPano && lodList.length > 1) {
       lodList.forEach((lod) => {
         const el = document.createElement('div');
-        el.textContent = (VIEW_MODES.find((m) => m.id === lod) || { label: lod }).label;
+        el.textContent = modeLabel(lod);
         Object.assign(el.style, { position: 'fixed', zIndex: 999, padding: '3px 8px', borderRadius: '4px',
                                   background: 'rgba(0,0,0,0.55)', color: '#fff', font: '13px sans-serif',
                                   pointerEvents: 'none' });
@@ -1257,7 +1282,16 @@
             applyVisibility(c);
             c.visible = false;
             xrContent.add(c);
-            cmpPanels.push({ content: c, lod });
+            let hasSplats = false;
+            c.traverse((o) => { if (o instanceof SplatMesh) hasSplats = true; });
+            let ps = null;
+            if (hasSplats) {
+              ps = new SparkRenderer({ renderer, autoUpdate: false, preUpdate: true,
+                                       view: { sort32: true, sortRadial: false } });
+              ps.visible = false;
+              scene.add(ps);
+            }
+            cmpPanels.push({ content: c, lod, spark: ps });
           } catch (e) {
             console.warn(`Comparison view ${lod} failed:`, e);
           } finally {
@@ -1273,12 +1307,24 @@
       const pw = panelSize.x / cmpCols, ph = panelSize.y / cmpRows;
       const rect = renderer.domElement.getBoundingClientRect();
       renderer.setScissorTest(true);
+      // The first panel's splats: Spark's own draw or the flat-splat mesh (flatSplats.sync() picks one).
+      const mainDraws = [spark, ...(flatSplats ? [flatSplats.mesh] : [])];
+      const mainVis = mainDraws.map((o) => o.visible);
       for (let i = 0; i < cmpCols * cmpRows; i++) {
         const col = i % cmpCols, row = Math.floor(i / cmpCols);
         const y = panelSize.y - (row + 1) * ph;        // viewport origin: bottom left
         renderer.setViewport(col * pw, y, pw, ph);
         renderer.setScissor(col * pw, y, pw, ph);
         all.forEach((p, j) => { p.content.visible = j === i; });
+        mainDraws.forEach((o, k) => { o.visible = i === 0 && mainVis[k]; });
+        all.forEach((p, j) => {
+          if (!p.spark) return;
+          p.spark.visible = j === i;
+          if (j !== i) return;
+          Object.assign(p.spark, { maxStdDev: spark.maxStdDev, maxPixelRadius: spark.maxPixelRadius });
+          p.spark.defaultView.camera = spark.defaultView.camera;   // sortOnce
+          p.spark.update({ scene: p.content, viewToWorld: camera.matrixWorld });
+        });
         renderer.render(scene, camera);                // a panel without content (yet) is cleared
         if (cmpLabels[i]) {
           cmpLabels[i].style.left = `${rect.left + col * pw + 8}px`;
@@ -1286,6 +1332,8 @@
         }
       }
       all.forEach((p, j) => { p.content.visible = j === 0; });
+      all.forEach((p) => { if (p.spark) p.spark.visible = false; });
+      mainDraws.forEach((o, k) => { o.visible = mainVis[k]; });
       renderer.setScissorTest(false);
       renderer.setViewport(0, 0, panelSize.x, panelSize.y);
     }
@@ -1647,8 +1695,12 @@
     gui.add(guiParams, 'showMesh').onChange((value) => {
       if (meshObj) meshObj.visible = value;
       applyVisibility(splat);
+      cmpPanels.forEach((p) => applyVisibility(p.content));
     });
-    gui.add(guiParams, 'showSplat').onChange(() => applyVisibility(splat));
+    gui.add(guiParams, 'showSplat').onChange(() => {
+      applyVisibility(splat);
+      cmpPanels.forEach((p) => applyVisibility(p.content));
+    });
     gui.add(guiParams, 'sortOnce').onChange(setSortOnce);
     addDepthControls();
     }

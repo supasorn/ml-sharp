@@ -68,7 +68,8 @@ def main():
     width, height = metadata.resolution_px
     f_px = metadata.focal_length_px
     f_x = f_y = f_px
-    c_x, c_y = (width - 1) / 2.0, (height - 1) / 2.0
+    # gsplat's pixel j is centred at j + 0.5, so the image centre is W / 2 (as in the viewer).
+    c_x, c_y = width / 2.0, height / 2.0
     intrinsics = torch.tensor([[f_x, 0, c_x, 0], [0, f_y, c_y, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
                               device=device, dtype=torch.float32)
     renderer = GSplatRenderer(color_space=metadata.color_space)
@@ -104,7 +105,7 @@ def main():
         sys.exit("No masked pixels; nothing to mesh.")
     rows, cols = np.nonzero(valid)
     d = depth_blurred[rows, cols]
-    vertices = np.stack([(cols - c_x) * d / f_x, (rows - c_y) * d / f_y, d], axis=1).astype(np.float32)
+    vertices = np.stack([(cols + 0.5 - c_x) * d / f_x, (rows + 0.5 - c_y) * d / f_y, d], axis=1).astype(np.float32)
     vidx = np.full((h, w), -1, np.int64)
     vidx[rows, cols] = np.arange(len(rows))
     quad = valid[:-1, :-1] & valid[1:, :-1] & valid[:-1, 1:] & valid[1:, 1:]
@@ -122,8 +123,8 @@ def main():
     dec = pv_mesh.decimate_pro(args.reduction, preserve_topology=True, boundary_vertex_deletion=True)
     dv = np.asarray(dec.points, np.float32)
     df = np.asarray(dec.faces).reshape(-1, 4)[:, 1:4]
-    u = np.clip(((f_x * dv[:, 0] / dv[:, 2] + c_x) + 0.5) / w, 0, 1)
-    v = np.clip(1.0 - ((f_y * dv[:, 1] / dv[:, 2] + c_y) + 0.5) / h, 0, 1)
+    u = np.clip((f_x * dv[:, 0] / dv[:, 2] + c_x) / w, 0, 1)
+    v = np.clip(1.0 - (f_y * dv[:, 1] / dv[:, 2] + c_y) / h, 0, 1)
     from trimesh.visual.texture import TextureVisuals
     glb = out / f"{stem}_mesh.glb"
     trimesh.Trimesh(dv, df, visual=TextureVisuals(uv=np.stack([u, v], 1), image=Image.fromarray(color)),
@@ -135,8 +136,8 @@ def main():
     X, Y, Z = means[:, 0], means[:, 1], means[:, 2]
     keep = Z > 0
     zs = np.where(keep, Z, 1)
-    iu = np.round(f_x * X / zs + c_x).astype(np.int64)
-    iv = np.round(f_y * Y / zs + c_y).astype(np.int64)
+    iu = np.floor(f_x * X / zs + c_x).astype(np.int64)
+    iv = np.floor(f_y * Y / zs + c_y).astype(np.int64)
     inb = keep & (iu >= 0) & (iu < w) & (iv >= 0) & (iv < h)
     prune_mask = cv.erode(mask, kernel, iterations=args.erode)
     iuc, ivc = np.clip(iu, 0, w - 1), np.clip(iv, 0, h - 1)

@@ -161,7 +161,7 @@
     // MPI-surf view modes (surf, surf2, ...): <scene>_mpionly_<mode>.glb, no mesh.
     // Any other ?lod is an MPI-only variant bake: <scene>_mpionly_<lod>.glb (surf*, ldi, ad25, u512, p256, ...;
     // listed in the model picker), no mesh. So every bake can be compared with ?lod=a,b,c.
-    const BASE_LODS = ['full', 'hybrid', 'meshflood', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
+    const BASE_LODS = ['full', 'hybrid', 'meshflood', 'meshall', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
     const isVariant = (lod) => !!lod && /^[a-z0-9]+$/i.test(lod) && !BASE_LODS.includes(lod);
     // ?lod=a,b[,c,d]: compare view modes on the desktop, side by side (two or three) or in a 2x2 grid (four),
     // all seen through the one camera (synced). The first mode is the scene's mode otherwise (and in XR).
@@ -643,7 +643,8 @@
     // ?lod=patches loads <scene>_hybrid.glb + <scene>_patches.glb (scripts/eval_alpha_patches.py);
     // ?lod=mpi the same with <scene>_mpi.glb (its MPI=1 sparse multi-plane mode);
     // ?lod=mpionly loads only <scene>_mpionly.glb (MPI from all splats, no mesh).
-    // ?lod=meshflood loads <scene>_mesh.glb + <scene>_pruned.ply (flood-filled surface mesh, scripts/mesh_hybrid.py).
+    // ?lod=meshflood loads <scene>_mesh.glb + <scene>_pruned.ply (flood-filled surface mesh, scripts/mesh_hybrid.py);
+    // ?lod=meshall <scene>_meshall.glb + <scene>_prunedall.ply (all smooth regions, scripts/mesh_regions.py).
     // All fall back to the full splats when missing.
     // ?variant=_hybrid_s2 (etc.) loads a hybrid baked with another --name-suffix.
     const hybridName = /^_[A-Za-z0-9_]+$/.test(getQueryParam('variant') || '') ? getQueryParam('variant') : '_hybrid';
@@ -657,7 +658,8 @@
                         { id: 'photo', label: 'Photo detail' }, { id: 'photo2', label: 'Photo full-res' },
                         { id: 'people', label: 'People' }];
     // Experimental modes: ?lod only (not in the XR gallery's mode row).
-    const EXTRA_MODES = [{ id: 'meshflood', label: 'Mesh hybrid (flood fill)' }];
+    const EXTRA_MODES = [{ id: 'meshflood', label: 'Mesh hybrid (flood fill)' },
+                         { id: 'meshall', label: 'Mesh hybrid (all regions)' }];
     async function splatUrlFor(scene) {
       const full = `${sceneBase(scene)}.ply`;
       if (lodMode !== 'quest') return full;
@@ -1037,12 +1039,13 @@
         }
         console.warn(`No ${url}; using full splats.`);
       }
-      if (lodMode === 'meshflood') {
-        const url = `${sceneBase(scene)}_mesh.glb`;
+      if (lodMode === 'meshflood' || lodMode === 'meshall') {
+        const sfx = lodMode === 'meshall' ? 'all' : '';
+        const url = `${sceneBase(scene)}_mesh${sfx}.glb`;
         try {
           if ((await fetch(url, { method: 'HEAD' })).ok) {
             loadedAs = modeLabel(lodMode);
-            return await loadHybrid(scene, '_mesh.glb', '_pruned.ply');
+            return await loadHybrid(scene, `_mesh${sfx}.glb`, `_pruned${sfx}.ply`);
           }
         } catch (e) {
           console.error(`Failed to load ${url}:`, e);
@@ -1087,6 +1090,41 @@
       return s;
     }
 
+    // Mesh inspection (GUI "shaded" / "wireframe"): opaque meshes (hybrid meshes, depth layers; not the
+    // semi-transparent MPI planes) drawn flat-shaded grey instead of textured, and/or with their triangle
+    // edges on top. Lit by inspectLights (only these materials use lights).
+    const inspectMat = new THREE.MeshLambertMaterial({ color: 0xb4b4b4, flatShading: true, side: THREE.DoubleSide,
+                                                       polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+    const wireMat = new THREE.MeshBasicMaterial({ color: 0x000000, wireframe: true, transparent: true, opacity: 0.35 });
+    const inspectLights = new THREE.Group();
+    {
+      const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+      sun.position.set(0.6, 1, 1);
+      inspectLights.add(sun, new THREE.HemisphereLight(0xffffff, 0x404040, 0.8));
+    }
+    function applyInspect(obj) {
+      obj.traverse((c) => {
+        if (!c.isMesh || c instanceof SplatMesh || c.userData.isWire || Array.isArray(c.material)) return;
+        if (!c.userData.texMat) {
+          if (c.material.transparent) return;
+          c.userData.texMat = c.material;
+          Object.assign(c.material, { polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+          c.material.needsUpdate = true;
+        }
+        c.material = guiParams.shaded ? inspectMat : c.userData.texMat;
+        if (guiParams.wireframe && !c.userData.wire) {
+          const w = new THREE.Mesh(c.geometry, wireMat);
+          w.userData.isWire = true;
+          w.frustumCulled = false;
+          w.raycast = () => {};
+          c.add(w);
+          c.userData.wire = w;
+        }
+        if (c.userData.wire) c.userData.wire.visible = guiParams.wireframe;
+        depthWarp.attach(c);           // the new materials follow the depth controls too (once per material)
+      });
+    }
+
     // Apply the GUI's showSplat / showMesh checkboxes to loaded content:
     // SplatMeshes follow showSplat, every other mesh (hybrid mesh, baked
     // layers) follows showMesh. Set per object, not on the parent group, so
@@ -1095,6 +1133,7 @@
     // ?hybrid=true page loads its splats and mesh separately, so there they always apply.
     function applyVisibility(obj) {
       if (!obj) return;
+      applyInspect(obj);
       if (hybrid !== "true") {
         let splats = false, meshes = false;
         obj.traverse((c) => { if (c instanceof SplatMesh) splats = true; else if (c.isMesh) meshes = true; });
@@ -1102,7 +1141,7 @@
       }
       obj.traverse((child) => {
         if (child instanceof SplatMesh) child.visible = guiParams.showSplat;
-        else if (child.isMesh) child.visible = guiParams.showMesh;
+        else if (child.isMesh && !child.userData.isWire) child.visible = guiParams.showMesh;
       });
     }
 
@@ -1201,7 +1240,7 @@
     loadStatus.start(pendingLabel(file));
     if (hybrid === "true") {
       splat = createSplat(splatURL);
-    } else if (isPano || ['layers', 'hybrid', 'meshflood', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
+    } else if (isPano || ['layers', 'hybrid', 'meshflood', 'meshall', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
       splat = await loadContent(file);
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading
@@ -1552,8 +1591,11 @@
       center: 50,
       showMesh: true,
       showSplat: true,
+      shaded: false,
+      wireframe: false,
       sortOnce: true
     };
+    scene.add(inspectLights);
     applyVisibility(splat);
 
     if (hybrid == "true") {
@@ -1701,6 +1743,9 @@
       applyVisibility(splat);
       cmpPanels.forEach((p) => applyVisibility(p.content));
     });
+    const inspect = () => [splat, meshObj, ...cmpPanels.map((p) => p.content)].forEach((o) => o && applyInspect(o));
+    gui.add(guiParams, 'shaded').onChange(inspect);
+    gui.add(guiParams, 'wireframe').onChange(inspect);
     gui.add(guiParams, 'sortOnce').onChange(setSortOnce);
     addDepthControls();
     }

@@ -65,9 +65,12 @@ VARIANTS = {"ad12sep": {"BINS": "64", "ADAPT": "3", "ADAPT_T": "12", "ADAPT_W": 
             # people: 4x finer planes only on the cells covering people (Mask R-CNN on the photo, grown to cover
             # the silhouette), otherwise as photo (its detail and texture budget, premultiplied colour): without them
             # People looked soft and blocky next to Photo detail (me_small's person 35.9 dB vs the photo; now 43.9,
-            # Photo detail 44.1); baked on request (gallery "People" toggle, see watch())
+            # Photo detail 44.1); un-premultiplied colour (smooth across the stacked planes' alpha edges) and the thorough
+            # ASTC preset: ASTC blocked the people's many stacked planes on the Quest 3 (a nose 38.6 dB vs its
+            # uncompressed render; now 42.9). Keeping the person uncompressed (HI_PEOPLE, 57 dB) cost ~45-60 fps.
+            # Baked on request (gallery "People" toggle, see watch()).
             "people": {"ADAPT": "4", "ADAPT_MASK": "people", "PHOTO_DETAIL": "1", "MAXPAGES": "8",
-                       "TEXFULL_THR": "0.0015"}}
+                       "TEXFULL_THR": "0.0015", "UNPREM": "1", "KTX2_ASTC": "thorough"}}
 # Variants the gallery may request for a scene (<collection>/renderings/requests/<scene>.<variant>, written by web.js):
 # the watcher bakes them before anything else and removes the request (renamed .failed if the bake fails).
 REQUESTABLE = ("people",)
@@ -161,6 +164,8 @@ def bake(ply: Path, gpu: str, args, log, gpu_done=None):
         return "skipped"
     work = args.work
     link = work / ply.name
+    if link.is_symlink() and not link.exists():      # dangling: its scene was removed (and maybe re-added) meanwhile
+        link.unlink()
     if not link.exists():
         link.symlink_to(ply.resolve())
     shutil.copy(ply.with_suffix(".json"), work / f"{ply.stem}.json")

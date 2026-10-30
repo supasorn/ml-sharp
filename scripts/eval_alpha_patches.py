@@ -141,6 +141,12 @@ ADAPT_BUDGET = float(os.environ.get("ADAPT_BUDGET", 0))
 # <EXPORT_DIR>/<scene>_people.png. Any other value: a mask image (white = refine) at the photo's size.
 ADAPT_MASK = os.environ.get("ADAPT_MASK", "")
 ADAPT_MASK_GROW = float(os.environ.get("ADAPT_MASK_GROW", 0.01))
+# HI_PEOPLE=1 (with ADAPT_MASK): the planes of the flagged cells (people) at full resolution in a separate,
+# uncompressed texture per atlas page (glTF emissiveTexture, kept PNG in the _astc / _ktx2 copies; their quads' u is
+# offset by 2), the rest as before: ASTC 4x4 blocked the people's finer planes (a smooth nose split over many planes
+# with sharp alpha edges inside 4x4 blocks: 38.6 dB vs the uncompressed render, Photo detail 41.0).
+HI_PEOPLE = bool(os.environ.get("HI_PEOPLE"))
+HI_CELLS = {}                                         # this scene's flagged cells: {"flag": (ny, nx) bool, "cell": px}
 # LDI=1 (MPI, not SURF): layered depth image. A front layer (per pixel, the slices composited near to far until
 # LDI_OPAQUE opaque) on one continuous grid mesh (a vertex every LDI_STEP render px on the median-depth map),
 # cut only where its depth jumps by more than LDI_CUT parallax px at MOVE; MPI-only slices behind it for
@@ -1273,6 +1279,7 @@ def run(scene: Path):
             nbent = 0
             Tf = torch.ones(Hc, Wc, device=dev)               # transmittance of the nearer bins (BEND visibility)
         passes_ = [(b_t, centers, edges, BINS, None, 0)]
+        HI_CELLS.clear()
         coarse_G = {}                                     # ADAPT: each coarse bin's corners (G, used)
         if ADAPT and not SURF:
             # ADAPT: more slices only where stacking shows. A pass over the bins gives each pixel's visible bin
@@ -1340,6 +1347,9 @@ def run(scene: Path):
                     pm = torch.from_numpy(np.asarray(Image.open(ADAPT_MASK).convert("L").resize((W, H))) > 127).to(dev)
                 mfull = torch.zeros(Hc, Wc, device=dev)
                 mfull[MARGIN:MARGIN + H, MARGIN:MARGIN + W] = pm.float()
+                if HI_PEOPLE:                             # the person proper (no margin): its cells hi-res
+                    mcore = torch.nn.functional.pad(mfull, (0, nx * cell - Wc, 0, ny * cell - Hc))
+                    HI_CELLS.update(flag=(mcore.reshape(ny, cell, nx, cell).amax((1, 3)) > 0).cpu().numpy(), cell=cell)
                 r_ = max(1, round(ADAPT_MASK_GROW * W))
                 mfull = torch.nn.functional.max_pool2d(mfull[None, None], 2 * r_ + 1, 1, r_)[0, 0]
                 mpad = torch.nn.functional.pad(mfull, (0, nx * cell - Wc, 0, ny * cell - Hc))
@@ -2196,6 +2206,12 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         return t.reshape(h, ds, w, ds, 4).mean((1, 3))
 
     texs, geo, pad, eo = {}, {}, {}, {}            # texs: padded texture block; pad: its margin (texels)
+    hi_ = np.zeros(len(rects), bool)                  # HI_PEOPLE: planes of flagged cells (by their centre)
+    if HI_CELLS:
+        fl_, c_ = HI_CELLS["flag"], HI_CELLS["cell"]
+        cx_ = ((rects[:, 0] + rects[:, 2]) // 2 // c_).astype(np.int64).clip(0, fl_.shape[1] - 1)
+        cy_ = ((rects[:, 1] + rects[:, 3]) // 2 // c_).astype(np.int64).clip(0, fl_.shape[0] - 1)
+        hi_ = fl_[cy_, cx_]
     if border is not None:
         groups, gb = border                                           # [(first cell index, (n, cb, cb, 4))]: cells
         assert gb % ds == 0 and all(t.shape[1] % ds == 0 for _, t in groups)   # of one size per group (bin)
@@ -2282,6 +2298,8 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
                 full[cand] = True
             print(f"  adaptive textures: {full.sum()} of {N} cells at full resolution "
                   f"(error > {TEXFULL_THR}, budget {MAXPAGES} pages)", flush=True)
+        if hi_.any():                                 # HI_PEOPLE: uncompressed, at their adaptive resolution (all full:
+            print(f"  hi-res people: {hi_.sum()} of {N} planes in a separate uncompressed texture", flush=True)   # 4x the memory, no visible gain)
         # Batched (GPU, chunked) per cell size: every cell's texture at its chosen resolution (full, or
         # box-downsampled by ds; premultiplied, so averaging is exact), and the bounding box of its texels with
         # alpha inside the cell. Textures stay 8-bit from here on.
@@ -2675,19 +2693,35 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
             place[i] = (x + pad[i], y + pad[i]); x += w; sh = max(sh, h)   # inner (unpadded) origin
         return place
 
+    def shelf_free(ids):                              # HI_PEOPLE: page wide, as tall as needed
+        place, x, y, sh = {}, 0, 0, 0
+        for i in sorted(ids, key=lambda i: -texs[i].shape[0]):
+            h, w = texs[i].shape[:2]
+            if x + w > page:
+                x, y, sh = 0, y + sh, 0
+            place[i] = (x + pad[i], y + pad[i]); x += w; sh = max(sh, h)
+        return place, y + sh
+
+    assert not (hi_.any() and (lq or lw or shared or band_)), "HI_PEOPLE: plain MPI pages only"
     pages, start = [], 0
     bstart = [j for j in range(len(order)) if j == 0 or band_.get(order[j]) != band_.get(order[j - 1])] if band_ else []
     while start < len(order):
-        end, acc = start, 0
+        end, acc, acc_hi = start, 0, 0
         while end < len(order):
             h, w = texs[order[end]].shape[:2]
+            if hi_[order[end]]:                   # a page's hi texture: at most a page (taller ones, 4096 x ~7400,
+                if acc_hi + h * w > 0.9 * page * page:   # showed as grey blocks on the Quest 3; phone and Mac were fine)
+                    break
+                acc_hi += h * w; end += 1
+                continue
             if acc + h * w > 0.95 * page * page:
                 break
             acc += h * w; end += 1
         end = max(end, start + 1)
         if band_ and end < len(order):               # SEPA: break at a band boundary (whole bands per page)
             end = max([b for b in bstart if start < b <= end], default=end)
-        while (pl := shelf(order[start:end])) is None:
+        while ((pl := shelf([i for i in order[start:end] if not hi_[i]])) is None
+               or (hi_.any() and shelf_free([i for i in order[start:end] if hi_[i]])[1] > page)):
             end_ = start + max(1, int((end - start) * 0.97))
             end = max([b for b in bstart if start < b <= end_], default=end_) if band_ else end_
         pages.append((order[start:end], pl)); start = end
@@ -2745,14 +2779,23 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
                 nsk += 1
         print(f"  skirts: {nsk} between unglued neighbouring pieces within {SURF_SKIRT:g} px", flush=True)
 
-    meshes, texels = [], 0
+    meshes, texels, hi_pages, hi_texels = [], 0, {}, 0
     for pg, (ids, pl) in enumerate(pages):
         img = np.zeros((page, page, 4), np.uint8)
+        hids = [i for i in ids if hi_[i]]
+        img_hi = None
+        if hids:                                      # HI_PEOPLE: this page's people planes, uncompressed
+            pl_hi, hh_ = shelf_free(hids)
+            pl = {**pl, **pl_hi}
+            img_hi = np.zeros((max(4, -(-hh_ // 4) * 4), page, 4), np.uint8)
         for i in ids:
             px, py = pl[i]
             t, g = texs[i], pad[i]
-            img[py - g:py - g + t.shape[0], px - g:px - g + t.shape[1]] = t
+            dst = img_hi if hi_[i] else img
+            dst[py - g:py - g + t.shape[0], px - g:px - g + t.shape[1]] = t
             texels += t.shape[0] * t.shape[1]
+            if hi_[i]:
+                hi_texels += t.shape[0] * t.shape[1]
         e_ = np.array([eo.get(i, 0) for i in ids], np.float64)
         sp_ = np.array([pad[i] and (geo[i][2] - geo[i][0]) / max(1, texs[i].shape[1] - 2 * pad[i]) for i in ids])
         r = np.array([geo[i] for i in ids], np.float64) + (e_ * sp_)[:, None] * [-1, -1, 1, 1]
@@ -2773,6 +2816,9 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         tw = np.array([texs[i].shape[1] - 2 * pad[i] for i in ids]) + 2 * e_; th = np.array([texs[i].shape[0] - 2 * pad[i] for i in ids]) + 2 * e_
         uu = np.stack([px, px + tw, px + tw, px], 1) / page
         vv = np.stack([py, py, py + th, py + th], 1) / page
+        if img_hi is not None:                        # u + 2: the page's hi texture (normalised by its own height)
+            hm_ = np.array([hi_[i] for i in ids])
+            uu[hm_] += 2.0; vv[hm_] *= page / img_hi.shape[0]
         if skirts:                                    # skirt quads, each drawn right after its farther piece
             pos = {i: n_ for n_, i in enumerate(ids)}
             sV, sU, sK = [], [], []
@@ -2918,6 +2964,8 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         # The viewer draws surface_<k> with larger k first (k = 0 is the front).
         meshes.append((f"surface_{len(pages) - 1 - pg}" + ("_u" if UNPREM else ""), V.reshape(-1, 3).astype(np.float32),
                        faces.astype(np.uint32), uv, img) + ((extra,) if extra is not None else ()))
+        if img_hi is not None:
+            hi_pages[meshes[-1][0]] = img_hi
     if LDI_FRONT or lq or (LCT and shared) or lw:
         # LDI / LCOL / LCT: the front and the MPI drawn in one far-to-near order (no depth test in the viewer): both split into
         # LDI_GROUPS depth groups (quantiles of the triangles' distance), drawn group by group, far first, the
@@ -2962,7 +3010,10 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
     n_tex, t0_ = len(texs), T0
 
     def finish():                                     # CPU only: PNG / KTX2 encoding and the files
-        write_layer_glbs(path, meshes, ktx2=EXPORT_KTX2)
+        write_layer_glbs(path, meshes, ktx2=EXPORT_KTX2, hi=hi_pages)
+        if hi_pages:
+            print(f"  hi-res people: {hi_texels / 1e6:.1f}M texels in {len(hi_pages)} uncompressed textures "
+                  f"({sum(h.shape[0] * h.shape[1] * 4 for h in hi_pages.values()) / 2**20:.0f} MB on the GPU)", flush=True)
         print(f"  quads cover {quad_px / (GW * SS * Hg * SS):.1f}x the frame (fill before blending/depth test)", flush=True)
         print(f"  [{time.time() - t0_:.0f}s] wrote {path} ({path.stat().st_size / 2**20:.0f} MB, {len(pages)} atlas pages of {page}^2, "
               f"{n_tex} patches, {texels / 1e6:.0f}M texels = {texels / (len(pages) * page * page):.0%} of the pages)",
@@ -2973,10 +3024,12 @@ def export_glb(rects, planes, atlas, off, area, fg, Hg, scene, centre, page=4096
         WRITER.submit(finish)
 
 
-def write_layer_glbs(path, meshes, ktx2=False):
+def write_layer_glbs(path, meshes, ktx2=False, hi=None):
     """Write the layer meshes [(name, V, faces, uv, page RGBA uint8)] as <path> (PNG pages, fast compression) and,
     with ktx2, also <stem>_ktx2.glb (Basis UASTC KTX2 pages with mipmaps, KHR_texture_basisu; see glb_ktx2.py),
-    encoding the pages in parallel."""
+    encoding the pages in parallel. hi: {mesh name: RGBA page} (HI_PEOPLE): a second texture of that mesh, as its
+    material's emissiveTexture: PNG here, uncompressed RGBA8 KTX2 with mipmaps in the compressed copies (as PNG the
+    Quest 3 showed grey blocks: those are the only images it decodes as PNG; phone and Mac were fine)."""
     import io, tempfile
     from concurrent.futures import ThreadPoolExecutor
     from glb_ktx2 import write_glb, encode_pages
@@ -2987,11 +3040,14 @@ def write_layer_glbs(path, meshes, ktx2=False):
     owner = [i if not isinstance(m[4], (int, np.integer)) else int(m[4]) for i, m in enumerate(meshes)]
     uniq = sorted(set(owner))
     slot = {o: k for k, o in enumerate(uniq)}
+    hi = hi or {}
+    hi_names = [m[0] for m in meshes if m[0] in hi]
     with ThreadPoolExecutor(len(uniq) or 1) as ex:
         pngs = list(ex.map(lambda o: png(meshes[o][4], 1), uniq))
+        hi_png = dict(zip(hi_names, ex.map(lambda n: png(hi[n], 1), hi_names)))
         tick("export: PNG pages")
 
-    def build(images, mime, basisu):
+    def build(images, mime, basisu, hi_imgs=None):
         g = {"asset": {"version": "2.0", "generator": "ml-sharp eval_alpha_patches"}, "scene": 0,
              "scenes": [{"nodes": list(range(len(meshes)))}], "nodes": [], "meshes": [], "materials": [],
              "textures": [], "images": [], "accessors": [], "bufferViews": []}
@@ -3011,6 +3067,13 @@ def write_layer_glbs(path, meshes, ktx2=False):
         for k_, im in enumerate(images):
             g["images"].append({"bufferView": view(im), "mimeType": mime})
             g["textures"].append({"extensions": {"KHR_texture_basisu": {"source": k_}}} if basisu else {"source": k_})
+        hi_tex = {}
+        for n_ in hi_names:                           # HI_PEOPLE textures: PNG, or raw KTX2 in the compressed copies
+            g["images"].append({"bufferView": view(hi_imgs[n_] if hi_imgs else hi_png[n_]),
+                                "mimeType": "image/ktx2" if hi_imgs else "image/png"})
+            k_ = len(g["images"]) - 1
+            g["textures"].append({"extensions": {"KHR_texture_basisu": {"source": k_}}} if hi_imgs else {"source": k_})
+            hi_tex[n_] = len(g["textures"]) - 1
         for k, (name, V, F, uv, _, *ext) in enumerate(meshes):
             pos = accessor(V, 5126, "VEC3", 34962, minmax=True)
             tex = accessor(uv, 5126, "VEC2", 34962)
@@ -3022,7 +3085,9 @@ def write_layer_glbs(path, meshes, ktx2=False):
             ti = slot[owner[k]]
             g["materials"].append({"name": f"patches_{k}", "doubleSided": True, "alphaMode": "BLEND",
                                    "pbrMetallicRoughness": {"baseColorTexture": {"index": ti},
-                                                            "metallicFactor": 0.0, "roughnessFactor": 1.0}})
+                                                            "metallicFactor": 0.0, "roughnessFactor": 1.0},
+                                   **({"emissiveTexture": {"index": hi_tex[name]}, "emissiveFactor": [1, 1, 1]}
+                                      if name in hi_tex else {})})
             g["meshes"].append({"name": name, "primitives": [{"attributes": attrs,
                                                                "indices": idx, "material": k}]})
             g["nodes"].append({"name": name, "mesh": k})
@@ -3033,13 +3098,17 @@ def write_layer_glbs(path, meshes, ktx2=False):
     write_glb(path, g, views)
     if ktx2:
         raw = pngs                                                    # the PNG pages just written, as ktx input
+        hi_raw = None
         for suffix, on, kw in (("_astc", KTX2_ASTC not in ("", "0"), dict(astc=KTX2_ASTC)), ("_ktx2", KTX2_UASTC, {})):
             if not on:
                 continue
             with tempfile.TemporaryDirectory() as td:
                 kt = encode_pages(raw, td, levels=KTX2_LEVELS, zstd=KTX2_ZSTD, **kw)
+                if hi_names and hi_raw is None:       # HI_PEOPLE: once, shared by the _astc / _ktx2 copies
+                    hi_raw = dict(zip(hi_names, encode_pages([hi_png[n_] for n_ in hi_names], td,
+                                                             levels=KTX2_LEVELS, zstd=KTX2_ZSTD, raw=True)))
             tick(f"export: KTX2 encode ({suffix[1:]})")
-            g, views = build(kt, "image/ktx2", True)
+            g, views = build(kt, "image/ktx2", True, hi_raw)
             write_glb(Path(path).with_name(Path(path).stem + suffix + ".glb"), g, views)
 
 

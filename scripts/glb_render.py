@@ -68,12 +68,19 @@ def load(path):
         g = scene[n]
         tex = T(g["tex"]); th, tw = tex.shape[:2]
         uv = torch.tensor(g["uv"].astype(np.float32), device=dev) * torch.tensor([tw, th], device=dev) - 0.5
+        hi = uvhi = None
+        if g.get("hi") is not None:                   # HI_PEOPLE: quads with u >= 2 read the uncompressed people texture
+            hi = T(g["hi"]); hh, hw = hi.shape[:2]
+            raw = torch.tensor(g["uv"].astype(np.float32), device=dev)
+            uvhi = torch.cat([(raw[:, :1] - 2) * hw, raw[:, 1:] * hh], 1) - 0.5
+            uvhi = torch.cat([uvhi, (raw[:, :1] > 1.5).float()], 1)        # + the flag
         uv1 = (torch.tensor(g["uv1"].astype(np.float32), device=dev) * torch.tensor([tw, th], device=dev) - 0.5
                if g["uv1"] is not None else None)
         uv2 = torch.tensor(g["uv2"].astype(np.float32), device=dev) if g["uv2"] is not None else None
         uv3 = torch.tensor(g["uv3"].astype(np.float32), device=dev) if g.get("uv3") is not None else None
         mips = [tex] + [T(x) for x in g["mips"][1:]] if MIPS and g.get("mips") else [tex]
-        meshes.append(dict(unprem=n.endswith("_u"), tex=tex, mips=mips, V=torch.tensor(g["V"].astype(np.float32), device=dev),
+        meshes.append(dict(unprem=n.endswith("_u"), tex=tex, mips=mips, hi=hi, uvhi=uvhi,
+                           V=torch.tensor(g["V"].astype(np.float32), device=dev),
                            F=torch.tensor(g["F"].astype(np.int64), device=dev), uv=uv, uv1=uv1, uv2=uv2, uv3=uv3))
     return meshes, cpage
 
@@ -144,6 +151,9 @@ def render(meshes, cpage, meta, eye, sc=1.0, R=None):
                 lod = torch.log2(torch.maximum(ux.norm(dim=1), uy.norm(dim=1)).clamp(min=1e-6)) + LOD_BIAS
             smp = (lambda u: sample_mip(m["mips"], u, lod)) if lod is not None else (lambda u: sample(m["tex"], u))
             col = smp(uvp)
+            if m["hi"] is not None:                                       # HI_PEOPLE: no mips, bilinear
+                uh = interp(m["uvhi"])
+                col = torch.where((uh[:, 2] > 0.5)[:, None], sample(m["hi"], uh[:, :2]), col)
             plain = torch.cat([col[:, :3] * col[:, 3:], col[:, 3:]], 1) if m["unprem"] else col   # UNPREM: colour / alpha
             if m["uv1"] is not None:
                 ch = m["uv2"][Ft[:, 0], 0]

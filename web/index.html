@@ -833,6 +833,24 @@
           if (!child.isMesh || /ldicolor_/.test(child.name || '')) return;
           const map = child.material.map;
           if (map) map.colorSpace = THREE.SRGBColorSpace;
+          // Bake HI_PEOPLE: the page's people planes in a second, uncompressed texture (glTF emissiveTexture); their
+          // quads' u is offset by 2. Raw values like the page, no mipmaps (as uncompressed pages).
+          // Mipmapped on the GPU and sampled like the compressed pages (trilinear, lodBias): without mipmaps the Quest,
+          // which shows them 2-3x smaller, read them at full resolution (bandwidth: People scenes fell to 45-60 fps).
+          // In the compressed files they are uncompressed RGBA8 KTX2 with their mipmaps (as PNG the Quest 3 showed grey
+          // blocks); PNG pages (?tex=png) get theirs generated.
+          const mapHi = child.material.emissiveMap || null;
+          if (mapHi) {
+            mapHi.colorSpace = THREE.NoColorSpace;
+            mapHi.generateMipmaps = !(mapHi.mipmaps && mapHi.mipmaps.length > 1);
+            mapHi.minFilter = THREE.LinearMipmapLinearFilter; mapHi.needsUpdate = true;
+          } else if (/surface_\d+/.test(child.name + ' ' + (child.parent?.name ?? ''))
+                     && child.geometry.getAttribute('uv')?.array.some((v, i) => i % 2 === 0 && v > 1.5)) {
+            // people quads but no people texture (it failed to load): they would read the page at random places
+            console.warn(`${child.name}: people texture missing`);
+            fetch('/fps', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ event: 'people-texture-missing', scene: file, mesh: child.name }) }).catch(() => {});
+          }
           child.material.dispose();
           const k = /surface_(\d+)/.exec(child.name + ' ' + (child.parent?.name ?? ''));
           // Atlas textures: no mipmaps (they would bleed across the small cells' seams; the layers are
@@ -941,7 +959,8 @@
             return;
           }
           child.material = new THREE.ShaderMaterial({
-            uniforms: { map: { value: map }, lodBias: { value: hasMips ? layerLodBias : 0.0 },
+            uniforms: { map: { value: map }, mapHi: { value: mapHi }, lodBiasHi: { value: layerLodBias },
+                        lodBias: { value: hasMips ? layerLodBias : 0.0 },
                         // identity depth warp until depthWarp.attach() shares its uniforms
                         dwScale: { value: 1 }, dwOffset: { value: 0 }, dwPivot: { value: 1 }, dwRadial: { value: 0 } },
             // PARALLAX bakes: shCh.y = the plane's thickness (disparity; 0 = none) and the colour tile's alpha = each
@@ -978,8 +997,13 @@
                 'vec4 p = texture2D(map, vUv2 + sh, lodBias); ' +
                 'float a = vCh < 0.5 ? p.r : (vCh < 1.5 ? p.g : (vCh < 2.5 ? p.b : p.a)); ' +
                 'gl_FragColor = vec4(c.rgb * a, a); }'
-              : 'uniform sampler2D map; uniform float lodBias; varying vec2 vUv; ' +
-                'void main() { vec4 c = texture2D(map, vUv, lodBias); ' + plainOut + ' }',
+              : mapHi
+                ? 'uniform sampler2D map; uniform sampler2D mapHi; uniform float lodBias; uniform float lodBiasHi; ' +
+                  'varying vec2 vUv; ' +
+                  'void main() { vec4 c = vUv.x > 1.5 ? texture2D(mapHi, vUv - vec2(2.0, 0.0), lodBiasHi) ' +
+                  ': texture2D(map, vUv, lodBias); ' + plainOut + ' }'
+                : 'uniform sampler2D map; uniform float lodBias; varying vec2 vUv; ' +
+                  'void main() { vec4 c = texture2D(map, vUv, lodBias); ' + plainOut + ' }',
             side: THREE.DoubleSide, transparent: true, depthWrite: false,
             blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
             blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
@@ -1162,7 +1186,11 @@
     }
     xrContent.add(splat);
     if (splat.initialized) splat.initialized.then(() => { if (!loadedAs) loadedAs = modeLabel(lodMode); loadStatus.done(loadT0); });
-    else loadStatus.done(loadT0);
+    else {
+      const lost = await uploadTextures(splat, file);           // checked (and logged) on the first load too
+      if (lost) loadStatus.fail(`${lost} texture page(s) (out of GPU memory?)`);
+      else loadStatus.done(loadT0);
+    }
 
     // --- Per-scene view settings: size in XR, depth scale and offset (web/js/depthWarp.js; left controller
     // trigger / grip in XR, sliders on the desktop). Saved per scene on the server (/view-config, inside the

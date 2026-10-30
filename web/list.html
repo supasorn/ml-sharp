@@ -574,6 +574,7 @@
       if (saved.optsVersion < 4) { saved.xrscale = 'auto'; saved.optsVersion = 4; }
       // One-time switch of MPI-only to Photo detail, the new default (MPI-only until it is baked).
       if (saved.optsVersion < 5) { if (saved.lod === 'mpionly') saved.lod = 'photo'; saved.optsVersion = 5; }
+      if (saved.lod === 'people2') saved.lod = 'people';   // People 2 became People
       // Removed experimental view modes (Surf2-9, Bent, Regions): back to the default view.
       if (/^surf(?:[2-9]|1[0-4])$/.test(saved.lod || '')) saved.lod = 'mpionly';
       opts = { ...opts, ...saved };

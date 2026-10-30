@@ -1,4 +1,4 @@
-"""Minimal GLB reader for the layer exports: meshes -> {name: dict(V, F, uv, uv1, uv2, uv3, tex RGBA uint8, mips)}
+"""Minimal GLB reader for the layer exports: meshes -> {name: dict(V, F, uv, uv1, uv2, uv3, tex RGBA uint8, mips, hi)}
 (mips: the texture's mip levels, level 0 = tex; only KTX2 pages have more than one).
 
 Reads PNG pages and KTX2 pages (KHR_texture_basisu, as written by glb_ktx2.py / EXPORT_KTX2): those are transcoded
@@ -62,11 +62,13 @@ def read_glb(path):
     def source(ti):
         t = g["textures"][ti]
         return t["extensions"]["KHR_texture_basisu"]["source"] if "source" not in t else t["source"]
-    srcs = {}
+    srcs, his = {}, {}
     for m in g["meshes"]:
         mat = g["materials"][m["primitives"][0]["material"]]
         srcs[m["name"]] = source(mat["pbrMetallicRoughness"]["baseColorTexture"]["index"])
-    uniq = sorted(set(srcs.values()))
+        if "emissiveTexture" in mat:                  # HI_PEOPLE: the page's uncompressed people texture
+            his[m["name"]] = source(mat["emissiveTexture"]["index"])
+    uniq = sorted(set(srcs.values()) | set(his.values()))
     with ThreadPoolExecutor(len(uniq) or 1) as ex:                 # pages in parallel
         imgs = dict(zip(uniq, ex.map(image, uniq)))
     out = {}
@@ -76,5 +78,5 @@ def read_glb(path):
                               uv1=acc(at["TEXCOORD_1"]) if "TEXCOORD_1" in at else None,
                               uv2=acc(at["TEXCOORD_2"]) if "TEXCOORD_2" in at else None,
                               uv3=acc(at["TEXCOORD_3"]) if "TEXCOORD_3" in at else None, tex=imgs[srcs[m["name"]]][0],
-                              mips=imgs[srcs[m["name"]]])
+                              mips=imgs[srcs[m["name"]]], hi=imgs[his[m["name"]]][0] if m["name"] in his else None)
     return out

@@ -317,6 +317,13 @@ gsplat renders of the splats, me_small + `20260102_153205_63202`, 5 moved eyes, 
   goes to the bins of the dominant surface by disparity, not bin index): the first version (UNPREM, 6 pages, error >
   0.003) looked soft and blocky next to Photo detail. `me_small`'s person vs the photo: 35.9 dB -> 43.9 dB (Photo
   detail 44.1), Laplacian detail 7.2 -> 10.0 (photo 11.5, Photo detail 10.1).
+  Since 2026-10-30 also `UNPREM=1` and `KTX2_ASTC=thorough`: on the Quest 3 (ASTC) a face showed 4x4 blocks, the
+  people's many stacked planes (alpha edges inside blocks) adding up ASTC errors: a nose vs its uncompressed render
+  38.6 dB (Photo detail 41.0); un-premultiplied colour 42.1, + thorough 42.9 (encode +~20 s), same planes and speed.
+  Tried: higher ASTC presets alone (+0.4 / +0.65 dB), all cells full resolution (no gain, +50% memory), 2x instead of
+  4x planes (+0.9 dB, loses shape), the person uncompressed (`HI_PEOPLE`: a second RGBA8 texture per page,
+  glTF emissiveTexture, quads' u + 2; 57 dB but ~2.3x GPU memory and 45-60 fps; as PNG > 4096 px tall it showed grey
+  blocks on the Quest, as KTX2 with mips untested). Kept as an option, off.
 - **Photo detail** (`PHOTO_DETAIL=1`, MPI-only plain bins; `photo_detail_mpi`): composite the bins from the photo's
   camera, put the residual photo - composite onto each pixel's front opaque surface (panorama v4 rules: opacity
   >= 0.95, eroded 2 px, spread over the surface's bins). 2.2 mm ultrawide `20260523_140013_30959`, input view vs

@@ -32,11 +32,14 @@ def ktx(*args):
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-def ktx_args(quality=2, zstd=18, rdo=0.0, levels=3, astc=None):
+def ktx_args(quality=2, zstd=18, rdo=0.0, levels=3, astc=None, raw=False):
     """`ktx create` arguments for the layer pages: UASTC, linear transfer (premultiplied display-space values
     sampled raw), box mipmaps, Zstandard. astc="fast" (etc.): plain ASTC 4x4 instead (the Quest's native format, no
-    transcoding; ~6x faster to encode than UASTC and more accurate, but most desktop GPUs can't sample it)."""
-    if astc:
+    transcoding; ~6x faster to encode than UASTC and more accurate, but most desktop GPUs can't sample it). raw:
+    uncompressed RGBA8 (eval_alpha_patches HI_PEOPLE textures: loaded like the other pages, mipmaps included)."""
+    if raw:
+        a = ["create", "--format", "R8G8B8A8_UNORM", "--assign-tf", "linear"]
+    elif astc:
         a = ["create", "--format", "ASTC_4x4_UNORM_BLOCK", "--astc-quality", astc, "--assign-tf", "linear"]
     else:
         a = ["create", "--format", "R8G8B8A8_UNORM", "--encode", "uastc", "--uastc-quality", quality, "--assign-tf", "linear"]
@@ -106,13 +109,24 @@ def main(argv=None):
     dec_views = list(views)
     t0 = time.time()
     png_bytes = ktx_bytes = 0
+    # base colour pages compressed; a second texture (emissiveTexture, eval_alpha_patches HI_PEOPLE) uncompressed
+    base = {g["textures"][m["pbrMetallicRoughness"]["baseColorTexture"]["index"]].get("source")
+            for m in g["materials"] if "baseColorTexture" in m.get("pbrMetallicRoughness", {})}
+    enc_imgs = [i for i in range(len(g["images"])) if i in base]
+    raw_imgs = [i for i in range(len(g["images"])) if i not in base]       # HI_PEOPLE: uncompressed RGBA8 KTX2
     with tempfile.TemporaryDirectory() as td:
-        pngs = [views[im["bufferView"]] for im in g["images"]]
+        pngs = [views[g["images"][i]["bufferView"]] for i in enc_imgs]
         png_bytes = sum(len(p) for p in pngs)
         kts = encode_pages(pngs, td, quality=a.quality, zstd=a.zstd, rdo=a.rdo, levels=a.levels,   # pages in parallel
                            astc=a.astc)
-        ktx_bytes = sum(len(k) for k in kts)
-        for i, (im, kb) in enumerate(zip(g["images"], kts)):
+        kraw = encode_pages([views[g["images"][i]["bufferView"]] for i in raw_imgs], td, levels=a.levels,
+                            zstd=a.zstd, raw=True) if raw_imgs else []
+        for i, kb in zip(raw_imgs, kraw):
+            gk["images"][i] = {"bufferView": g["images"][i]["bufferView"], "mimeType": "image/ktx2"}
+            views[g["images"][i]["bufferView"]] = kb
+        ktx_bytes = sum(len(k) for k in kts) + sum(len(k) for k in kraw)
+        for i, kb in zip(enc_imgs, kts):
+            im = g["images"][i]
             bv = im["bufferView"]
             gk["images"][i] = {"bufferView": bv, "mimeType": "image/ktx2"}
             if a.decoded:

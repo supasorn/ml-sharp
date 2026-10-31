@@ -9,7 +9,7 @@
    Flooding from every seed with this neighbour-to-neighbour rule = connected components of the link
    graph, labelled in one pass. Regions under --min-region pixels and low-alpha pixels stay splats.
    Pockets of up to --fill-holes pixels enclosed by one region (depth spikes, e.g. on faces) join it,
-   with their depth inpainted from around them.
+   with their depth inpainted from around them; with --fill-far-rel, not those clearly behind their surround.
 3. Each region minus its border pixels, eroded (--erode), triangulated as a pixel grid: 2 triangles per
    2x2 block of kept pixels, each only where its edges pass the --crack-px test (no curtains across depth
    jumps), on parallax smoothed only across such links (--smooth).
@@ -175,6 +175,8 @@ def main():
     ap.add_argument("--crack-px", type=float, default=3.0, help="max neighbour parallax step (px)")
     ap.add_argument("--smooth", type=int, default=8, help="rounds of edge-stopping vertex smoothing")
     ap.add_argument("--fill-holes", type=int, default=5000, help="enclosed pockets up to this size (px) join the region")
+    ap.add_argument("--fill-far-rel", type=float, default=0.0,
+                    help="don't fill pockets whose parallax is this fraction below their surround's (0 = fill all)")
     ap.add_argument("--depth", choices=["median", "expected"], default="median")
     ap.add_argument("--min-alpha", type=float, default=0.5, help="pixels with less rendered alpha stay splats")
     ap.add_argument("--min-region", type=int, default=2000, help="smaller regions (px, before erosion) stay splats")
@@ -255,6 +257,15 @@ def main():
         if not n:
             continue
         small = np.flatnonzero(np.bincount(pockets.ravel())[1:] <= args.fill_holes) + 1
+        if args.fill_far_rel > 0 and len(small):
+            # A pocket clearly behind the region around it is background seen through a gap (a wall between
+            # stems), not a depth spike: inpainted from around, its texture would hang at the front depth.
+            ring = ndimage.grey_dilation(pockets, size=(7, 7)) * (reg & valid)
+            p_in = np.asarray(ndimage.median(P, np.where(valid, pockets, 0), small))
+            p_ring = np.asarray(ndimage.median(P, ring, small))
+            far = np.isfinite(p_in) & np.isfinite(p_ring) & (p_in < p_ring * (1 - args.fill_far_rel))
+            print(f"region {rid}: {int(far.sum())} of {len(small)} pockets left unfilled (behind their surround)")
+            small = small[~far]
         hole = np.isin(pockets, small)
         labels[hole] = rid
         filled |= hole

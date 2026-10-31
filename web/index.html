@@ -161,7 +161,7 @@
     // MPI-surf view modes (surf, surf2, ...): <scene>_mpionly_<mode>.glb, no mesh.
     // Any other ?lod is an MPI-only variant bake: <scene>_mpionly_<lod>.glb (surf*, ldi, ad25, u512, p256, ...;
     // listed in the model picker), no mesh. So every bake can be compared with ?lod=a,b,c.
-    const BASE_LODS = ['full', 'hybrid', 'meshflood', 'meshall', 'meshback', 'bgsplats', 'fgsplats', 'meshbg', 'meshmpi', 'meshmpi-d1', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
+    const BASE_LODS = ['full', 'hybrid', 'meshflood', 'meshall', 'meshback', 'bgsplats', 'fgsplats', 'meshbg', 'meshmpi', 'meshmpi-d1', 'meshmpi-p', 'mpi', 'mpionly', 'layers', 'surfaces', 'patches', 'quest'];
     const isVariant = (lod) => !!lod && /^[a-z0-9]+$/i.test(lod) && !BASE_LODS.includes(lod);
     // ?lod=a,b[,c,d]: compare view modes on the desktop, side by side (two or three) or in a 2x2 grid (four),
     // all seen through the one camera (synced). The first mode is the scene's mode otherwise (and in XR).
@@ -319,7 +319,7 @@
     // the extra pixels remove texture aliasing without softening), 1.0 for the splat views (splat-count bound).
     // It can't change mid-session. No fixed foveation by default.
     const xrScale = parseFloat(getQueryParam('xrscale')
-      || ((isPano ? panoMode === 'msi' : (['mpi', 'mpionly', 'meshmpi', 'meshmpi-d1'].includes(lodList[0]) || isVariant(lodList[0]))) ? '1.4' : '1'));
+      || ((isPano ? panoMode === 'msi' : (['mpi', 'mpionly', 'meshmpi', 'meshmpi-d1', 'meshmpi-p'].includes(lodList[0]) || isVariant(lodList[0]))) ? '1.4' : '1'));
     const xrFoveation = parseFloat(getQueryParam('foveation') || '0');
     const xrStdDev = parseFloat(getQueryParam('xrstddev') || String(Math.sqrt(5)));
     // Close-up scenes cost more: their photos are wider-angle (the scene fills
@@ -760,7 +760,8 @@
                          { id: 'meshback', label: 'Mesh hybrid + backdrop' },
                          { id: 'bgsplats', label: 'Background splats' }, { id: 'fgsplats', label: 'Foreground splats' },
                          { id: 'meshbg', label: 'Mesh + background MPI' },
-                         { id: 'meshmpi-d1', label: 'Mesh-MPI · debug: splat-coloured mesh' }];
+                         { id: 'meshmpi-d1', label: 'Mesh-MPI · debug: splat-coloured mesh' },
+                         { id: 'meshmpi-p', label: 'Mesh-MPI · far pockets unfilled' }];
     async function splatUrlFor(scene) {
       const full = `${sceneBase(scene)}.ply`;
       if (lodMode !== 'quest') return full;
@@ -1168,7 +1169,8 @@
       }
       // meshmpi-d1 (debug): the same MPI with the mesh textured by SHARP's splat colours only (mesh_regions.py
       // --suffix d1 --no-photo-detail): files <scene>_meshmpid1[_astc].glb (= meshmpi's) + _meshmpid1_mesh.glb.
-      const MESHMPI_SFX = { meshmpi: '_meshmpi', 'meshmpi-d1': '_meshmpid1' };
+      // meshmpi-p: pockets behind their surround keep their own depth (bake_meshmpi.py --fill-far-rel 0.05 --tag p).
+      const MESHMPI_SFX = { meshmpi: '_meshmpi', 'meshmpi-d1': '_meshmpid1', 'meshmpi-p': '_meshmpip' };
       if (lodMode in MESHMPI_SFX) {
         const url = `${sceneBase(scene)}${MESHMPI_SFX[lodMode]}.glb`;
         try {
@@ -1418,7 +1420,7 @@
     loadStatus.start(pendingLabel(file));
     if (hybrid === "true") {
       splat = createSplat(splatURL);
-    } else if (isPano || ['layers', 'hybrid', 'meshflood', 'meshall', 'meshback', 'bgsplats', 'fgsplats', 'meshbg', 'meshmpi', 'meshmpi-d1', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
+    } else if (isPano || ['layers', 'hybrid', 'meshflood', 'meshall', 'meshback', 'bgsplats', 'fgsplats', 'meshbg', 'meshmpi', 'meshmpi-d1', 'meshmpi-p', 'surfaces', 'patches', 'mpi', 'mpionly'].includes(lodMode) || isVariant(lodMode)) {
       splat = await loadContent(file);
     } else {
       splat = createSplat(splatURL);  // shows progressively while loading

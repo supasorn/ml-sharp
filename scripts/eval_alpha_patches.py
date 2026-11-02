@@ -63,13 +63,14 @@ EXPORT_DIR = os.environ.get("EXPORT_DIR", "")
 # PHOTO_DETAIL (MPI-only, plain bins): add the photo's detail the splats lost onto each pixel's front opaque surface,
 # so the composite from the photo's camera equals the photo (scripts/pano_msi.py's photo detail v4; see
 # photo_detail_mpi). PHOTO: the photo (default <EXPORT_DIR>/../images/<json image>); PD_ALPHA: surface opacity needed;
-# PD_ERODE: px (at GW 1024; scaled with GW) kept clear of the surface's rim; PD_BAND: relative disparity of the
-# bins that form the dominant bin's surface (at least 1.5 bins).
+# PD_ERODE: px (at GW 1024; scaled with GW) kept clear of the surface's rim; PD_EDGE: likewise of a hybrid mesh;
+# PD_BAND: relative disparity of the bins that form the dominant bin's surface (at least 1.5 bins).
 PHOTO_DETAIL = bool(int(os.environ.get("PHOTO_DETAIL", 0)))
 PHOTO = os.environ.get("PHOTO", "")
 PD_ALPHA = float(os.environ.get("PD_ALPHA", 0.95))
 PD_ERODE = float(os.environ.get("PD_ERODE", 2))
 PD_BAND = float(os.environ.get("PD_BAND", 0.05))
+PD_EDGE = float(os.environ.get("PD_EDGE", 12))
 EVAL = int(os.environ.get("EVAL", 1))
 FITFLAT = bool(os.environ.get("FITFLAT", "1") != "0")  # fronto-parallel patches (tilted RANSAC planes mix depths)
 TEXDS = int(os.environ.get("TEXDS", 2))
@@ -474,7 +475,7 @@ def photo_path(scene, meta):
     return PHOTO or str(Path(EXPORT_DIR or scene.parent).parent / "images" / meta["image"])
 
 
-def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H):
+def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H, mesh_z=None):
     """PHOTO_DETAIL: the residual photo - composite (from the photo's camera, at render resolution), put onto each
     pixel's dominant surface: the bins within PD_BAND relative disparity (>= 1.5 bins) of the bin with the largest
     weight T * alpha. Only where that surface is opaque (alpha >= PD_ALPHA at every px within PD_ERODE): away from
@@ -482,7 +483,13 @@ def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H):
     the surface's bins in proportion to their alpha, i.e. the surface's colour shifts by D / its weight.
     Returns apply(d, rgb, a) -> the premultiplied rgb of the bin at disparity d with the detail (clamped to a valid
     colour). By disparity, not bin index: ADAPT's finer bins (e.g. on people) get it too, from the same surface band
-    (their alpha-weighted sum over the band adds up to the plain bins', so the composite still gains D)."""
+    (their alpha-weighted sum over the band adds up to the plain bins', so the composite still gains D).
+    mesh_z (H, W; inf = none): the hybrid mesh's depth from the photo's camera. Not where the mesh is in front of
+    the surface: there the residual is the mesh's (a leaf over the wall's bins), hidden from the photo's camera but
+    painted onto the surface behind, which shows as the eye moves. With a mesh, also faded out under semi-transparent content
+    in front of the surface (all of it under front alpha <= 0.1, none from 0.5: a soft leaf edge over the wall,
+    whose residual is the edge's) and kept PD_EDGE px (at GW 1024) clear of the mesh: next to it the MPI fades out
+    where the mesh takes over (the residual against the MPI alone would brighten a ring there)."""
     F_ = torch.nn.functional
     im = load_photo(photo, W, H)
     if im is None:
@@ -516,15 +523,26 @@ def photo_detail_mpi(photo, kept, b_t, centers, Kc, Wc, Hc, W, H):
     d_best = cen[best_k.clamp(min=0)]
     band = torch.maximum(PD_BAND * d_best, torch.full_like(d_best, 1.5 * binw))
     T2 = torch.ones(Hc, Wc, device=dev); surf_T = torch.ones(Hc, Wc, device=dev); surf_w = torch.zeros(Hc, Wc, device=dev)
+    front_T = torch.ones(Hc, Wc, device=dev)
     for k in ks:                                     # the dominant surface's opacity and weight from the camera
         _, a = render(k)
         inb = (cen[k] - d_best).abs() <= band
+        front_T = torch.where(cen[k] > d_best + band, front_T * (1 - a), front_T)
         surf_T = torch.where(inb, surf_T * (1 - a), surf_T)
         surf_w = surf_w + torch.where(inb, T2 * a, 0)
         T2 = T2 * (1 - a)
-    opaque = (((1 - surf_T) >= PD_ALPHA) & (best_k >= 0) & inside).float()[None, None]
+    opaque = ((1 - surf_T) >= PD_ALPHA) & (best_k >= 0) & inside
+    if mesh_z is not None:
+        md = torch.zeros(Hc, Wc, device=dev)
+        md[MARGIN:MARGIN + H, MARGIN:MARGIN + W] = 1 / mesh_z            # inf -> 0: no mesh
+        re = max(1, round(PD_EDGE * W / (1024 * SS)))
+        near = (md > 0).float()[None, None]                                    # any mesh, dilated by PD_EDGE
+        opaque &= (md <= d_best + band) & (F_.max_pool2d(near, 2 * re + 1, 1, re)[0, 0] == 0)
+    opaque = opaque.float()[None, None]
     r = max(1, round(PD_ERODE * W / (1024 * SS)))
     weight = (-F_.max_pool2d(-opaque, 2 * r + 1, 1, r))[0, 0]                     # erosion: all of the window
+    if mesh_z is not None:
+        weight = weight * ((0.5 - (1 - front_T)) / 0.4).clamp(0, 1)
     shift = weight[..., None] * D / surf_w[..., None].clamp(min=0.3)
     ins = D[inside]
     print(f"  photo detail ({Path(photo).name} at {W}x{H}; surface opacity >= {PD_ALPHA}, band {PD_BAND}, erode {r} "
@@ -1469,7 +1487,8 @@ def run(scene: Path):
             assert FASTWIN, "PHOTO_DETAIL needs plain MPI-only bins (ADAPT's finer bins are fine)"
             photo = photo_path(scene, meta)
             if Path(photo).exists():
-                pd_apply = photo_detail_mpi(photo, kept, passes_[0][0], passes_[0][1], Kc, Wc, Hc, W, H)
+                mesh_z = None if NOMESH else s2.mesh_layer(M, (0.0, 0.0, 0.0), W, H, f)[1].reshape(H, W)
+                pd_apply = photo_detail_mpi(photo, kept, passes_[0][0], passes_[0][1], Kc, Wc, Hc, W, H, mesh_z)
             else:
                 print(f"  photo detail: {photo} not found: skipped", flush=True)
             tick("photo detail")

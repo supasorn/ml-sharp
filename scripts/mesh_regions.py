@@ -6,6 +6,8 @@
 2. Regions: neighbouring pixels are joined when their parallax differs by less than --crack-px, where a
    pixel's parallax is P = f * move / z (how far it slides, in pixels, when the head moves --move metres;
    a disparity in pixel units). So the allowed depth step grows with z^2: lenient far away, strict nearby.
+   --crack-rel r raises the limit to r * P where that is larger (near surfaces such as faces, where 3 px
+   is under 1% of the depth and SHARP's depth noise alone crosses it). The same limit is used in 3. and by the photo-detail edge test.
    Flooding from every seed with this neighbour-to-neighbour rule = connected components of the link
    graph, labelled in one pass. Regions under --min-region pixels and low-alpha pixels stay splats.
    Pockets of up to --fill-holes pixels enclosed by one region (depth spikes, e.g. on faces) join it,
@@ -49,8 +51,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 
-def label_regions(P, valid, crack_px):
-    """Connected components of the pixel graph with an edge where both pixels are valid and |dP| < crack_px."""
+def smooth_step(pa, pb, crack_px, crack_rel):
+    """Neighbour parallax step under the crack limit: crack_px, or crack_rel of the nearer-to-zero side."""
+    return np.abs(pa - pb) < np.maximum(crack_px, crack_rel * np.minimum(pa, pb))
+
+
+def label_regions(P, valid, crack_px, crack_rel=0.0):
+    """Connected components of the pixel graph with an edge where both pixels are valid and smooth_step."""
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
 
@@ -60,7 +67,7 @@ def label_regions(P, valid, crack_px):
     for a, b, pa, pb in [(idx[:, :-1], idx[:, 1:], P[:, :-1], P[:, 1:]),
                          (idx[:-1, :], idx[1:, :], P[:-1, :], P[1:, :])]:
         va = valid.reshape(-1)[a] & valid.reshape(-1)[b]
-        ok = va & (np.abs(pa - pb) < crack_px)
+        ok = va & smooth_step(pa, pb, crack_px, crack_rel)
         rows.append(a[ok])
         cols.append(b[ok])
     rows, cols = np.concatenate(rows), np.concatenate(cols)
@@ -173,6 +180,8 @@ def main():
     ap.add_argument("--suffix", default="all", help="outputs <scene>_mesh<suffix>.glb / _pruned<suffix>.ply")
     ap.add_argument("--move", type=float, default=0.1, help="head move (m) that defines parallax pixels")
     ap.add_argument("--crack-px", type=float, default=3.0, help="max neighbour parallax step (px)")
+    ap.add_argument("--crack-rel", type=float, default=0.0,
+                    help="max neighbour parallax step as a fraction of the parallax, where above --crack-px")
     ap.add_argument("--smooth", type=int, default=8, help="rounds of edge-stopping vertex smoothing")
     ap.add_argument("--fill-holes", type=int, default=5000, help="enclosed pockets up to this size (px) join the region")
     ap.add_argument("--fill-far-rel", type=float, default=0.0,
@@ -245,7 +254,7 @@ def main():
     P = np.where(valid, fb / np.where(valid, depth, 1), 0).astype(np.float32)
     print("neighbour parallax steps (px) percentiles:",
           {k: round(v, 4) for k, v in step_stats(P, valid).items()})
-    labels = label_regions(P, valid, args.crack_px)
+    labels = label_regions(P, valid, args.crack_px, args.crack_rel)
     ids, sizes = np.unique(labels[labels >= 0], return_counts=True)
     big = ids[sizes >= args.min_region]
     # Enclosed pockets join their region; their depth is interpolated from the region around them.
@@ -312,7 +321,7 @@ def main():
                        ((slice(None, -1), slice(None)), (slice(1, None), slice(None))),
                        ((slice(None, -1), slice(None, -1)), (slice(1, None), slice(1, None))),
                        ((slice(None, -1), slice(1, None)), (slice(1, None), slice(None, -1)))]:
-            j = mask[a_] & mask[b_] & (np.abs(P[a_] - P[b_]) >= args.crack_px)
+            j = mask[a_] & mask[b_] & ~smooth_step(P[a_], P[b_], args.crack_px, args.crack_rel)
             jump[a_] |= j
             jump[b_] |= j
         k = 2 * args.jump_gap + 1
@@ -324,8 +333,8 @@ def main():
     # Links: neighbouring mesh pixels whose (unsmoothed) parallax passes the region test. Triangles and
     # smoothing use only these, so neither crosses a depth jump (pixels of one region can still be across a
     # jump from each other, joined by a detour; a triangle there is a stretched curtain).
-    lh = mask[:, :-1] & mask[:, 1:] & (np.abs(P[:, 1:] - P[:, :-1]) < args.crack_px)
-    lv = mask[:-1, :] & mask[1:, :] & (np.abs(P[1:, :] - P[:-1, :]) < args.crack_px)
+    lh = mask[:, :-1] & mask[:, 1:] & smooth_step(P[:, 1:], P[:, :-1], args.crack_px, args.crack_rel)
+    lv = mask[:-1, :] & mask[1:, :] & smooth_step(P[1:, :], P[:-1, :], args.crack_px, args.crack_rel)
     # Smoothing: --smooth rounds of averaging each pixel with its linked neighbours (in parallax, where
     # planes stay planes), ~ a Gaussian of sigma 0.6 * sqrt(rounds) px that stops at depth edges.
     Ps = np.where(mask, P, 0).astype(np.float32)
@@ -342,7 +351,7 @@ def main():
     vidx[rows, cols] = np.arange(len(rows))
     # Two triangles per 2x2 block, (a b c) and (b e c) with a = (r, c), b = (r+1, c), c = (r, c+1),
     # e = (r+1, c+1); a triangle only where its three edges are links (the diagonal b-c tested likewise).
-    quad = mask[:-1, :-1] & mask[1:, :-1] & mask[:-1, 1:] & mask[1:, 1:] & (np.abs(P[1:, :-1] - P[:-1, 1:]) < args.crack_px)
+    quad = mask[:-1, :-1] & mask[1:, :-1] & mask[:-1, 1:] & mask[1:, 1:] & smooth_step(P[1:, :-1], P[:-1, 1:], args.crack_px, args.crack_rel)
     good = [quad & lv[:, :-1] & lh[:-1, :], quad & lh[1:, :] & lv[:, 1:]]
     corner = [vidx[:-1, :-1], vidx[1:, :-1], vidx[:-1, 1:], vidx[1:, 1:]]
     faces = np.concatenate([np.stack([corner[k][g] for k in t], 1) for t, g in zip([(0, 1, 2), (1, 3, 2)], good)])
@@ -417,7 +426,8 @@ def main():
             wgt = surf * np.clip((0.5 - a_ex) / 0.4, 0, 1).astype(np.float32)
             ke = np.ones((2 * args.detail_edge_px + 1,) * 2, np.uint8)
             Pv = np.where(valid | filled, P, 0).astype(np.float32)
-            calm = (cv.dilate(Pv, ke) - Ps <= args.crack_px) & (Ps - cv.erode(Pv, ke) <= args.crack_px)
+            lim = np.maximum(args.crack_px, args.crack_rel * Ps)
+            calm = (cv.dilate(Pv, ke) - Ps <= lim) & (Ps - cv.erode(Pv, ke) <= lim)
             wgt = cv.erode(wgt * calm, kernel, iterations=2)
             wgt = cv.GaussianBlur(wgt, (0, 0), 1.0) * surf
             tex = tex + wgt[..., None] * (photo - color)

@@ -67,6 +67,15 @@ function sortedSceneNames(outDir) {
 // MSI variants, best first: the viewer shows the first one a pano has (the others are selectable).
 const PANO_VARIANTS = [
   { id: 'out_dr_photo4', label: 'DAP-corrected depth (photo detail v4)' },   // default: scripts/pano_watch.py
+  { id: 'out_ds_photo4', label: 'DAP fit + seams, feather (photo detail v4)' },   // experiment: --depth dap_seam
+  { id: 'out_dsm_photo4', label: 'DAP fit + seams, multiband (photo detail v4)' },   // --seam-blend multiband
+  { id: 'out_pdap2_photo4', label: 'Poisson + DAP, icoup (photo detail v4)' },   // --depth poisson_dap, current code
+  { id: 'out_pdap3_photo4', label: 'Poisson + DAP, free edges (photo detail v4)' },   // + --free-edges 0.05 1.5
+  { id: 'out_pdap4_photo4', label: 'Poisson + DAP, free + snapped edges (photo detail v4)' },   // + --snap-edges
+  { id: 'out_dr4_photo4', label: 'DAP-corrected depth v4: v3 + views post-aligned to the shared map (photo detail v4)' },   // v3 + --post-align
+  { id: 'out_dr3_photo4', label: 'DAP-corrected depth v3: DAP-confirmed edges + near-DAP blend + snapped edges (photo detail v4)' },   // --ratio-edge-stop 0.08 --ratio-edge-ratio 0.3 --ratio-near-dap 0.1 --snap-edges
+  { id: 'out_dr2_photo4', label: 'DAP-corrected depth v2: edge-stop + near-DAP blend (photo detail v4)' },   // --ratio-edge-stop 0.08 --ratio-near-dap 0.1
+  { id: 'out_pdap5_photo4', label: 'Poisson + DAP, free + soft + snapped edges (photo detail v4)' },   // --free-edges 0.05 1.5 0.02
   { id: 'out_ico2_photo4', label: 'Stitched depth (photo detail v4)' },   // the previous default
   { id: 'out_uk_photo4', label: 'UniK3D depth (photo detail v4)' },   // experiment: 360 depth instead of stitching
   { id: 'out_gd_photo4', label: 'Poisson depth, up view (photo detail v4)' },   // experiment: gradient-domain stitching
@@ -105,8 +114,11 @@ function panoScenes(coll) {
   return fs.readdirSync(inputs).filter((f) => /\.(jpe?g|png)$/i.test(f))
     .map((f) => panoInfo(coll, f.replace(/\.[^.]+$/, ''))).filter(Boolean);
 }
+// MSI variants with their own gallery button ("MSI v3", "MSI v4"): view mode msi-<d> = ?pvariant=out_<d>_photo4.
+const PANO_GALLERY_VARIANTS = ['dr3', 'dr4'];
 function panoModes(p) {
-  return [...(p.variants.length ? ['msi'] : []), ...(p.spz ? ['splats'] : [])];
+  return [...(p.variants.length ? ['msi'] : []), ...(p.spz ? ['splats'] : []),
+          ...PANO_GALLERY_VARIANTS.filter((d) => p.variants.some((v) => v.id === `out_${d}_photo4`)).map((d) => `msi-${d}`)];
 }
 // Photo scenes and panoramas of the given collections in one list, most recently modified first.
 function allSceneEntries(colls) {

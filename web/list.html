@@ -415,6 +415,8 @@
       <div class="seg" id="pmodeSeg">
         <button type="button" data-pmode="msi">MSI</button>
         <button type="button" data-pmode="splats">Splats</button>
+        <button type="button" data-pmode="msi-dr3" title="MSI on DAP-corrected depth v3 (out_dr3_photo4: DAP-confirmed edges, near-DAP blend, snapped edges); only where baked">MSI v3</button>
+        <button type="button" data-pmode="msi-dr4" title="MSI on DAP-corrected depth v4 (out_dr4_photo4: v3 + each view's splats post-aligned to the shared depth map); only where baked">MSI v4</button>
       </div>
     </div>
     <div class="opt-group" title="Eye-buffer resolution in AR/VR (1 = full)">
@@ -552,8 +554,13 @@
       $('.scene-item a').each(function () {
         const url = new URL($(this).attr('href'), window.location.href);
         // Photo scenes take the view mode (lod), panoramas their own (pmode); auto xrscale follows either.
-        if ($(this).closest('.scene-item').data('kind') === 'pano') url.searchParams.set('pmode', opts.pmode);
-        else url.searchParams.set('lod', opts.lod);
+        // "MSI v3" / "MSI v4" (pmode msi-<d>) are the MSI view of one variant (?pvariant=out_<d>_photo4).
+        if ($(this).closest('.scene-item').data('kind') === 'pano') {
+          const variant = /^msi-(\w+)$/.exec(opts.pmode);
+          url.searchParams.set('pmode', variant ? 'msi' : opts.pmode);
+          if (variant) url.searchParams.set('pvariant', `out_${variant[1]}_photo4`);
+          else url.searchParams.delete('pvariant');
+        } else url.searchParams.set('lod', opts.lod);
         if (opts.xrscale === 'auto') url.searchParams.delete('xrscale');
         else url.searchParams.set('xrscale', opts.xrscale);
         url.searchParams.delete('foveation');

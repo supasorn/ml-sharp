@@ -4,7 +4,8 @@
  *
  * Desktop controls (PanoLook): drag = look around (no orbit), right-drag / shift-drag or two fingers =
  * slide sideways and up, WASD / arrows = move, Q / E = down / up, wheel or pinch = zoom (FOV), R = back
- * to the centre. Movement stays within `maxMove` metres of the capture point (parallax, not walking).
+ * to the centre. Double-tap / double-click toggles what a one-finger drag does: look around or slide (phones
+ * have no right-drag). Movement stays within `maxMove` metres of the capture point (parallax, not walking).
  */
 import * as THREE from "three";
 
@@ -22,6 +23,9 @@ export class PanoLook {
     camera.rotation.order = "YXZ";
     this._pointers = new Map();
     this._pinch = null;
+    this.slideMode = false;         // one-finger / left drag slides instead of looking (double-tap toggles)
+    this.onModeChange = null;       // (slideMode) => ..., e.g. the viewer's hint
+    this._lastTap = null;
     this._bind();
   }
 
@@ -46,6 +50,11 @@ export class PanoLook {
     this._clamp();
   }
 
+  setSlideMode(on) {
+    this.slideMode = on;
+    if (this.onModeChange) this.onModeChange(on);
+  }
+
   _bind() {
     const el = this.dom;
     el.style.touchAction = "none";
@@ -53,7 +62,16 @@ export class PanoLook {
     el.addEventListener("contextmenu", (e) => e.preventDefault());
     el.addEventListener("pointerdown", (e) => {
       el.setPointerCapture(e.pointerId);
-      this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, slide: e.button === 2 || e.shiftKey });
+      // Double-tap: a second single-pointer press within 300 ms and 30 px of the last one.
+      const t = performance.now(), lt = this._lastTap;
+      if (this._pointers.size === 0 && e.button === 0 && lt && t - lt.t < 300 && Math.hypot(e.clientX - lt.x, e.clientY - lt.y) < 30) {
+        this._lastTap = null;
+        this.setSlideMode(!this.slideMode);
+      } else {
+        this._lastTap = this._pointers.size === 0 ? { t, x: e.clientX, y: e.clientY } : null;
+      }
+      this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY,
+                                        slide: (e.button === 2 || e.shiftKey) !== this.slideMode });
       el.style.cursor = "grabbing";
       if (this._pointers.size === 2) this._pinch = null;
     });

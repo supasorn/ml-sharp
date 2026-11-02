@@ -1903,8 +1903,13 @@
       setInterval(() => { panoParams.fov = panoLook.fov; }, 250);
       const help = document.createElement('div');
       help.id = 'pano-help';
-      help.innerHTML = '<b>360°</b> Drag: look around · WASD / arrows: move · Q / E: down / up · ' +
-                       'right-drag: slide · wheel: zoom · R: centre';
+      const setHelp = (slide) => {
+        help.innerHTML = `<b>360°</b> Drag: ${slide ? '<b>slide (move)</b>' : 'look around'} · double-tap: ` +
+                         `${slide ? 'back to looking' : 'drag to slide'} · WASD / arrows: move · Q / E: down / up · ` +
+                         'right-drag: slide · wheel: zoom · R: centre';
+      };
+      setHelp(false);
+      panoLook.onModeChange = setHelp;
       document.body.appendChild(help);
     } else {
     gui.add(guiParams, 'cameraMotion', ["None", "SpiralXYZ", "SpiralXY", "Dolly"]);

@@ -694,7 +694,8 @@ def stitch_depth(depths, rots, f, size, eq_w, eq_h, device, border=0.03, prior=0
 # ---------------------------------------------------------------- output
 
 
-def post_align(g_ndc, unproj, target, sigma_deg=1.5, px_deg=10.24, stop=0.08, robust=0.1, iters=2, layer_tol=0.15):
+def post_align(g_ndc, unproj, target, sigma_deg=1.5, px_deg=10.24, stop=0.08, robust=0.1, iters=2, layer_tol=0.15,
+               sky=None):
     """--post-align: after pass 2, scale each view's splats along their rays by a smooth correction towards the shared
     map (target: its distance, size x size), so every view puts a surface where the map does. The learned alignment
     only corrects SHARP's depth by moderate factors around the view's overall scale (the median ratio): in
@@ -705,7 +706,10 @@ def post_align(g_ndc, unproj, target, sigma_deg=1.5, px_deg=10.24, stop=0.08, ro
     the map's or the splats' depth edges), smoothed over ~sigma_deg by a diffusion that stops at the splats' own
     steps > stop (log) so a face and the wall behind it get their own factors, robust (Cauchy, `robust`). Detail
     below ~sigma_deg stays SHARP's. A back-layer splat takes its pixel's factor if within layer_tol of the front,
-    else none. Returns the Gaussians and the fraction of front splats moved by > 5%."""
+    else none. Not in the sky (`sky`: DAP's sky mask in the view, size x size, > 0.5 = sky) and never past the
+    view's farthest front splat: the shared map's sky is SHARP's times a correction DAP has no data for (79372: up
+    to 27 km, SHARP's sky <= 0.8 km), and sky splats pushed out there showed as black blotches in the MSI.
+    Returns the Gaussians and the fraction of front splats moved by > 5%."""
     dev = g_ndc.mean_vectors.device
     N = g_ndc.mean_vectors.shape[0]
     n = int(round(math.sqrt(N // 2)))
@@ -721,6 +725,9 @@ def post_align(g_ndc, unproj, target, sigma_deg=1.5, px_deg=10.24, stop=0.08, ro
         gy = F.pad((x[..., 1:, :] - x[..., :-1, :]).abs(), (0, 0, 0, 1))
         return F.max_pool2d(torch.maximum(gx, gy), 7, 1, 3)
     c = (g_ndc.opacities.view(2, n, n)[0] > 0.3).float()[None, None] / (1 + (torch.maximum(edge(front), edge(lt)) / 0.02) ** 2)
+    sk = None if sky is None else F.interpolate(sky[None, None].float(), size=(n, n), mode="area") > 0.5
+    if sk is not None:
+        c = c * (~sk).float()
     rd = lt - front
     kx = 1 / (1 + ((front[..., :, 1:] - front[..., :, :-1]).abs() / stop) ** 4)
     ky = 1 / (1 + ((front[..., 1:, :] - front[..., :-1, :]).abs() / stop) ** 4)
@@ -731,7 +738,10 @@ def post_align(g_ndc, unproj, target, sigma_deg=1.5, px_deg=10.24, stop=0.08, ro
     rb, den = smooth(c)
     for _ in range(iters):
         rb, den = smooth(c / (1 + ((rd - rb) / robust) ** 2))
-    rb = torch.where(den > 1e-4, rb, torch.zeros_like(rb))[0, 0]       # no support at all: unchanged
+    rb = torch.where(den > 1e-4, rb, torch.zeros_like(rb))       # no support at all: unchanged
+    if sk is not None:
+        rb = torch.where(sk, torch.zeros_like(rb), rb)
+    rb = torch.minimum(rb, front.max() - front)[0, 0]
     back = torch.where((logr[1] - logr[0]).abs() < layer_tol, rb, torch.zeros_like(rb))
     s_ = torch.exp(torch.stack([rb, back])).reshape(-1)
     mean = (world * s_[:, None] - t) @ torch.linalg.inv(M).T
@@ -878,6 +888,7 @@ def run(args):
         depths, mono_outs = zip(*[monodepth(model, v, factor) for v in views])
     depths = [z.float() for z in depths]
     eq_w = args.depth_width
+    sky = None                                 # DAP's sky mask (equirect), where a depth mode computed it
     if args.depth == "dap_ratio":              # each view's depth smoothly corrected towards DAP, then feather-blended
         # into one shared map: views aligned to their own corrected depth disagreed on thin objects (pano_9000's
         # lamp heads, ~30%) and showed them twice in the overlaps (final splats: 4.4% of overlap pixels > 5% apart,
@@ -984,6 +995,8 @@ def run(args):
             lr = F.grid_sample(logd[None, None], grid[None], mode="bilinear", padding_mode="border",
                                align_corners=False)[0, 0]
             target = torch.exp(lr) / rays.norm(dim=-1)  # distance -> z-depth
+            sky_v = None if sky is None else F.grid_sample(sky[None, None].float(), grid[None], mode="bilinear",
+                                                           padding_mode="border", align_corners=False)[0, 0]
         # The alignment only corrects SHARP's own depth by moderate factors: a view far off (a street panorama's
         # downward views had SHARP's road at 0.33x / 0.42x the target) stayed at 0.59x / 0.77x and floated as a
         # big triangle. So the view is aligned to the target divided by its overall factor, and its splats are
@@ -998,7 +1011,8 @@ def run(args):
         E[:3, :3] = Rt.T  # world -> camera
         unproj = get_unprojection_matrix(E, K, (size, size))
         if args.post_align and target is not None:
-            g_ndc, moved = post_align(g_ndc, unproj, target * rays.norm(dim=-1), px_deg=f * math.pi / 180 / (size / 768))
+            g_ndc, moved = post_align(g_ndc, unproj, target * rays.norm(dim=-1), px_deg=f * math.pi / 180 / (size / 768),
+                                      sky=sky_v)
             LOGGER.info("view %d: post-aligned to the shared map, %.2f%% of front splats moved > 5%%", k, 100 * moved)
         if args.snap_edges:
             g_ndc, moved = snap_edges(g_ndc, unproj)
